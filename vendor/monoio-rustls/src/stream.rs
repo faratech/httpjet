@@ -14,10 +14,9 @@ use monoio::{
 use monoio_io_wrapper::ReadBuffer;
 use rustls::{ClientConnection, ConnectionCommon, ServerConnection, SideData};
 
-/// One rustls send batch in one write: rustls queues at most 64 KiB of plaintext
-/// (its default send-buffer limit), i.e. four full records, each adding at most
-/// 29 bytes of framing.
-const TLS_WRITE_BUFFER_IDLE: usize = 64 * 1024 + 256;
+/// One rustls send batch in one write: accommodates a full 64 KiB payload plus
+/// HTTP/1 or HTTP/2 framing and TLS record headers without growing.
+const TLS_WRITE_BUFFER_IDLE: usize = 68 * 1024;
 const TLS_WRITE_BUFFER_BURST: usize = 512 * 1024;
 /// Idle-size write buffers kept warm per thread (see [`take_idle_box`]).
 const IDLE_BUFFER_POOL_CAP: usize = 32;
@@ -734,6 +733,24 @@ impl WriteBuffer {
         }
     }
 
+    async fn write_owned_record<IO: AsyncWriteRent>(
+        &mut self,
+        mut io: IO,
+        record: Vec<u8>,
+    ) -> io::Result<usize> {
+        #[allow(irrefutable_let_patterns)]
+        let Self::Safe(buffer) = self
+        else {
+            return Err(write_cancelled_in_flight());
+        };
+        let empty = buffer.buffer.take().ok_or_else(write_cancelled_in_flight)?;
+        let total = record.len();
+        let (result, _) = io.write_all(record).await;
+        result?;
+        buffer.buffer = Some(empty);
+        Ok(total)
+    }
+
     async fn write_owned_batch<IO: AsyncWriteRent>(
         &mut self,
         mut io: IO,
@@ -1190,6 +1207,9 @@ where
 
     pub(crate) async fn write_io(&mut self) -> io::Result<usize> {
         if self.w_buffer.accepts_owned_batch() {
+            if let Some(record) = self.session.take_single_tls_record() {
+                return self.w_buffer.write_owned_record(&mut self.io, record).await;
+            }
             if let Some(records) = self.session.take_tls_write_batch() {
                 return self.w_buffer.write_owned_batch(&mut self.io, records).await;
             }
@@ -1262,14 +1282,10 @@ where
         splitted: bool,
     ) -> BufResult<usize, T> {
         self.rx_records = None;
-        let slice = unsafe { std::slice::from_raw_parts_mut(buf.write_ptr(), buf.bytes_total()) };
         loop {
             // read from rustls to buffer
-            match self.session.reader().read(slice) {
-                Ok(n) => {
-                    unsafe { buf.set_init(n) };
-                    return (Ok(n), buf);
-                }
+            match read_plaintext(&mut self.session.reader(), &mut buf) {
+                Ok(n) => return (Ok(n), buf),
                 // we need more data, read something.
                 Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => (),
                 Err(e) => {
@@ -1283,6 +1299,24 @@ where
             }
         }
     }
+}
+
+fn read_plaintext<T: IoBufMut>(
+    reader: &mut rustls::Reader<'_>,
+    buf: &mut T,
+) -> io::Result<usize> {
+    let capacity = buf.bytes_total();
+    if capacity == 0 {
+        return Ok(0);
+    }
+    // SAFETY: the rental owns this writable range for the duration of the call.
+    let spare = unsafe {
+        std::slice::from_raw_parts_mut(buf.write_ptr().cast::<MaybeUninit<u8>>(), capacity)
+    };
+    let len = reader.read_into_spare(spare)?;
+    // SAFETY: rustls initialized exactly the returned prefix.
+    unsafe { buf.set_init(len) };
+    Ok(len)
 }
 
 impl<IO: AsyncReadRent, C, SD: SideData> ReadHalf<IO, C>
@@ -1330,17 +1364,13 @@ where
     }
 
     async fn read_inner<T: IoBufMut>(&mut self, mut buf: T) -> BufResult<usize, T> {
-        let slice = unsafe { std::slice::from_raw_parts_mut(buf.write_ptr(), buf.bytes_total()) };
         loop {
             let result = {
                 let mut session = self.session.borrow_mut();
-                session.reader().read(slice)
+                read_plaintext(&mut session.reader(), &mut buf)
             };
             match result {
-                Ok(n) => {
-                    unsafe { buf.set_init(n) };
-                    return (Ok(n), buf);
-                }
+                Ok(n) => return (Ok(n), buf),
                 Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {}
                 Err(err) => return (Err(err), buf),
             }
@@ -1376,8 +1406,11 @@ where
     C: DerefMut + Deref<Target = ConnectionCommon<SD>>,
 {
     async fn write_io(&mut self) -> io::Result<usize> {
-        #[cfg(not(target_arch = "aarch64"))]
         if self.w_buffer.accepts_owned_batch() {
+            let single = self.session.borrow_mut().take_single_tls_record();
+            if let Some(record) = single {
+                return self.w_buffer.write_owned_record(&mut self.io, record).await;
+            }
             let batch = self.session.borrow_mut().take_tls_write_batch();
             if let Some(records) = batch {
                 return self.w_buffer.write_owned_batch(&mut self.io, records).await;
@@ -1411,18 +1444,6 @@ where
         self.session.borrow().wants_write()
     }
 
-    // On AArch64, keep the ordinary split flush on the buffered write path.
-    #[cfg(target_arch = "aarch64")]
-    async fn write_large_batch(&mut self) -> io::Result<()> {
-        let batch = self.session.borrow_mut().take_tls_write_batch();
-        if let Some(records) = batch {
-            self.w_buffer
-                .write_owned_batch(&mut self.io, records)
-                .await?;
-        }
-        Ok(())
-    }
-
     async fn flush_pending(&mut self) -> io::Result<()> {
         while self.wants_write() {
             if self.write_io().await? == 0 {
@@ -1452,12 +1473,6 @@ where
             Ok(n) => n,
             Err(err) => return (Err(err), buf),
         };
-        #[cfg(target_arch = "aarch64")]
-        if written >= 16 * 1024 - 64 && self.w_buffer.accepts_owned_batch() {
-            if let Err(err) = Box::pin(self.write_large_batch()).await {
-                return (Err(err), buf);
-            }
-        }
         if let Err(err) = self.flush_pending().await {
             return (Err(err), buf);
         }
@@ -1479,12 +1494,6 @@ where
             Ok(n) => n,
             Err(err) => return (Err(err), buf_vec),
         };
-        #[cfg(target_arch = "aarch64")]
-        if total >= 16 * 1024 - 64 && self.w_buffer.accepts_owned_batch() {
-            if let Err(err) = Box::pin(self.write_large_batch()).await {
-                return (Err(err), buf_vec);
-            }
-        }
         if let Err(err) = self.flush_pending().await {
             return (Err(err), buf_vec);
         }

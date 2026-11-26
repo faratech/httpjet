@@ -18,7 +18,7 @@ use http_body_util::BodyExt;
 #[cfg(test)]
 use tokio::sync::Semaphore;
 use tokio::sync::{Notify, mpsc, oneshot};
-use tokio_util::sync::CancellationToken;
+use tokio::task::JoinHandle;
 
 use hj_core::{Body, Proto, Request, Response};
 
@@ -160,7 +160,6 @@ struct BridgeReq {
     req: Request,
     ctx: BridgeCtx,
     resp: oneshot::Sender<BridgeResp>,
-    cancel: CancellationToken,
     permit: AdmissionPermit,
     body_budget: Arc<hj_core::budget::BodyBufferBudget>,
 }
@@ -349,30 +348,19 @@ impl BridgeAdmission {
     }
 }
 
-struct CancelOnDrop {
-    token: CancellationToken,
-    armed: bool,
-}
+/// Cancel the request, including any pending response forwarding, until
+/// the transport takes ownership of the reply.
+struct AbortRequestOnDrop(Option<JoinHandle<()>>);
 
-impl CancelOnDrop {
-    fn new(token: CancellationToken) -> Self {
-        Self { token, armed: true }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for CancelOnDrop {
+impl Drop for AbortRequestOnDrop {
     fn drop(&mut self) {
-        if self.armed {
-            self.token.cancel();
+        if let Some(task) = &self.0 {
+            task.abort();
         }
     }
 }
 
-type SpawnFn = dyn Fn(BridgeReq, &tokio::runtime::Handle) + Send + Sync;
+type SpawnFn = dyn Fn(BridgeReq, &tokio::runtime::Handle) -> JoinHandle<()> + Send + Sync;
 
 /// Clonable handle the monoio cores use to dispatch a request to the side-runtime.
 #[derive(Clone)]
@@ -455,26 +443,22 @@ impl Bridge {
             }
         };
         let (rtx, rrx) = oneshot::channel();
-        let cancel = CancellationToken::new();
-        let mut cancel_on_drop = CancelOnDrop::new(cancel.clone());
-        (self.spawn_req)(
+        let mut task = AbortRequestOnDrop(Some((self.spawn_req)(
             BridgeReq {
                 req,
                 ctx,
                 resp: rtx,
-                cancel,
                 permit,
                 body_budget: self.body_budget.clone(),
             },
             &self.timer,
-        );
-        match rrx.await {
-            Ok(resp) => {
-                cancel_on_drop.disarm();
-                Some(resp)
-            }
-            Err(_) => None,
+        )));
+        let response = rrx.await.ok();
+        if response.is_some() {
+            // Detach the task so an accepted streaming body can finish.
+            drop(task.0.take());
         }
+        response
     }
 
     /// Dispatch and reassemble a full `hj_core::Response` (with a `Body::Full`
@@ -588,9 +572,6 @@ where
 {
     let handler = Arc::new(handler);
     Arc::new(move |req: BridgeReq, rt: &tokio::runtime::Handle| {
-        if req.resp.is_closed() {
-            return;
-        }
         let handler = Arc::clone(&handler);
         // The request future is ~15 KiB; a recycled slot keeps the tokio task
         // small and the future's memory resident across requests on this worker.
@@ -599,25 +580,18 @@ where
                 req,
                 ctx,
                 resp,
-                cancel,
                 permit,
                 body_budget,
             } = req;
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {}
-                _ = async move {
-                    let direct_file = ctx.direct_file_egress;
-                    let budget = ResponseBudget {
-                        global: body_budget,
-                        connection: ctx.response_budget.clone(),
-                    };
-                    let response = handler(req, ctx).await;
-                    forward_response_with_budget(response, resp, direct_file, &budget).await;
-                } => {}
-            }
+            let direct_file = ctx.direct_file_egress;
+            let budget = ResponseBudget {
+                global: body_budget,
+                connection: ctx.response_budget.clone(),
+            };
+            let response = handler(req, ctx).await;
+            forward_response_with_budget(response, resp, direct_file, &budget).await;
             drop(permit);
-        }));
+        }))
     })
 }
 
@@ -1483,25 +1457,27 @@ async fn read_uncached_file_body(f: hj_core::FileBody) -> (Bytes, bool) {
         let mut buf = std::mem::take(&mut out);
         let step = run_file_blocking(move || {
             let cur = buf.len();
-            buf.resize(cur + want, 0);
+            buf.reserve(want);
             let mut filled = 0usize;
             let mut err = false;
             while filled < want {
-                match std::os::unix::fs::FileExt::read_at(
+                match rustix::io::pread(
                     &*reader,
-                    &mut buf[cur + filled..],
+                    &mut buf.spare_capacity_mut()[filled..want],
                     off + filled as u64,
                 ) {
-                    Ok(0) => break,
-                    Ok(n) => filled += n,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Ok(([], _)) => break,
+                    Ok((initialized, _)) => filled += initialized.len(),
+                    Err(rustix::io::Errno::INTR) => {}
                     Err(_) => {
                         err = true;
                         break;
                     }
                 }
             }
-            buf.truncate(cur + filled);
+            // SAFETY: each successful pread initialized exactly the next prefix.
+            // Keep the previously initialized bytes and publish only those read.
+            unsafe { buf.set_len(cur + filled) };
             (buf, err, filled)
         })
         .await;
@@ -2079,6 +2055,78 @@ mod tests {
             b = b.header(http::header::CONTENT_TYPE, ct);
         }
         b.body(body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn dropping_a_dispatch_with_an_unobserved_reply_aborts_the_task() {
+        let sent = Arc::new(AtomicUsize::new(0));
+        let alive = Arc::new(AtomicUsize::new(0));
+        let mut bridge = spawn_on_current(1, |_req, _ctx| async {
+            hj_core::text_response(http::StatusCode::OK, "done")
+        });
+        bridge.spawn_req = {
+            let regular = bridge.spawn_req.clone();
+            let sent = sent.clone();
+            let alive = alive.clone();
+            Arc::new(move |req, rt| {
+                if sent.load(Ordering::SeqCst) != 0 {
+                    return regular(req, rt);
+                }
+                let sent = sent.clone();
+                let alive = alive.clone();
+                rt.spawn(async move {
+                    let _permit = req.permit;
+                    alive.fetch_add(1, Ordering::SeqCst);
+                    let _active = ActiveGuard(alive);
+                    assert!(req.resp.send(service_unavailable_resp()).is_ok());
+                    sent.store(1, Ordering::SeqCst);
+                    // A buffered reply has no stream receiver that could wake
+                    // this task when the dispatch future drops.
+                    std::future::pending::<()>().await;
+                })
+            })
+        };
+        let mut dispatch = Box::pin(bridge.dispatch(test_request(1), test_ctx()));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(dispatch.as_mut().poll(&mut cx).is_pending());
+        wait_for_count(&sent, 1).await;
+        assert_eq!(alive.load(Ordering::SeqCst), 1);
+        drop(dispatch);
+        wait_for_count(&alive, 0).await;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            bridge.dispatch(test_request(2), test_ctx()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status, http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn accepting_the_reply_detaches_the_bridge_task() {
+        let (response, feed, _) = feed_resp(false, &[("content-type", "text/event-stream")]);
+        let response = std::sync::Mutex::new(Some(response));
+        let bridge = spawn_on_current(1, move |_req, _ctx| {
+            std::future::ready(response.lock().unwrap().take().unwrap())
+        });
+
+        let response = bridge.dispatch(test_request(1), test_ctx()).await.unwrap();
+        let BridgeBody::Stream { mut rx, .. } = response.body else {
+            panic!("event streams are forwarded as they arrive");
+        };
+        feed.send(Bytes::from_static(b"event after head"))
+            .await
+            .unwrap();
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk, "event after head");
+        drop(feed);
+        assert!(rx.recv().await.is_none());
     }
 
     #[tokio::test]

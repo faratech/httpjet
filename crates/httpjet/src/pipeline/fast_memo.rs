@@ -145,18 +145,63 @@ pub(super) enum VaryItem {
         name: http::HeaderName,
         value: Option<Bytes>,
     },
-    /// The UA-cond match bitmap of a User-Agent-reading ruleset.
-    UaClass { rules: UaRules, bits: u64 },
+    /// The UA-cond match bitmap of a User-Agent-reading ruleset, paired with
+    /// the raw User-Agent bytes that produced it so identical UAs hit via a
+    /// single slice compare without UTF-8 lossy decode or `ua_cache` lookup.
+    UaClass {
+        rules: UaRules,
+        bits: u64,
+        raw_ua: Option<Bytes>,
+    },
 }
 
 impl VaryItem {
+    #[cfg(test)]
     fn matches(&self, req: &Request, ua_cache: &UaClassifyCache) -> bool {
         match self {
             VaryItem::Header { name, value } => {
                 req.headers().get(name).map(|v| v.as_bytes()) == value.as_deref()
             }
-            VaryItem::UaClass { rules, bits } => {
-                ua_cache.get_or_compute(rules.rules(), &ua_for_classify(req)) == *bits
+            VaryItem::UaClass {
+                rules,
+                bits,
+                raw_ua,
+            } => {
+                if req
+                    .headers()
+                    .get(http::header::USER_AGENT)
+                    .map(|v| v.as_bytes())
+                    == raw_ua.as_deref()
+                {
+                    return true;
+                }
+                ua_cache.get_or_compute(rules.rules(), &ua_for_headers(req.headers())) == *bits
+            }
+        }
+    }
+
+    fn matches_headers_cookieless(
+        &self,
+        headers: &http::HeaderMap,
+        ua_cache: &UaClassifyCache,
+    ) -> bool {
+        match self {
+            VaryItem::Header { name, value } => {
+                if *name == http::header::COOKIE {
+                    return value.is_none();
+                }
+                headers.get(name).map(|v| v.as_bytes()) == value.as_deref()
+            }
+            VaryItem::UaClass {
+                rules,
+                bits,
+                raw_ua,
+            } => {
+                if headers.get(http::header::USER_AGENT).map(|v| v.as_bytes()) == raw_ua.as_deref()
+                {
+                    return true;
+                }
+                ua_cache.get_or_compute(rules.rules(), &ua_for_headers(headers)) == *bits
             }
         }
     }
@@ -167,8 +212,12 @@ impl VaryItem {
                 a == b && va == vb
             }
             (
-                VaryItem::UaClass { rules: a, bits: ba },
-                VaryItem::UaClass { rules: b, bits: bb },
+                VaryItem::UaClass {
+                    rules: a, bits: ba, ..
+                },
+                VaryItem::UaClass {
+                    rules: b, bits: bb, ..
+                },
             ) => ba == bb && a.same(b),
             _ => false,
         }
@@ -189,7 +238,11 @@ pub(super) fn vary_header(req: &Request, name: http::HeaderName) -> VaryItem {
 /// first value, decoded lossily, absent ⇒ `""` (see `keyed_header` in
 /// `rewrite_glue`). Probe and store MUST classify the same string.
 pub(super) fn ua_for_classify(req: &Request) -> Cow<'_, str> {
-    req.headers()
+    ua_for_headers(req.headers())
+}
+
+fn ua_for_headers(headers: &http::HeaderMap) -> Cow<'_, str> {
+    headers
         .get(http::header::USER_AGENT)
         .map(hj_core::header_value_lossy)
         .unwrap_or(Cow::Borrowed(""))
@@ -216,11 +269,12 @@ struct MemoEntry {
     query: String,
     ae: Vec<u8>,
     vary: Vec<VaryItem>,
+    bandwidth: Option<super::PerConnBandwidth>,
     status: http::StatusCode,
     headers: Arc<http::HeaderMap>,
     /// `headers` ends with a placeholder `Date` that each replay overwrites in place.
     stamp_date: bool,
-    /// Unix epoch second of the `Date` currently stamped into `headers` (0 if none).
+    /// Last observed epoch second, shared by access logging and generated Date headers.
     stamped_date_sec: u64,
     body: Bytes,
     expires: Instant,
@@ -341,6 +395,17 @@ fn key_hash(k: &MemoKey) -> u64 {
     h.finish()
 }
 
+/// Empty query and encoding fields match by length. The usual string/slice
+/// comparison can still call into libc for a pair of zero-length inputs.
+#[inline]
+fn same_optional_bytes(stored: &[u8], current: &[u8]) -> bool {
+    if current.is_empty() {
+        stored.is_empty()
+    } else {
+        stored == current
+    }
+}
+
 /// Identity guard (page-cache rule 2): a hash collision degrades to a miss,
 /// never a wrong response.
 fn matches(e: &MemoEntry, k: &MemoKey) -> bool {
@@ -356,14 +421,16 @@ fn matches(e: &MemoEntry, k: &MemoKey) -> bool {
         && e.vhost == k.vhost
         && e.host == k.host
         && e.path == k.path
-        && e.query == k.query
-        && e.ae == k.ae
+        && same_optional_bytes(e.query.as_bytes(), k.query.as_bytes())
+        && same_optional_bytes(&e.ae, k.ae)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct PageMemoServe {
     pub key_hash: u64,
     pub variant_codec: Option<u8>,
+    pub deadline: Instant,
+    pub lease: hj_pagecache::SnapshotLease,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -377,6 +444,64 @@ pub(super) fn probe_serve<E>(
     purge_epoch_current: impl Fn(u64) -> bool,
     memo_changed_err: E,
 ) -> Option<Result<(Response, std::net::IpAddr, Option<PageMemoServe>, u64), E>> {
+    probe_shared_serve(
+        k,
+        req.headers(),
+        ua_cache,
+        now,
+        check_acl,
+        purge_epoch_current,
+        memo_changed_err,
+    )
+    .map(|result| {
+        result.map(|(hit, client_ip, page_serve, date_sec)| {
+            let mut response = http::Response::new(Body::Full(hit.body));
+            *response.status_mut() = hit.status;
+            if let Some(rate) = hit.bandwidth {
+                response.extensions_mut().insert(rate);
+            }
+            if use_shared_headers {
+                response
+                    .extensions_mut()
+                    .insert(hj_core::SharedHeaders(hit.headers));
+            } else {
+                *response.headers_mut() = (*hit.headers).clone();
+            }
+            (response, client_ip, page_serve, date_sec)
+        })
+    })
+}
+
+/// An authorized immutable memo serve before protocol response allocation.
+/// Never retained as a permission token; all live checks below run per probe.
+pub(super) struct SharedMemoServe {
+    pub status: http::StatusCode,
+    pub headers: Arc<http::HeaderMap>,
+    pub body: Bytes,
+    pub bandwidth: Option<super::PerConnBandwidth>,
+    pub expires: Instant,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn probe_shared_serve<E>(
+    k: &MemoKey,
+    headers: &http::HeaderMap,
+    ua_cache: &UaClassifyCache,
+    now: Instant,
+    check_acl: impl FnOnce() -> Result<std::net::IpAddr, E>,
+    purge_epoch_current: impl Fn(u64) -> bool,
+    memo_changed_err: E,
+) -> Option<
+    Result<
+        (
+            SharedMemoServe,
+            std::net::IpAddr,
+            Option<PageMemoServe>,
+            u64,
+        ),
+        E,
+    >,
+> {
     let h = key_hash(k);
     MEMO.with(|m| {
         let mut m = m.borrow_mut();
@@ -390,15 +515,23 @@ pub(super) fn probe_serve<E>(
                 return None;
             };
             let bucket = occ.get_mut();
-            bucket.retain(|e| {
-                if e.expires > now && e.page.as_ref().is_none_or(|p| p.lease.is_current()) {
-                    true
-                } else {
-                    removed_bytes += e.body.len();
-                    removed_count += 1;
-                    false
-                }
-            });
+            // Fast path: 99%+ of buckets hold a single live entry — skip `retain`
+            // closure overhead when that entry is still live.
+            let single_live = bucket.len() == 1
+                && bucket.first().is_some_and(|e| {
+                    e.expires > now && e.page.as_ref().is_none_or(|p| p.lease.is_current())
+                });
+            if !single_live {
+                bucket.retain(|e| {
+                    if e.expires > now && e.page.as_ref().is_none_or(|p| p.lease.is_current()) {
+                        true
+                    } else {
+                        removed_bytes += e.body.len();
+                        removed_count += 1;
+                        false
+                    }
+                });
+            }
             if bucket.is_empty() {
                 occ.remove();
                 None
@@ -408,7 +541,9 @@ pub(super) fn probe_serve<E>(
                     .find(|e| {
                         (k.allow_page_responses || e.page.is_none())
                             && matches(e, k)
-                            && e.vary.iter().all(|v| v.matches(req, ua_cache))
+                            && e.vary
+                                .iter()
+                                .all(|v| v.matches_headers_cookieless(headers, ua_cache))
                     })
                     .and_then(|e| {
                         if !purge_epoch_current(k.purge_epoch) {
@@ -425,30 +560,28 @@ pub(super) fn probe_serve<E>(
                             Some(PageMemoServe {
                                 key_hash: page.key_hash,
                                 variant_codec: e.variant_codec,
+                                deadline: page.deadline,
+                                lease: page.lease.clone(),
                             })
                         } else {
                             None
                         };
-                        let date_sec = if e.stamp_date {
-                            let (sec, maybe_val) =
-                                hj_core::http_date_sec_if_changed(now, e.stamped_date_sec);
-                            if let Some(date_val) = maybe_val {
+                        let (date_sec, changed_date) =
+                            hj_core::http_date_sec_if_changed(now, e.stamped_date_sec);
+                        if let Some(date_val) = changed_date {
+                            if e.stamp_date {
                                 Arc::make_mut(&mut e.headers).insert(http::header::DATE, date_val);
-                                e.stamped_date_sec = sec;
                             }
-                            sec
-                        } else {
-                            hj_core::http_date_sec_if_changed(now, u64::MAX).0
-                        };
-                        let mut resp = http::Response::new(Body::Full(e.body.clone()));
-                        *resp.status_mut() = e.status;
-                        if use_shared_headers {
-                            resp.extensions_mut()
-                                .insert(hj_core::SharedHeaders(Arc::clone(&e.headers)));
-                        } else {
-                            *resp.headers_mut() = (*e.headers).clone();
+                            e.stamped_date_sec = date_sec;
                         }
-                        Some(Ok((resp, client_ip, page_serve, date_sec)))
+                        let response = SharedMemoServe {
+                            status: e.status,
+                            headers: Arc::clone(&e.headers),
+                            body: e.body.clone(),
+                            bandwidth: e.bandwidth,
+                            expires: e.expires,
+                        };
+                        Some(Ok((response, client_ip, page_serve, date_sec)))
                     })
             }
         };
@@ -490,6 +623,9 @@ pub(super) fn probe(
         }
         let mut resp = http::Response::new(Body::Full(e.body.clone()));
         *resp.status_mut() = e.status;
+        if let Some(rate) = e.bandwidth {
+            resp.extensions_mut().insert(rate);
+        }
         *resp.headers_mut() = (*e.headers).clone();
         Some((resp, e.page.clone()))
     })
@@ -602,13 +738,14 @@ pub(super) fn store_until(
         query: k.query.to_owned(),
         ae: k.ae.to_owned(),
         vary,
+        bandwidth: resp.extensions().get::<super::PerConnBandwidth>().copied(),
         status: resp.status(),
         headers,
         stamp_date,
         stamped_date_sec,
         // Held for the memo's TTL. A pooled egress buffer (marked `FreshBody` by its producer)
         // is copied out, or the entry would pin it whole while the byte budget counted only
-        // its length; any other body (the static cache's exact-size bytes) is shared.
+        // its length; any other body (static cache or shrink_to_fit page-cache variants) is shared.
         body: if is_page
             || resp
                 .extensions()
@@ -736,6 +873,102 @@ mod tests {
         };
         let lease = store.lease_snapshot(&key, &snapshot).unwrap();
         (store, key, lease)
+    }
+
+    #[test]
+    fn borrowed_h2_payload_keeps_vary_acl_expiry_and_page_revocation() {
+        let now = Instant::now();
+        let request = req(&[("origin", "https://a.test")]);
+        let k = key("/borrowed-payload-guards", b"");
+        let deadline = now + Duration::from_millis(20);
+        assert!(store_until(
+            &k,
+            vec![vary_header(&request, http::header::ORIGIN)],
+            &resp(b"fresh"),
+            now,
+            deadline
+        ));
+        let cache = ua_cache();
+        let probe = |headers: &http::HeaderMap, at| {
+            probe_shared_serve(
+                &k,
+                headers,
+                &cache,
+                at,
+                || Ok::<_, ()>(std::net::Ipv4Addr::LOCALHOST.into()),
+                |_| true,
+                (),
+            )
+        };
+        let (hit, _, _, _) = probe(request.headers(), now).unwrap().unwrap();
+        assert_eq!(&hit.body[..], b"fresh");
+        assert!(probe(req(&[("origin", "https://b.test")]).headers(), now).is_none());
+        assert!(matches!(
+            probe_shared_serve(
+                &k,
+                request.headers(),
+                &cache,
+                now,
+                || Err::<std::net::IpAddr, _>("denied"),
+                |_| true,
+                "changed",
+            ),
+            Some(Err("denied"))
+        ));
+        assert!(probe(request.headers(), deadline).is_none());
+
+        let (store, page_key, lease) = page_lease();
+        let mut page_key_fields = key("/borrowed-payload-page", b"");
+        page_key_fields.allow_page_responses = true;
+        let mut response = resp(b"page");
+        response
+            .extensions_mut()
+            .insert(crate::lscache::PublicResponseMemo {
+                key_hash: 123,
+                purge_epoch: 0,
+                deadline: now + TTL,
+                lease,
+            });
+        assert!(store_until(
+            &page_key_fields,
+            Vec::new(),
+            &response,
+            now,
+            now + TTL
+        ));
+        let current = std::cell::Cell::new(true);
+        assert!(
+            matches!(
+                probe_shared_serve(
+                    &page_key_fields,
+                    request.headers(),
+                    &cache,
+                    now,
+                    || {
+                        current.set(false);
+                        Ok(std::net::Ipv4Addr::LOCALHOST.into())
+                    },
+                    |_| current.get(),
+                    (),
+                ),
+                Some(Err(()))
+            ),
+            "purge changing during ACL evaluation must stop the serve"
+        );
+        store.invalidate_key(&page_key);
+        assert!(
+            probe_shared_serve(
+                &page_key_fields,
+                request.headers(),
+                &cache,
+                now,
+                || Ok::<_, ()>(std::net::Ipv4Addr::LOCALHOST.into()),
+                |_| true,
+                (),
+            )
+            .is_none(),
+            "a revoked native lease must not replay"
+        );
     }
 
     #[test]
@@ -990,16 +1223,34 @@ mod tests {
         let now = Instant::now();
         let request = req(&[]);
         let cache = ua_cache();
+        let serve = |key: &MemoKey<'_>| {
+            probe_serve(
+                key,
+                &request,
+                &cache,
+                now,
+                false,
+                || Ok(std::net::Ipv4Addr::LOCALHOST.into()),
+                |_| true,
+                (),
+            )
+            .unwrap()
+            .unwrap()
+        };
         let undated = key("/undated", b"");
         store(&undated, Vec::new(), &resp(b"x"), now);
-        let (hit, _) = probe(&undated, &request, &cache, now).unwrap();
+        let (hit, _, _, logged_sec) = serve(&undated);
         let names: Vec<_> = hit.headers().keys().map(|n| n.as_str()).collect();
         assert_eq!(
             names,
             ["content-type", "date"],
             "Date stays last, as stamp_date appends it"
         );
-        assert_eq!(hit.headers()[http::header::DATE], hj_core::http_date_now());
+        let logged_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(logged_sec);
+        assert_eq!(
+            hit.headers()[http::header::DATE].to_str().unwrap(),
+            httpdate::fmt_http_date(logged_at)
+        );
 
         let dated = key("/dated", b"");
         let mut backend = resp(b"y");
@@ -1008,11 +1259,15 @@ mod tests {
             http::HeaderValue::from_static("Mon, 01 Jan 2024 00:00:00 GMT"),
         );
         store(&dated, Vec::new(), &backend, now);
-        let (hit, _) = probe(&dated, &request, &cache, now).unwrap();
-        assert_eq!(
-            hit.headers()[http::header::DATE],
-            "Mon, 01 Jan 2024 00:00:00 GMT"
-        );
+        let (expected_sec, _) = hj_core::http_date_sec_if_changed(now, 0);
+        for _ in 0..2 {
+            let (hit, _, _, logged_sec) = serve(&dated);
+            assert_eq!(logged_sec, expected_sec);
+            assert_eq!(
+                hit.headers()[http::header::DATE],
+                "Mon, 01 Jan 2024 00:00:00 GMT"
+            );
+        }
     }
 
     #[test]
@@ -1092,6 +1347,39 @@ mod tests {
             probe(&key("/a", b""), &r, &c, t0 + Duration::from_millis(1500)).is_none(),
             "expired entry must miss"
         );
+    }
+
+    #[test]
+    fn optional_fields_must_match_even_in_the_same_hash_bucket() {
+        let now = Instant::now();
+        let queries = ["", "a=1", "a=2"];
+        let encodings: &[&[u8]] = &[b"", b"gzip", b"br", b"zstd"];
+        for stored_query in queries {
+            for &stored_encoding in encodings {
+                let mut stored = key("/optional-fields", stored_encoding);
+                stored.query = stored_query;
+                store(&stored, Vec::new(), &resp(b"page"), now);
+                MEMO.with(|cache| {
+                    let cache = cache.borrow();
+                    let entry = cache.map[&key_hash(&stored)]
+                        .iter()
+                        .find(|entry| matches(entry, &stored))
+                        .expect("freshly stored entry");
+                    // Exercise the identity guard directly so the hash cannot
+                    // turn a mismatched field into a miss before this check.
+                    for query in queries {
+                        for &encoding in encodings {
+                            let mut candidate = key("/optional-fields", encoding);
+                            candidate.query = query;
+                            assert_eq!(
+                                matches(entry, &candidate),
+                                query == stored_query && encoding == stored_encoding
+                            );
+                        }
+                    }
+                });
+            }
+        }
     }
 
     #[test]
@@ -1192,6 +1480,10 @@ mod tests {
             vec![VaryItem::UaClass {
                 rules: UaRules::Inline(rs.clone()),
                 bits,
+                raw_ua: bot
+                    .headers()
+                    .get(http::header::USER_AGENT)
+                    .map(|v| Bytes::copy_from_slice(v.as_bytes())),
             }],
             &resp(b"bot"),
             t0,

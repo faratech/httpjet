@@ -155,6 +155,7 @@ impl Drop for InflightLeader {
 pub struct RefreshRegistry {
     inflight: dashmap::DashMap<u64, ()>,
     sem: Arc<tokio::sync::Semaphore>,
+    capacity: usize,
 }
 
 /// RAII token for an in-flight background refresh. On drop it frees the per-key
@@ -176,10 +177,16 @@ pub enum RefreshStart {
 
 impl RefreshRegistry {
     pub fn new(max_concurrent: usize) -> Arc<Self> {
+        let capacity = max_concurrent.max(1);
         Arc::new(RefreshRegistry {
             inflight: dashmap::DashMap::new(),
-            sem: Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1))),
+            sem: Arc::new(tokio::sync::Semaphore::new(capacity)),
+            capacity,
         })
+    }
+
+    pub(super) fn is_idle(&self) -> bool {
+        self.sem.available_permits() == self.capacity
     }
 
     /// Try to become the sole background-refresher for `key_hash`. Returns a guard

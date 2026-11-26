@@ -194,6 +194,21 @@ mod connection {
             }
         }
 
+        /// Copy plaintext into spare capacity and initialize the returned prefix.
+        /// EOF and WouldBlock follow the same rules as `Read::read`.
+        #[doc(hidden)]
+        #[inline]
+        pub fn read_into_spare(
+            &mut self,
+            buf: &mut [core::mem::MaybeUninit<u8>],
+        ) -> io::Result<usize> {
+            let len = self.received_plaintext.read_into_spare(buf);
+            if len > 0 || buf.is_empty() {
+                return Ok(len);
+            }
+            self.check_no_bytes_state().map(|()| len)
+        }
+
         /// Obtain a chunk of plaintext data received from the peer over this TLS connection.
         ///
         /// This method consumes `self` so that it can return a slice whose lifetime is bounded by
@@ -390,9 +405,16 @@ https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
         fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
             self.check_error()?;
             let payload_owner: Vec<&[u8]>;
-            let payload = match bufs.len() {
-                0 => return Ok(0),
-                1 => OutboundChunks::Single(bufs[0].deref()),
+            let pair;
+            let payload = match bufs {
+                [] => return Ok(0),
+                [only] => OutboundChunks::Single(only.deref()),
+                [first, second] => {
+                    // Headers plus body is a common write. Keep the borrowed
+                    // slice descriptors on the stack for this synchronous call.
+                    pair = [first.deref(), second.deref()];
+                    OutboundChunks::new(&pair)
+                }
                 _ => {
                     payload_owner = bufs.iter().map(|io_slice| io_slice.deref()).collect();
 
@@ -804,6 +826,13 @@ impl<Data> ConnectionCommon<Data> {
     /// [`CommonState::wants_write`] function can be used to check if the output buffer is empty.
     pub fn write_tls(&mut self, wr: &mut dyn io::Write) -> Result<usize, io::Error> {
         self.sendable_tls.write_to(wr)
+    }
+
+    /// Move a single queued TLS record to a transport that can hold its
+    /// allocation until asynchronous completion. Avoids copying small (<16 KiB)
+    /// responses into an intermediate 64 KiB write buffer.
+    pub fn take_single_tls_record(&mut self) -> Option<alloc::vec::Vec<u8>> {
+        self.sendable_tls.pop_single()
     }
 
     /// Move a bounded batch of queued TLS records to a transport that can hold

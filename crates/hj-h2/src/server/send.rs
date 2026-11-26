@@ -166,17 +166,139 @@ pub(super) fn begin_response(
     enc: &mut Encoder,
     out: &mut OutQueue,
     outstreams: &mut FxHashMap<u32, OutStream>,
-    send_schedule: &mut VecDeque<u32>,
+    send_schedule: &mut SendSchedule,
     pending_window: &mut FxHashMap<u32, i64>,
     send_conn: &mut i64,
     peer: &PeerSettings,
     block_scratch: &mut Vec<u8>,
 ) {
-    let (mut head, body) = response.into_parts();
+    begin_ready_response(
+        stream_id,
+        is_head,
+        super::ReadyResponse::Ordinary(response),
+        enc,
+        out,
+        outstreams,
+        send_schedule,
+        pending_window,
+        send_conn,
+        peer,
+        block_scratch,
+    );
+}
+
+pub(super) fn begin_ready_response(
+    stream_id: u32,
+    is_head: bool,
+    response: super::ReadyResponse,
+    enc: &mut Encoder,
+    out: &mut OutQueue,
+    outstreams: &mut FxHashMap<u32, OutStream>,
+    send_schedule: &mut SendSchedule,
+    pending_window: &mut FxHashMap<u32, i64>,
+    send_conn: &mut i64,
+    peer: &PeerSettings,
+    block_scratch: &mut Vec<u8>,
+) {
+    // Ultra-fast path for warm borrowed-memo H2 hits (`SharedFull` + HPACK replay hit):
+    // skips `Response::new().into_parts()`, `HeaderMap::get_all(LINK)`, and `OnceLock`
+    // checks because `remember_shared_response` only caches status-200, non-103-hint,
+    // pre-sanitized header maps.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    let response = match response {
+        super::ReadyResponse::SharedFull(shared) if !is_head => {
+            if let Some(wire) = enc.replay_shared_response(&shared.headers) {
+                let mf = (peer.max_frame_size as usize).max(1);
+                let bytes = shared.body;
+                #[cfg(feature = "monoio")]
+                if let Some(timing) = out.timing.as_mut()
+                    && bytes.len() <= 2048
+                {
+                    timing.short_ready();
+                }
+                if bytes.is_empty() {
+                    out.frames(|b| write_field_block(b, stream_id, flags::END_STREAM, wire, mf));
+                    return;
+                }
+                let credit = if pending_window.is_empty() {
+                    0
+                } else {
+                    pending_window.remove(&stream_id).unwrap_or(0)
+                };
+                let window = (peer.initial_window + credit).min(i32::MAX as i64);
+                let total = bytes.len();
+                if outstreams.is_empty()
+                    && total <= mf
+                    && total <= out.remaining_data_for(total)
+                    && (total as i64) <= (*send_conn).min(window)
+                {
+                    out.reserve_bulk_headroom(total);
+                    out.frames(|b| write_field_block(b, stream_id, 0, wire, mf));
+                    out.frames(|b| {
+                        FrameHeader {
+                            length: total as u32,
+                            kind: kind::DATA,
+                            flags: flags::END_STREAM,
+                            stream_id,
+                        }
+                        .write(b)
+                    });
+                    out.body(bytes);
+                    *send_conn -= total as i64;
+                    return;
+                }
+                out.frames(|b| write_field_block(b, stream_id, 0, wire, mf));
+                outstreams.insert(
+                    stream_id,
+                    OutStream {
+                        completion: None,
+                        pending: bytes,
+                        body: None,
+                        pulling: false,
+                        eof: true,
+                        done: false,
+                        window,
+                        cancel: None,
+                        stall: None,
+                        send_blocked: false,
+                        send_queued: true,
+                    },
+                );
+                send_schedule.ready.push_back(stream_id);
+                return;
+            }
+            super::ReadyResponse::SharedFull(shared)
+        }
+        other => other,
+    };
+
+    let (mut head, body, shared_override) = match response {
+        super::ReadyResponse::Ordinary(response) => {
+            let (head, body) = response.into_parts();
+            (head, body, None)
+        }
+        super::ReadyResponse::SharedFull(response) => {
+            // A plain Response creates empty stack parts; no extension map is
+            // allocated. All remaining sender logic is the existing path.
+            let (head, body) = Response::new(Body::Full(response.body)).into_parts();
+            (head, body, Some(hj_core::SharedHeaders(response.headers)))
+        }
+    };
+    #[cfg(feature = "monoio")]
+    if let Some(timing) = out.timing.as_mut()
+        && (is_head
+            || matches!(&body, Body::Empty)
+            || matches!(&body, Body::Full(bytes) if bytes.len() <= 2048)
+            || matches!(&body, Body::File(file) if file.len <= 2048))
+    {
+        timing.short_ready();
+    }
     // ResponseCompletion is opt-in (currently OpenTelemetry). The normal
     // production response has no extensions, so avoid a TypeId/hash-table
     // lookup on every H2 response.
-    let (mut completion, shared_headers) = if head.extensions.is_empty() {
+    let (mut completion, shared_headers) = if let Some(shared) = shared_override {
+        (None, Some(shared))
+    } else if head.extensions.is_empty() {
         (None, None)
     } else {
         (
@@ -236,12 +358,12 @@ pub(super) fn begin_response(
     // assets while the (often large/slow) body is still in flight. The hints stay on the
     // final response too. Same connection HPACK encoder; END_HEADERS but NOT END_STREAM
     // (§8.1 allows one or more interim 1xx HEADERS before the final response HEADERS).
+    let mut any_hint = false;
     if head.status.is_success() {
         // One scan decides hint-ness per Link value (bit i ⇒ value i is a hint), so the
         // emit loop below doesn't re-scan ~2.5 KB of Link values a second time per
         // response. Single pass avoids a duplicate `get_all(LINK)` probe when absent.
         let mut hints: u64 = 0;
-        let mut any_hint = false;
         for (i, v) in headers_ref.get_all(http::header::LINK).iter().enumerate() {
             if is_early_hint_link(v) {
                 any_hint = true;
@@ -267,18 +389,16 @@ pub(super) fn begin_response(
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let replay_headers = {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        shared_for_replay.filter(|headers| {
-            let short_response = match &body {
-                Body::Empty => true,
-                Body::Full(bytes) => bytes.len() <= 2048,
-                _ => false,
-            };
-            short_response
+        shared_for_replay.filter(|_| {
+            let replayable_body = matches!(&body, Body::Empty | Body::Full(_));
+            replayable_body
                 && *ENABLED.get_or_init(|| {
                     std::env::var_os("HJ_H2_HEADER_REPLAY").as_deref()
                         != Some(std::ffi::OsStr::new("0"))
                 })
-                && !headers.contains_key(http::header::LINK)
+                // Ordinary Link fields belong to the final block. Keep
+                // responses that emitted a separate 103 on the encode path.
+                && !any_hint
         })
     };
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -350,7 +470,7 @@ pub(super) fn begin_response(
         }
     };
     let register = |outstreams: &mut FxHashMap<u32, OutStream>,
-                    send_schedule: &mut VecDeque<u32>,
+                    send_schedule: &mut SendSchedule,
                     pending,
                     body,
                     eof,
@@ -368,9 +488,10 @@ pub(super) fn begin_response(
                 cancel: None,
                 stall: None,
                 send_blocked: false,
+                send_queued: true,
             },
         );
-        send_schedule.push_back(stream_id);
+        send_schedule.ready.push_back(stream_id);
     };
 
     // HEAD and body-forbidden statuses send the header block only. HEAD keeps the
@@ -416,17 +537,18 @@ pub(super) fn begin_response(
                 headers_only(out, completion.take());
             } else if outstreams.is_empty()
                 && bytes.len() <= mf
+                && bytes.len() <= out.remaining_data_for(bytes.len())
                 && (bytes.len() as i64) <= (*send_conn).min(window)
             {
                 // Single-frame direct-emit fast path: when no other stream is queued
-                // for round-robin fairness and the entire body fits in one DATA frame
-                // under both connection and stream windows, emit HEADERS + DATA(END_STREAM)
-                // directly without inserting/removing an OutStream or slicing Bytes.
-                let n = bytes.len();
+                // and the body fits in one DATA frame, emit HEADERS + DATA(END_STREAM)
+                // directly without inserting/removing an OutStream.
+                let total = bytes.len();
+                out.reserve_bulk_headroom(total);
                 emit_headers(out, 0);
                 out.frames(|b| {
                     FrameHeader {
-                        length: n as u32,
+                        length: total as u32,
                         kind: kind::DATA,
                         flags: flags::END_STREAM,
                         stream_id,
@@ -434,7 +556,7 @@ pub(super) fn begin_response(
                     .write(b)
                 });
                 out.body(bytes);
-                *send_conn -= n as i64;
+                *send_conn -= total as i64;
                 if let Some(completion) = completion.take() {
                     out.completions.push(completion);
                 }
@@ -614,13 +736,16 @@ fn pump_one_frame(
     max_frame: usize,
 ) -> bool {
     if !st.pending.is_empty() {
-        let allow = (*send_conn).min(st.window).min(max_frame as i64);
+        let frame_limit = max_frame.min(out.remaining_data()) as i64;
+        let allow = (*send_conn).min(st.window).min(frame_limit);
         if allow <= 0 {
             note_send_blocked(st, *send_conn <= 0);
             return false;
         }
         st.send_blocked = false;
-        let n = (allow as usize).min(st.pending.len());
+        let proposed = (allow as usize).min(st.pending.len());
+        out.reserve_bulk_headroom(proposed);
+        let n = proposed.min(out.remaining_data());
         let chunk = if n == st.pending.len() {
             std::mem::take(&mut st.pending)
         } else {
@@ -686,56 +811,89 @@ fn note_send_blocked(st: &mut OutStream, conn_starved: bool) -> bool {
     true
 }
 
-/// Drive every active outgoing body: send what the windows allow, queue a chunk pull for
-/// any stream that has drained its buffer and has more to come, and drop finished streams.
+/// Round-robin DATA among runnable streams. Backend and per-stream waits have
+/// no queue entry until their event occurs. A drained connection window parks
+/// its waiters together, in send order.
+#[derive(Default)]
+pub(super) struct SendSchedule {
+    ready: VecDeque<u32>,
+    connection_wait: VecDeque<u32>,
+}
+
+impl SendSchedule {
+    pub(super) fn wake(&mut self, sid: u32, st: &mut OutStream) {
+        if !st.send_queued {
+            st.send_queued = true;
+            self.ready.push_back(sid);
+        }
+    }
+}
+
+/// Flush runnable DATA and start body pulls. Returns whether the batch limit
+/// interrupted a runnable queue that the loop must revisit after flushing.
 pub(super) fn pump_streams(
     outstreams: &mut FxHashMap<u32, OutStream>,
-    send_schedule: &mut VecDeque<u32>,
+    send_schedule: &mut SendSchedule,
     out: &mut OutQueue,
     send_conn: &mut i64,
     pulls: &mut Pulls,
     peer: &PeerSettings,
-) {
+) -> bool {
+    if *send_conn > 0 && !send_schedule.connection_wait.is_empty() {
+        let mut woken = std::mem::take(&mut send_schedule.connection_wait);
+        woken.append(&mut send_schedule.ready);
+        send_schedule.connection_wait = std::mem::replace(&mut send_schedule.ready, woken);
+    } else if send_schedule.connection_wait.len() > outstreams.len() + 32 {
+        // RST or expiry can remove a parked response without restoring credit.
+        send_schedule
+            .connection_wait
+            .retain(|sid| outstreams.contains_key(sid));
+    }
     let max_frame = (peer.max_frame_size as usize).max(1);
-    let mut visits_without_output = send_schedule.len();
-    while visits_without_output > 0 {
-        let Some(sid) = send_schedule.pop_front() else {
+    while out.remaining_data() > 0 {
+        let Some(sid) = send_schedule.ready.pop_front() else {
             break;
         };
-        let mut keep = false;
-        let mut wrote = false;
-        if let Some(st) = outstreams.get_mut(&sid) {
+        let Some(st) = outstreams.get_mut(&sid) else {
+            continue;
+        };
+        st.send_queued = false;
+        if !st.done {
+            let window_before = st.window;
+            pump_one_frame(sid, st, out, send_conn, max_frame);
+            if !st.done && st.pending.is_empty() && !st.eof && !st.pulling {
+                if let Some(body) = st.body.take() {
+                    st.pulling = true;
+                    let cancel = st
+                        .cancel
+                        .get_or_insert_with(tokio_util::sync::CancellationToken::new)
+                        .clone();
+                    pulls.push(Box::pin(pull_next(sid, body, cancel)));
+                }
+            }
             if !st.done {
-                let window_before = st.window;
-                wrote = pump_one_frame(sid, st, out, send_conn, max_frame);
-                if !st.done && st.pending.is_empty() && !st.eof && !st.pulling {
-                    if let Some(body) = st.body.take() {
-                        st.pulling = true;
-                        let cancel = st
-                            .cancel
-                            .get_or_insert_with(tokio_util::sync::CancellationToken::new)
-                            .clone();
-                        pulls.push(Box::pin(pull_next(sid, body, cancel)));
+                let sent = (window_before - st.window).max(0) as u64;
+                st.stall = advance_stall(st.stall, sent, !st.pending.is_empty());
+                if !st.pending.is_empty() && st.window > 0 {
+                    // A stream that spent the last credit goes behind
+                    // streams that have not yet had their turn this round.
+                    if *send_conn <= 0 && sent == 0 {
+                        note_send_blocked(st, true);
+                        st.send_queued = true;
+                        send_schedule.connection_wait.push_back(sid);
+                    } else {
+                        send_schedule.wake(sid, st);
                     }
+                } else if !st.pending.is_empty() {
+                    note_send_blocked(st, false);
                 }
-                if !st.done {
-                    let sent = (window_before - st.window).max(0) as u64;
-                    st.stall = advance_stall(st.stall, sent, !st.pending.is_empty());
-                }
-                keep = !st.done;
             }
         }
-        if keep {
-            send_schedule.push_back(sid);
-        } else {
+        if st.done {
             outstreams.remove(&sid);
         }
-        if wrote {
-            visits_without_output = send_schedule.len();
-        } else {
-            visits_without_output -= 1;
-        }
     }
+    !send_schedule.ready.is_empty()
 }
 
 /// DATA bytes a response must deliver per send-stall window while it has bytes waiting
@@ -851,11 +1009,13 @@ pub(super) fn apply_pull(
     res: Option<Result<Bytes, hj_core::BoxError>>,
     outstreams: &mut FxHashMap<u32, OutStream>,
     out: &mut OutQueue,
+    schedule: &mut SendSchedule,
 ) {
     let Some(st) = outstreams.get_mut(&sid) else {
         return; // stream was reset/dropped while the pull was in flight
     };
     st.pulling = false;
+    schedule.wake(sid, st);
     match res {
         Some(Ok(data)) => {
             st.body = Some(body);
@@ -1112,6 +1272,7 @@ mod tests {
                 cancel: None,
                 stall: None,
                 send_blocked: false,
+                send_queued: false,
             }
         }
         fn data_stream_ids(out: &OutQueue) -> Vec<u32> {
@@ -1139,7 +1300,10 @@ mod tests {
         let mut streams = FxHashMap::default();
         streams.insert(1, stream(b"aaaaaaaa"));
         streams.insert(3, stream(b"bbbbbbbb"));
-        let mut schedule = VecDeque::from([1, 3]);
+        let mut schedule = SendSchedule {
+            ready: VecDeque::from([1, 3]),
+            ..Default::default()
+        };
         let mut out = OutQueue::default();
         let mut pulls = Pulls::new();
         let peer = PeerSettings {
@@ -1177,6 +1341,121 @@ mod tests {
     }
 
     #[test]
+    fn stream_credit_wakes_just_the_parked_stream() {
+        let mut streams = FxHashMap::default();
+        for (sid, window) in [(1, 0), (3, 4)] {
+            streams.insert(
+                sid,
+                OutStream {
+                    completion: None,
+                    pending: Bytes::from_static(b"data"),
+                    body: None,
+                    pulling: false,
+                    eof: true,
+                    done: false,
+                    window,
+                    cancel: None,
+                    stall: None,
+                    send_blocked: false,
+                    send_queued: true,
+                },
+            );
+        }
+        let mut schedule = SendSchedule {
+            ready: VecDeque::from([1, 3]),
+            ..Default::default()
+        };
+        let mut out = OutQueue::default();
+        let mut credit = 8;
+        let mut pulls = Pulls::new();
+        let peer = PeerSettings::default();
+        assert!(!pump_streams(
+            &mut streams,
+            &mut schedule,
+            &mut out,
+            &mut credit,
+            &mut pulls,
+            &peer
+        ));
+        assert!(schedule.ready.is_empty());
+        assert!(schedule.connection_wait.is_empty());
+        assert_eq!(credit, 4);
+        assert!(!streams.contains_key(&3));
+        let parked = streams.get_mut(&1).unwrap();
+        assert!(parked.stall.is_some());
+        parked.window = 4;
+        schedule.wake(1, parked);
+        schedule.wake(1, parked);
+        assert_eq!(schedule.ready.len(), 1);
+        assert!(!pump_streams(
+            &mut streams,
+            &mut schedule,
+            &mut out,
+            &mut credit,
+            &mut pulls,
+            &peer
+        ));
+        assert!(streams.is_empty());
+        assert_eq!(credit, 0);
+    }
+
+    #[test]
+    fn capped_send_batches_continue_without_more_credit() {
+        let mut streams = FxHashMap::default();
+        streams.insert(
+            1,
+            OutStream {
+                completion: None,
+                pending: Bytes::from_static(b"abcdefghij"),
+                body: None,
+                pulling: false,
+                eof: true,
+                done: false,
+                window: 10,
+                cancel: None,
+                stall: None,
+                send_blocked: false,
+                send_queued: false,
+            },
+        );
+        let mut schedule = SendSchedule {
+            ready: VecDeque::from([1]),
+            ..Default::default()
+        };
+        let mut out = OutQueue {
+            data_remaining: Some(6),
+            ..Default::default()
+        };
+        let mut conn_window = 10;
+        let mut pulls = Pulls::new();
+        let peer = PeerSettings::default();
+        assert!(pump_streams(
+            &mut streams,
+            &mut schedule,
+            &mut out,
+            &mut conn_window,
+            &mut pulls,
+            &peer
+        ));
+        assert_eq!(out.remaining_data(), 0);
+        assert_eq!(conn_window, 4);
+        assert_eq!(streams[&1].pending, b"ghij"[..]);
+        out.clear();
+        out.data_remaining = Some(6);
+        assert!(!pump_streams(
+            &mut streams,
+            &mut schedule,
+            &mut out,
+            &mut conn_window,
+            &mut pulls,
+            &peer
+        ));
+        assert_eq!(out.remaining_data(), 2);
+        assert_eq!(conn_window, 0);
+        assert!(streams.is_empty());
+    }
+
+    #[test]
     fn send_blocked_counts_once_per_transition_by_starved_window() {
         let blocked = super::super::send_blocked_counts;
         let mut st = OutStream {
@@ -1190,6 +1469,7 @@ mod tests {
             cancel: None,
             stall: None,
             send_blocked: false,
+            send_queued: false,
         };
         let mut out = OutQueue::default();
         let (conn0, stream0) = blocked();
@@ -1364,6 +1644,7 @@ mod tests {
                     cancel: Some(cancel),
                     stall: None,
                     send_blocked: false,
+                    send_queued: false,
                 },
             );
         }
@@ -1378,7 +1659,14 @@ mod tests {
                     .await
                     .expect("reset and unrelated pull must both complete")
                     .expect("pull result");
-            apply_pull(sid, body, result, &mut outstreams, &mut out);
+            apply_pull(
+                sid,
+                body,
+                result,
+                &mut outstreams,
+                &mut out,
+                &mut SendSchedule::default(),
+            );
             match sid {
                 1 => {
                     saw_cancelled = true;
@@ -1429,10 +1717,14 @@ mod tests {
                     cancel: None,
                     stall: None,
                     send_blocked: false,
+                    send_queued: false,
                 },
             );
         }
-        let mut schedule = VecDeque::from([1, 3]);
+        let mut schedule = SendSchedule {
+            ready: VecDeque::from([1, 3]),
+            ..Default::default()
+        };
         let mut out = OutQueue::default();
         let mut pulls = Pulls::new();
         let mut connection_window = 65_535;

@@ -199,6 +199,14 @@ where
         cancelled,
         inflight_sids,
         None,
+        None,
+        |fut| {
+            if super::spare_cores() {
+                super::TaggedInner::Spawned(super::AbortOnDrop(tokio::spawn(fut)))
+            } else {
+                super::TaggedInner::Inline(fut)
+            }
+        },
     )
 }
 
@@ -207,7 +215,7 @@ where
 /// `FuturesUnordered` + `inflight_sids`. Immediate on-core hits (fast-memo, page-cache,
 /// cached static) resolve directly into `ready_out` with zero cancellation-handle allocations.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn process_frame_with_ready<S, F>(
+pub(super) fn process_frame_with_ready<S, F, Sp>(
     hdr: FrameHeader,
     payload: &[u8],
     streams: &mut FxHashMap<u32, StreamState>,
@@ -222,11 +230,14 @@ pub(super) fn process_frame_with_ready<S, F>(
     inflight: &mut Inflight<F>,
     cancelled: &mut FxHashSet<u32>,
     inflight_sids: &mut FxHashMap<u32, AbortHandle>,
-    mut ready_out: Option<&mut Vec<(u32, bool, Response)>>,
+    mut ready_out: Option<&mut Vec<(u32, bool, super::ReadyResponse)>>,
+    borrowed_probe: Option<&super::BorrowedMemoProbe>,
+    wrap_inflight: Sp,
 ) -> FrameOutcome
 where
     S: Fn(Request) -> F,
-    F: Future<Output = Response> + Send + 'static,
+    F: Future<Output = Response> + 'static,
+    Sp: Fn(hj_core::Recycled<F>) -> super::TaggedInner<F>,
 {
     macro_rules! goaway {
         ($code:expr_2021) => {{
@@ -383,18 +394,12 @@ where
                             if let std::task::Poll::Ready(resp) =
                                 std::pin::Pin::new(&mut fut).poll(&mut cx)
                             {
-                                ready.push((sid, is_head, resp));
+                                ready.push((sid, is_head, super::ReadyResponse::Ordinary(resp)));
                                 inline_ready = true;
                             }
                         }
                         if !inline_ready {
-                            let inner = if super::spare_cores() {
-                                super::TaggedInner::Spawned(super::AbortOnDrop(tokio::spawn(
-                                    fut,
-                                )))
-                            } else {
-                                super::TaggedInner::Inline(fut)
-                            };
+                            let inner = wrap_inflight(fut);
                             let (tagged, abort) = super::Tagged::cancellable(sid, is_head, inner);
                             inflight.push(tagged);
                             // Retain the stream's cancellation handle until its future drains.
@@ -683,6 +688,29 @@ where
                     goaway!(error_code::COMPRESSION_ERROR);
                 }
                 recv.open_header_block = None;
+                // All stream ordering/concurrency, padding/priority and frame
+                // checks above remain authoritative. An exact stable block
+                // already has unchanged HPACK state and a validated empty body.
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                if borrowed_probe.is_some() && !super::spare_cores() {
+                    #[cfg(target_arch = "x86_64")]
+                    let borrowed = recv.stable_request.borrowed(dec, block);
+                    #[cfg(target_arch = "aarch64")]
+                    let borrowed = recv
+                        .sampled_request
+                        .as_ref()
+                        .and_then(|sample| sample.borrowed(dec, block, sid));
+                    if let Some((head, hint)) = borrowed
+                        && let Some(probe) = borrowed_probe
+                        && let Some(ready) = ready_out.as_deref_mut()
+                        && let Some(response) = (probe.0)(&head)
+                    {
+                        recv.header_count_hint = hint;
+                        recv.no_progress_frames = 0;
+                        ready.push((sid, false, super::ReadyResponse::SharedFull(response)));
+                        return FrameOutcome::Continue;
+                    }
+                }
                 let mut st = StreamState {
                     recv_window: iw,
                     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -691,20 +719,33 @@ where
                     ..Default::default()
                 };
                 #[cfg(target_arch = "x86_64")]
-                let mut decode_head =
-                    |decoder, stream, wire| recv.stable_request.decode(decoder, stream, wire, hint);
+                let decoded = recv.stable_request.decode(dec, &mut st, block, hint);
                 #[cfg(target_arch = "aarch64")]
-                let mut decode_head = |decoder, stream: &mut StreamState, wire| {
+                let decoded = {
                     if let Some(sampled) = recv.sampled_request.as_mut() {
-                        sampled.decode(decoder, stream, wire, hint, sid)
+                        sampled.decode(dec, &mut st, block, hint, sid)
                     } else {
-                        stream.headers = http::HeaderMap::with_capacity(hint);
-                        decode_block_from(decoder, stream, wire)
+                        st.headers = http::HeaderMap::with_capacity(hint);
+                        decode_block_from(dec, &mut st, block)
                     }
                 };
                 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-                use self::decode_block_from as decode_head;
-                match decode_head(dec, &mut st, block) {
+                let decoded = decode_block_from(dec, &mut st, block);
+                if borrowed_probe.is_some() {
+                    #[cfg(target_arch = "x86_64")]
+                    if let Some(head) = recv.stable_request.template.as_deref_mut() {
+                        head.prepare_borrowed_headers();
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    if let Some(head) = recv
+                        .sampled_request
+                        .as_mut()
+                        .and_then(|s| s.head.as_deref_mut())
+                    {
+                        head.prepare_borrowed_headers();
+                    }
+                }
+                match decoded {
                     Decoded::Ok => {
                         if declared_body_too_large(Some(&st), recv.max_request_body) {
                             reject_too_large!(sid, "413", true);
@@ -1070,10 +1111,9 @@ fn decode_discard_header_block(dec: &mut Decoder, block: &[u8]) -> bool {
 // table always go through the decoder, including inserts and size updates.
 // x86-64 checks consecutive heads. AArch64 spaces probes after a miss.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
-const STABLE_HEAD_BYTES: usize = 32;
+const STABLE_HEAD_BYTES: usize = 128;
 
 #[cfg(target_arch = "x86_64")]
-#[derive(Default)]
 pub(super) struct StableRequestHead {
     block: [u8; STABLE_HEAD_BYTES],
     len: usize,
@@ -1082,16 +1122,156 @@ pub(super) struct StableRequestHead {
     template: Option<Box<RequestHeadTemplate>>,
 }
 
+#[cfg(target_arch = "x86_64")]
+impl Default for StableRequestHead {
+    fn default() -> Self {
+        Self {
+            block: [0; STABLE_HEAD_BYTES],
+            len: 0,
+            table_revision: 0,
+            last_hash: None,
+            template: None,
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
+static NEXT_TEMPLATE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
 struct RequestHeadTemplate {
+    template_id: u64,
     method: http::Method,
     path: http::Uri,
     authority: Option<http::HeaderValue>,
     headers: http::HeaderMap,
+    borrowed_headers: Option<http::HeaderMap>,
+    borrowed_prepared: bool,
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
+impl RequestHeadTemplate {
+    fn retained_map_heap(capacity: usize, entries: usize, extras: usize) -> usize {
+        // Locked http 1.5 layout: Bucket owns HeaderName, HeaderValue, a u16
+        // hash and Option<two usize links>. Four usize cover hash/link/alignment
+        // overhead; round upward for slack. Pos is two u16; at 75% load,
+        // capacity*sizeof(usize) overbounds the index allocation on 64-bit.
+        let slot = (std::mem::size_of::<http::HeaderName>()
+            + std::mem::size_of::<http::HeaderValue>()
+            + 4 * std::mem::size_of::<usize>())
+        .div_ceil(64)
+            * 64;
+        let allocations =
+            usize::from(capacity != 0) + usize::from(entries != 0) + usize::from(extras != 0);
+        capacity
+            .saturating_mul(8)
+            .saturating_add(entries.saturating_mul(slot))
+            .saturating_add(extras.saturating_mul(slot))
+            .saturating_add(allocations * 2 * std::mem::size_of::<usize>())
+    }
+
+    fn retained_raw_bytes(&self) -> usize {
+        // HeaderMap derives Clone in locked http 1.5: immutable cloned entry
+        // and extra-value Vec capacities equal their lengths; boxed indices
+        // preserve the source capacity. Do not charge a receiving StreamState
+        // or pseudo-header/body-accounting allowance that this box never owns.
+        let keys = self.headers.keys().count();
+        let backing = self.headers.iter().fold(0usize, |bytes, (name, value)| {
+            bytes.saturating_add(
+                name.as_str().len() + value.len() + 4 * std::mem::size_of::<usize>(),
+            )
+        });
+        std::mem::size_of::<Self>()
+            .saturating_add(Self::retained_map_heap(
+                self.headers.capacity(),
+                keys,
+                self.headers.len() - keys,
+            ))
+            .saturating_add(backing)
+            .saturating_add(self.path.path().len() + self.path.query().map_or(0, |q| q.len() + 1))
+            .saturating_add(self.authority.as_ref().map_or(0, http::HeaderValue::len))
+            .saturating_add(self.method.as_str().len() + 8 * std::mem::size_of::<usize>())
+    }
+
+    fn prepare_borrowed_headers(&mut self) {
+        if self.borrowed_prepared {
+            return;
+        }
+        // Both availability and denial depend only on this immutable exact
+        // template. Never repeat scans on its ordinary fallback requests.
+        self.borrowed_prepared = true;
+        if self.method != http::Method::GET {
+            return;
+        }
+        let keys = self.headers.keys().count();
+        // Repeated fields retain the original path rather than relying on
+        // private extra-value growth details. No ordinary admission changes.
+        if self.headers.len() != keys {
+            return;
+        }
+        let needed = keys
+            + usize::from(
+                self.authority.is_some() && !self.headers.contains_key(http::header::HOST),
+            );
+        if needed == 0 || needed > 16 {
+            return;
+        }
+        let bound_slots = needed.max(6);
+        if self
+            .retained_raw_bytes()
+            .saturating_add(Self::retained_map_heap(bound_slots, bound_slots, 0))
+            > 2048
+        {
+            return;
+        }
+        let mut headers = http::HeaderMap::with_capacity(needed);
+        if headers.capacity() > 32 {
+            return;
+        }
+        for (name, value) in &self.headers {
+            headers.append(name.clone(), value.clone());
+        }
+        if let Some(authority) = &self.authority {
+            headers.insert(http::header::HOST, authority.clone());
+        }
+        // HeaderName/HeaderValue clones share their Bytes backing. The raw
+        // footprint already charges that data and its backing metadata once.
+        self.borrowed_headers = Some(headers);
+    }
+
+    fn borrowed(&self) -> Option<(super::BorrowedRequestHead<'_>, usize)> {
+        Some((
+            super::BorrowedRequestHead {
+                template_id: self.template_id,
+                method: &self.method,
+                uri: &self.path,
+                headers: self.borrowed_headers.as_ref()?,
+            },
+            (self.headers.len() + usize::from(self.authority.is_some())).min(HEADER_COUNT_HINT_MAX),
+        ))
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 impl StableRequestHead {
+    fn borrowed(
+        &self,
+        decoder: &Decoder,
+        wire: &[u8],
+    ) -> Option<(super::BorrowedRequestHead<'_>, usize)> {
+        let head = self.template.as_deref()?;
+        if head.borrowed_headers.is_none() {
+            return None;
+        }
+        if self.len == 0
+            || self.table_revision != decoder.table_revision()
+            || self.block.get(..self.len) != Some(wire)
+        {
+            return None;
+        }
+        head.borrowed()
+    }
+
     fn decode(
         &mut self,
         dec: &mut Decoder,
@@ -1143,16 +1323,18 @@ impl StableRequestHead {
             && !st.headers.contains_key(http::header::PROXY_AUTHORIZATION)
             && let (Some(method), Some(path)) = (st.method.as_ref(), st.path.as_ref())
             && (method == http::Method::GET || method == http::Method::HEAD)
-            && path.query().is_none()
             && let Some(wire) = self.block.get_mut(..block.len())
         {
             wire.copy_from_slice(block);
             self.len = block.len();
             self.template = Some(Box::new(RequestHeadTemplate {
+                template_id: NEXT_TEMPLATE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 method: method.clone(),
                 path: path.clone(),
                 authority: st.authority.clone(),
                 headers: st.headers.clone(),
+                borrowed_headers: None,
+                borrowed_prepared: false,
             }));
         }
         result
@@ -1161,7 +1343,6 @@ impl StableRequestHead {
 
 /// ARM request-head reuse with bounded work on changing header blocks.
 #[cfg(any(target_arch = "aarch64", test))]
-#[derive(Default)]
 pub(super) struct SampledRequestHead {
     wire: [u8; STABLE_HEAD_BYTES],
     len: usize,
@@ -1171,7 +1352,40 @@ pub(super) struct SampledRequestHead {
 }
 
 #[cfg(any(target_arch = "aarch64", test))]
+impl Default for SampledRequestHead {
+    fn default() -> Self {
+        Self {
+            wire: [0; STABLE_HEAD_BYTES],
+            len: 0,
+            revision: 0,
+            next_probe: 0,
+            head: None,
+        }
+    }
+}
+
+#[cfg(any(target_arch = "aarch64", test))]
 impl SampledRequestHead {
+    fn borrowed(
+        &self,
+        decoder: &Decoder,
+        wire: &[u8],
+        sid: u32,
+    ) -> Option<(super::BorrowedRequestHead<'_>, usize)> {
+        let head = self.head.as_deref()?;
+        if head.borrowed_headers.is_none() {
+            return None;
+        }
+        if sid < self.next_probe
+            || self.len == 0
+            || self.revision != decoder.table_revision()
+            || self.wire.get(..self.len) != Some(wire)
+        {
+            return None;
+        }
+        head.borrowed()
+    }
+
     #[cfg(target_arch = "aarch64")]
     pub(super) fn configured() -> Option<Self> {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1238,10 +1452,14 @@ impl SampledRequestHead {
             {
                 self.len = wire.len();
                 self.head = Some(Box::new(RequestHeadTemplate {
+                    template_id: NEXT_TEMPLATE_ID
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     method: method.clone(),
                     path: path.clone(),
                     authority: stream.authority.clone(),
                     headers: stream.headers.clone(),
+                    borrowed_headers: None,
+                    borrowed_prepared: false,
                 }));
                 return result;
             }
@@ -1504,6 +1722,159 @@ fn decode_block_from(dec: &mut Decoder, st: &mut StreamState, block: &[u8]) -> D
 mod pseudo_header_tests {
     use super::*;
     use crate::hpack::Encoder;
+
+    fn borrowed_field_fixture(fields: &[(&str, &str)]) -> (Decoder, Vec<u8>) {
+        fn literal(out: &mut Vec<u8>, bytes: &[u8]) {
+            if bytes.len() < 127 {
+                out.push(bytes.len() as u8);
+            } else {
+                out.push(127);
+                let mut remaining = bytes.len() - 127;
+                while remaining >= 128 {
+                    out.push((remaining as u8 & 127) | 128);
+                    remaining >>= 7;
+                }
+                out.push(remaining as u8);
+            }
+            out.extend_from_slice(bytes);
+        }
+        let mut decoder = Decoder::new(4096, 8192);
+        let mut seed = Vec::new();
+        for (name, value) in fields {
+            seed.push(0x40); // incrementally indexed, literal name
+            literal(&mut seed, name.as_bytes());
+            literal(&mut seed, value.as_bytes());
+        }
+        decoder.decode_octets(&seed, |_, _| {}).unwrap();
+        let mut block = b"\x82\x87\x04\x06/stuff".to_vec();
+        // Every request uses only existing dynamic entries; repeated requests
+        // do not alter the decoder table. :authority is first in fields.
+        for index in 0..fields.len() {
+            block.push(0x80 | (61 + fields.len() - index) as u8);
+        }
+        (decoder, block)
+    }
+
+    fn borrowed_benchmark_fixture() -> (Decoder, Vec<u8>) {
+        borrowed_field_fixture(&[
+            (":authority", "first.local"),
+            (
+                "user-agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+            ),
+            ("accept-encoding", "gzip, deflate, br, zstd"),
+            ("host", "first.local"),
+        ])
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn borrowed_h2_head_preserves_host_exact_scope_and_retention_bound() {
+        let (mut decoder, block) = borrowed_benchmark_fixture();
+        let mut cache = StableRequestHead::default();
+        for _ in 0..2 {
+            assert!(matches!(
+                cache.decode(&mut decoder, &mut StreamState::default(), &block, 4),
+                Decoded::Ok
+            ));
+        }
+        cache
+            .template
+            .as_deref_mut()
+            .unwrap()
+            .prepare_borrowed_headers();
+        let (view, _) = cache
+            .borrowed(&decoder, &block)
+            .expect("real browser UA/AE/Host must activate the borrowed view");
+        assert_eq!(view.headers[http::header::HOST], "first.local");
+        assert_eq!(
+            view.headers[http::header::ACCEPT_ENCODING],
+            "gzip, deflate, br, zstd"
+        );
+        assert!(view.headers[http::header::USER_AGENT].as_bytes().len() > 100);
+        let mut changed = block.clone();
+        changed[4] = b'X';
+        assert!(cache.borrowed(&decoder, &changed).is_none());
+        decoder
+            .decode_octets(b"\x41\x0csecond.local", |_, _| {})
+            .unwrap();
+        assert!(cache.borrowed(&decoder, &block).is_none());
+
+        let large = "x".repeat(700);
+        let (mut decoder, block) =
+            borrowed_field_fixture(&[(":authority", "first.local"), ("x-large", &large)]);
+        let mut cache = StableRequestHead::default();
+        for _ in 0..2 {
+            let mut request = StreamState::default();
+            assert!(matches!(
+                cache.decode(&mut decoder, &mut request, &block, 4),
+                Decoded::Ok
+            ));
+            assert!(
+                pending_header_charge(&request) <= 2048,
+                "old admission must stay intact"
+            );
+        }
+        let head = cache.template.as_deref_mut().unwrap();
+        assert!(
+            (1025..=2048).contains(&head.retained_raw_bytes()),
+            "real raw retained footprint is in the requested range"
+        );
+        head.prepare_borrowed_headers();
+        assert!(head.borrowed_prepared);
+        head.prepare_borrowed_headers();
+        assert!(
+            cache.borrowed(&decoder, &block).is_none(),
+            "raw+normalized retention must remain bounded"
+        );
+        let identity = cache.template.as_deref().unwrap() as *const RequestHeadTemplate;
+        let mut ordinary = StreamState::default();
+        assert!(matches!(
+            cache.decode(&mut decoder, &mut ordinary, &block, 4),
+            Decoded::Ok
+        ));
+        assert_eq!(
+            cache.template.as_deref().unwrap() as *const RequestHeadTemplate,
+            identity
+        );
+        assert_eq!(
+            ordinary.headers["x-large"].as_bytes().len(),
+            700,
+            "ordinary stable reuse still works"
+        );
+    }
+
+    #[test]
+    fn borrowed_h2_sampled_arm_view_uses_real_benchmark_headers() {
+        let (mut decoder, block) = borrowed_benchmark_fixture();
+        let mut sampled = SampledRequestHead::default();
+        for sid in [1, 3] {
+            assert!(matches!(
+                sampled.decode(&mut decoder, &mut StreamState::default(), &block, 4, sid),
+                Decoded::Ok
+            ));
+        }
+        sampled
+            .head
+            .as_deref_mut()
+            .unwrap()
+            .prepare_borrowed_headers();
+        let (view, _) = sampled
+            .borrowed(&decoder, &block, 5)
+            .expect("ARM sampled cache must activate for real UA/AE/Host");
+        assert_eq!(view.headers[http::header::HOST], "first.local");
+        assert_eq!(
+            view.headers[http::header::ACCEPT_ENCODING],
+            "gzip, deflate, br, zstd"
+        );
+        let mut changed = block.clone();
+        changed[4] = b'X';
+        assert!(sampled.borrowed(&decoder, &changed, 7).is_none());
+        decoder
+            .decode_octets(b"\x41\x0csecond.local", |_, _| {})
+            .unwrap();
+        assert!(sampled.borrowed(&decoder, &block, 7).is_none());
+    }
 
     #[cfg(target_arch = "x86_64")]
     #[test]

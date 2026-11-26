@@ -313,6 +313,8 @@ pub(super) struct OutStream {
     pub(super) stall: Option<SendStall>,
     /// Already counted as flow-control blocked; cleared by the next DATA frame it sends.
     pub(super) send_blocked: bool,
+    /// An ID already present in either queue, kept there until the sender pops it.
+    pub(super) send_queued: bool,
 }
 
 /// One response's send-stall clock: when its current window started and how many DATA

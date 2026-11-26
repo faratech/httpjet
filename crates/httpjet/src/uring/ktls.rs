@@ -509,12 +509,76 @@ pub(crate) struct KtlsStream<S> {
     rekey: RekeyState,
 }
 
+/// Zero-atomic single-threaded async lock for [`RekeyState`] on a monoio worker.
+/// Uncontended writes acquire and release with a single `Cell<bool>` flip instead
+/// of `tokio::sync::Mutex`'s atomic semaphore CAS.
+struct LocalRekeyLock {
+    locked: std::cell::Cell<bool>,
+    waiter: std::cell::RefCell<Option<std::task::Waker>>,
+    state: std::cell::RefCell<RekeyState>,
+}
+
+struct LocalRekeyGuard<'a> {
+    lock: &'a LocalRekeyLock,
+    guard: std::mem::ManuallyDrop<std::cell::RefMut<'a, RekeyState>>,
+}
+
+impl std::ops::Deref for LocalRekeyGuard<'_> {
+    type Target = RekeyState;
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for LocalRekeyGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for LocalRekeyGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: `guard` is dropped exactly once here before releasing `locked`.
+        unsafe {
+            std::mem::ManuallyDrop::drop(&mut self.guard);
+        }
+        self.lock.locked.set(false);
+        if let Some(waker) = self.lock.waiter.borrow_mut().take() {
+            waker.wake();
+        }
+    }
+}
+
+impl LocalRekeyLock {
+    fn new(state: RekeyState) -> Self {
+        Self {
+            locked: std::cell::Cell::new(false),
+            waiter: std::cell::RefCell::new(None),
+            state: std::cell::RefCell::new(state),
+        }
+    }
+
+    async fn lock(&self) -> LocalRekeyGuard<'_> {
+        std::future::poll_fn(|cx| {
+            if !self.locked.get() {
+                self.locked.set(true);
+                let guard = std::mem::ManuallyDrop::new(self.state.borrow_mut());
+                std::task::Poll::Ready(LocalRekeyGuard { lock: self, guard })
+            } else {
+                *self.waiter.borrow_mut() = Some(cx.waker().clone());
+                std::task::Poll::Pending
+            }
+        })
+        .await
+    }
+}
+
 /// Structurally split kTLS read half. The raw socket read half is independent;
 /// the rekey gate serializes receive-side KeyUpdate processing with every TX
 /// operation performed by [`KtlsWriteHalf`].
 pub(crate) struct KtlsReadHalf<R> {
     inner: R,
-    rekey: Rc<tokio::sync::Mutex<RekeyState>>,
+    rekey: Rc<LocalRekeyLock>,
 }
 
 /// Structurally split kTLS write half. Holding the rekey gate until a write
@@ -522,7 +586,7 @@ pub(crate) struct KtlsReadHalf<R> {
 /// data is still being submitted with the previous generation.
 pub(crate) struct KtlsWriteHalf<W> {
     inner: W,
-    rekey: Rc<tokio::sync::Mutex<RekeyState>>,
+    rekey: Rc<LocalRekeyLock>,
 }
 
 impl<S: AsRawFd> KtlsStream<S> {
@@ -680,7 +744,7 @@ impl<S: Splitable> Splitable for KtlsStream<S> {
 
     fn into_split(self) -> (Self::OwnedRead, Self::OwnedWrite) {
         let (read, write) = self.inner.into_split();
-        let rekey = Rc::new(tokio::sync::Mutex::new(self.rekey));
+        let rekey = Rc::new(LocalRekeyLock::new(self.rekey));
         (
             KtlsReadHalf {
                 inner: read,

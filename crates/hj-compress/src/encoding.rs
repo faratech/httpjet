@@ -542,6 +542,12 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+struct ZstdContext {
+    compressor: zstd::bulk::Compressor<'static>,
+    capped: bool,
+    search_log: u32,
+}
+
 thread_local! {
     /// Per-thread reused zstd compression context. zstd's `bulk::Compressor`
     /// "re-uses the zstd context between jobs to avoid re-allocations", so the
@@ -555,7 +561,7 @@ thread_local! {
     /// because the pooled context outlives any single `Levels`; so is the window
     /// cap (the `bool`: whether [`zstd_window_log`] is applied), which a level
     /// change does not clear.
-    static ZSTD_CCTX: std::cell::RefCell<Option<(zstd::bulk::Compressor<'static>, bool)>> =
+    static ZSTD_CCTX: std::cell::RefCell<Option<ZstdContext>> =
         std::cell::RefCell::new(None);
 }
 
@@ -576,24 +582,53 @@ pub(crate) fn zstd_bytes_level(input: &[u8], level: i32) -> Option<Vec<u8>> {
     })
 }
 
+/// Encode a stored page variant with the level-15 strategy and a shorter
+/// match search. Keeping the search override scoped preserves ordinary frames.
+pub fn encode_compact_zstd_short_search(input: &[u8]) -> Option<Vec<u8>> {
+    exact_output(zstd::zstd_safe::compress_bound(input.len()), |out| {
+        zstd_into_with_search(input, 15, 2, out)
+    })
+}
+
 /// Append the zstd frame of `input` to `out`, which must have room for
 /// `compress_bound(input.len())` more bytes.
 fn zstd_into(input: &[u8], level: i32, out: &mut Vec<u8>) -> Option<()> {
+    zstd_into_with_search(input, level, 0, out)
+}
+
+fn zstd_into_with_search(
+    input: &[u8],
+    level: i32,
+    search_log: u32,
+    out: &mut Vec<u8>,
+) -> Option<()> {
+    use zstd::zstd_safe::CParameter;
     ZSTD_CCTX.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
-            *slot = Some((zstd::bulk::Compressor::new(level).ok()?, false));
+            *slot = Some(ZstdContext {
+                compressor: zstd::bulk::Compressor::new(level).ok()?,
+                capped: false,
+                search_log: 0,
+            });
         }
-        let (comp, capped) = slot.as_mut()?;
-        comp.set_compression_level(level).ok()?;
+        let ctx = slot.as_mut()?;
+        ctx.compressor.set_compression_level(level).ok()?;
         let window = zstd_window_log(level);
-        if window.is_some() != *capped {
-            // 0 restores the level's own window.
-            comp.set_parameter(zstd::zstd_safe::CParameter::WindowLog(window.unwrap_or(0)))
+        if window.is_some() != ctx.capped {
+            ctx.compressor
+                .set_parameter(CParameter::WindowLog(window.unwrap_or(0)))
                 .ok()?;
-            *capped = window.is_some();
+            ctx.capped = window.is_some();
         }
-        comp.compress_to_buffer(input, out).ok().map(drop)
+        if search_log != ctx.search_log {
+            // Zero resets the override to the selected level's default.
+            ctx.compressor
+                .set_parameter(CParameter::SearchLog(search_log))
+                .ok()?;
+            ctx.search_log = search_log;
+        }
+        ctx.compressor.compress_to_buffer(input, out).ok().map(drop)
     })
 }
 
@@ -837,6 +872,27 @@ mod tests {
                 assert_eq!(negotiate_with(ae, p), reference(ae, p), "wrapper ae={ae:?}");
             }
             assert_eq!(parsed.is_empty(), ae.trim().is_empty(), "ae={ae:?}");
+        }
+    }
+
+    #[test]
+    fn compact_search_keeps_the_ordinary_encoder_byte_identical() {
+        let input: Vec<u8> = (0..30000u64)
+            .flat_map(|n| n.wrapping_mul(0x9e3779b97f4a7c15).to_le_bytes())
+            .collect();
+        let mut reference = zstd::bulk::Compressor::new(15).unwrap();
+        reference
+            .set_parameter(zstd::zstd_safe::CParameter::SearchLog(2))
+            .unwrap();
+        let expected = reference.compress(&input).unwrap();
+        for level in [9, 15, 19] {
+            let tuned = encode_compact_zstd_short_search(&input).unwrap();
+            assert_eq!(tuned, expected);
+            assert_eq!(decode_bytes(Encoding::Zstd, &tuned).unwrap(), input);
+            assert_eq!(
+                zstd_bytes_level(&input, level).unwrap(),
+                zstd::bulk::compress(&input, level).unwrap()
+            );
         }
     }
 

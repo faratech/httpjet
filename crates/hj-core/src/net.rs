@@ -34,12 +34,12 @@ pub fn host_without_port_cow(authority: &str) -> std::borrow::Cow<'_, str> {
     let host = if let Some(rest) = a.strip_prefix('[') {
         // `[ipv6]` or `[ipv6]:port` — take up to the closing bracket.
         rest.split(']').next().unwrap_or(rest)
-    } else if a.as_bytes().iter().filter(|&&b| b == b':').count() > 1 {
-        // Unbracketed multi-colon: a bare IPv6 literal (malformed in a Host header
-        // per RFC 7230, but don't mangle it) — there is no port to strip.
-        a
+    } else if let Some((host, suffix)) = a.split_once(':') {
+        // Preserve a bare IPv6 literal. Only a single colon can separate
+        // an unbracketed host from its port.
+        if suffix.contains(':') { a } else { host }
     } else {
-        a.split(':').next().unwrap_or(a)
+        a
     };
     let trimmed = host.trim_end_matches('.');
     if trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
@@ -70,23 +70,33 @@ pub fn valid_uri_scheme(value: &str) -> bool {
         && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
 }
 
-fn uri_sub_delim(byte: u8) -> bool {
+const fn uri_sub_delim(byte: u8) -> bool {
     matches!(
         byte,
         b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'='
     )
 }
 
+/// Unreserved bytes and sub-delimiters. Percent escapes and the optional
+/// colon in userinfo are handled separately.
+const URI_COMPONENT_PLAIN: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut i = 0;
+    while i < table.len() {
+        let b = i as u8;
+        table[i] =
+            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') || uri_sub_delim(b);
+        i += 1;
+    }
+    table
+};
+
 fn valid_uri_component(value: &str, allow_colon: bool) -> bool {
     let bytes = value.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        if b.is_ascii_alphanumeric()
-            || matches!(b, b'-' | b'.' | b'_' | b'~')
-            || uri_sub_delim(b)
-            || (allow_colon && b == b':')
-        {
+        if URI_COMPONENT_PLAIN[usize::from(b)] || (allow_colon && b == b':') {
             i += 1;
         } else if b == b'%'
             && bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
@@ -115,11 +125,9 @@ fn valid_ip_literal(value: &str) -> bool {
     !version.is_empty()
         && version.bytes().all(|b| b.is_ascii_hexdigit())
         && !address.is_empty()
-        && address.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(b, b'-' | b'.' | b'_' | b'~' | b':')
-                || uri_sub_delim(b)
-        })
+        && address
+            .bytes()
+            .all(|b| b == b':' || URI_COMPONENT_PLAIN[usize::from(b)])
 }
 
 /// RFC 3986 §3.2 authority syntax. This validates the generic grammar rather
@@ -134,26 +142,29 @@ pub fn valid_uri_authority(value: &str) -> bool {
         value
     };
 
+    authority_host(host_port).is_some()
+}
+
+/// Return the validated host without allocating or normalizing its spelling.
+/// The generic URI validator permits an empty registered name.
+fn authority_host(host_port: &str) -> Option<&str> {
     if let Some(literal) = host_port.strip_prefix('[') {
-        let Some(close) = literal.find(']') else {
-            return false;
-        };
-        let (address, suffix) = literal.split_at(close);
-        let suffix = &suffix[1..];
-        return valid_ip_literal(address)
+        let (address, suffix) = literal.split_once(']')?;
+        return (valid_ip_literal(address)
             && (suffix.is_empty()
                 || suffix
                     .strip_prefix(':')
-                    .is_some_and(|port| port.bytes().all(|b| b.is_ascii_digit())));
+                    .is_some_and(|port| port.bytes().all(|b| b.is_ascii_digit()))))
+        .then_some(address);
     }
 
     let (host, port) = match host_port.rsplit_once(':') {
         Some((host, port)) => (host, Some(port)),
         None => (host_port, None),
     };
-    !host.contains(':')
-        && valid_uri_component(host, false)
-        && port.is_none_or(|port| port.bytes().all(|b| b.is_ascii_digit()))
+    (valid_uri_component(host, false)
+        && port.is_none_or(|port| port.bytes().all(|b| b.is_ascii_digit())))
+    .then_some(host)
 }
 
 /// Validate an HTTP(S) authority. RFC 3986's generic authority grammar permits
@@ -161,7 +172,8 @@ pub fn valid_uri_authority(value: &str) -> bool {
 /// neither. Keep the generic validator separate so HTTP/2 can still carry valid
 /// non-HTTP schemes.
 pub fn valid_http_authority(value: &str) -> bool {
-    !value.contains('@') && valid_uri_authority(value) && !host_without_port_cow(value).is_empty()
+    !value.contains('@')
+        && authority_host(value).is_some_and(|host| !host.trim_end_matches('.').is_empty())
 }
 
 #[cfg(test)]

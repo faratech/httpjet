@@ -685,7 +685,20 @@ pub(crate) fn record_response_memo_hit_codec(
 ) {
     if let Some(store) = state.page_cache.as_ref() {
         store.record_hit();
-        state.page_cache_admission.record(key_hash);
+        // Sample W-TinyLFU admission bumps on already-admitted response_memo hits
+        // (1 in 16 per thread) to avoid bouncing the hot key's admission cache line
+        // across cores on every cached H2 hit.
+        thread_local! {
+            static ADMIT_STRIDE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+        }
+        let tick = ADMIT_STRIDE.with(|c| {
+            let v = c.get().wrapping_add(1);
+            c.set(v);
+            v
+        });
+        if (tick & 15) == 0 {
+            state.page_cache_admission.record(key_hash);
+        }
         state.metrics.pagecache_lookup.record_result(2, 0);
         if let Some(counter) = variant_codec
             .and_then(|index| state.metrics.pagecache_variant_serves.get(index as usize))
@@ -1106,6 +1119,32 @@ fn lookup(
             capsule_shell,
         );
     }
+    if method == Method::GET
+        && entry.variants_filled
+        && hit::compact_zstd_enabled()
+        && accept_encoding.accepts(Encoding::Zstd)
+        && matches!(entry.scope, hj_pagecache::PageScope::Public)
+        && entry.status == 200
+        && !capsule_shell
+        && !entry.compact_zstd_attempted()
+        && !hj_compress::no_gzip(ctx)
+        && state.page_cache_admission.estimate(key_hash) >= COMPACT_ZSTD_MIN_SIGHTINGS
+        && state.compress.stored_encodable(&entry.headers)
+    {
+        if let Some((_, frame)) = entry
+            .variants
+            .iter()
+            .find(|(codec, body)| codec == "zstd" && body.len() <= 256 * 1024)
+        {
+            spawn_compact_zstd(
+                state,
+                key_ref.to_owned(),
+                key_hash,
+                entry.clone(),
+                frame.clone(),
+            );
+        }
+    }
     match build_hit_response_with_successor_retry(
         state,
         store,
@@ -1401,6 +1440,8 @@ fn spawn_guarded(
     RefreshStart::Started
 }
 
+static ORDINARY_VARIANT_FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn spawn_variant_fill(
     state: &Arc<ServerState>,
     key: hj_pagecache::PageCacheKey,
@@ -1412,7 +1453,7 @@ fn spawn_variant_fill(
     let at_rest_zstd = plain_skips_zstd_fill(state, key_hash, &entry);
     let registry = state.page_cache_variant_fill.clone();
     let state = state.clone();
-    spawn_guarded(&registry, key_hash, async move {
+    let admitted = spawn_guarded(&registry, key_hash, async move {
         let Some(store) = state.page_cache.clone() else {
             return;
         };
@@ -1440,6 +1481,7 @@ fn spawn_variant_fill(
                     accept_encoding,
                     capsule_shell,
                     at_rest_zstd,
+                    !matches!(entry.scope, hj_pagecache::PageScope::Public),
                 );
                 // The store only uses `derive_len` for an InMem body (a file-tier body
                 // keeps its tmpfs identity), so skip the verify decode everywhere else.
@@ -1476,6 +1518,64 @@ fn spawn_variant_fill(
             }
         }
         store.fill_variants(&key, &entry.identity, entry.stored_at, variants, derive_len);
+    });
+    if admitted == RefreshStart::Started && hit::compact_zstd_enabled() {
+        ORDINARY_VARIANT_FILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+// Count-min estimates include the initial store and any finalized response memo hits.
+const COMPACT_ZSTD_MIN_SIGHTINGS: u8 = 8;
+
+fn spawn_compact_zstd(
+    state: &Arc<ServerState>,
+    key: hj_pagecache::PageCacheKey,
+    key_hash: u64,
+    entry: Arc<CachedResponse>,
+    frame: Bytes,
+) {
+    static UPGRADE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    let Ok(permit) = UPGRADE.try_acquire() else {
+        return;
+    };
+    let Some(store) = state.page_cache.clone() else {
+        return;
+    };
+    let state = state.clone();
+    let registry = state.page_cache_variant_fill.clone();
+    let Some(handle) = pipeline_handle() else {
+        return;
+    };
+    let started = ORDINARY_VARIANT_FILLS.load(std::sync::atomic::Ordering::Relaxed);
+    handle.spawn(async move {
+        // Let ordinary fills claim the shared budget before spending CPU on
+        // an already usable response. The next hit can retry if we defer.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if !registry.is_idle()
+            || ORDINARY_VARIANT_FILLS.load(std::sync::atomic::Ordering::Relaxed) != started
+        {
+            return;
+        }
+        spawn_guarded(&registry, key_hash, async move {
+            // Upgrades still share the total four-slot fill budget. One upgrade
+            // leaves the remaining permits available to ordinary fills.
+            let _permit = permit;
+            if !store.mark_compact_zstd_attempt(&key, &entry.identity, entry.stored_at) {
+                return;
+            }
+            let (identity, stored_at) = (entry.identity.clone(), entry.stored_at);
+            let result = tokio::task::spawn_blocking(move || {
+                hit::compact_stored_zstd(&entry.headers, &frame)
+            })
+            .await;
+            if let Ok(Some(encoded)) = result
+                && store.install_compact_zstd(&key, &identity, stored_at, encoded)
+                && let Some(index) = variant_codec_index("zstd")
+            {
+                state.metrics.pagecache_variant_fills[index]
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
     });
 }
 
@@ -2922,14 +3022,15 @@ fn capsule_public_fallback_lookup(
 
     let key = configuration_key(state, capsule_public_fallback_key(ctx, cc, store));
     let key_hash = hash_key(&key);
-    let (mut entry, stale) = match store.get_entry_uncounted(&key, cc.identity, now) {
-        hj_pagecache::EntryState::Fresh(e) => (e, false),
-        hj_pagecache::EntryState::Stale(e) => (e, true),
-        hj_pagecache::EntryState::ErrorOnly(_) | hj_pagecache::EntryState::Miss => {
-            record_capsule_miss(state, "public_fallback_miss");
-            return CacheOutcome::Miss(dedicated_key_hash);
-        }
-    };
+    let (mut entry, stale) =
+        match store.get_entry_hashed_uncounted(key_hash, &key, cc.identity, now) {
+            hj_pagecache::EntryState::Fresh(e) => (e, false),
+            hj_pagecache::EntryState::Stale(e) => (e, true),
+            hj_pagecache::EntryState::ErrorOnly(_) | hj_pagecache::EntryState::Miss => {
+                record_capsule_miss(state, "public_fallback_miss");
+                return CacheOutcome::Miss(dedicated_key_hash);
+            }
+        };
 
     if !capsule_entry_shell_capable(&entry)
         || (entry.dict_gen != 0 && matching_dict(state, entry.dict_gen).is_none())
@@ -3015,7 +3116,7 @@ fn capsule_public_fallback_lookup(
         spawn_variant_fill(
             state,
             key.clone(),
-            hash_key(&key),
+            key_hash,
             entry.clone(),
             accept_encoding,
             true,
@@ -3159,7 +3260,7 @@ pub fn capsule_lookup(
     }
     let key = configuration_key(state, capsule_key(ctx, cc, store));
     let key_hash = hash_key(&key);
-    let mut entry = match store.get_entry_uncounted(&key, cc.identity, now) {
+    let mut entry = match store.get_entry_hashed_uncounted(key_hash, &key, cc.identity, now) {
         hj_pagecache::EntryState::Fresh(e) => e,
         hj_pagecache::EntryState::Stale(mut e) => {
             if e.dict_gen != 0 && matching_dict(state, e.dict_gen).is_none() {
@@ -3403,10 +3504,15 @@ fn stale_if_error_fallback(
     {
         return None;
     }
-    let ResolvedKey { key, identity, .. } = resolved_cache_key(state, ctx, cc, store, route)?;
+    let ResolvedKey {
+        key,
+        key_hash,
+        identity,
+        ..
+    } = resolved_cache_key(state, ctx, cc, store, route)?;
     let identity: &str = &identity;
     let now = Instant::now();
-    let mut entry = match store.get_entry(&key, identity, now) {
+    let mut entry = match store.get_entry_hashed(key_hash, &key, identity, now) {
         hj_pagecache::EntryState::Fresh(e)
         | hj_pagecache::EntryState::Stale(e)
         | hj_pagecache::EntryState::ErrorOnly(e) => e,
@@ -4086,6 +4192,29 @@ pub async fn cache_store_leading(
             strip_control_headers(&mut parts.headers);
             return Response::from_parts(parts, Body::Stream(inner));
         };
+        let second_sighting = url_vary.is_none()
+            && cfg
+                .stream_fill_second_sighting_vhosts
+                .iter()
+                .any(|host| host.eq_ignore_ascii_case(&ctx.vhost_name));
+        let admit_base = if second_sighting {
+            state.page_cache_admit_base.max(2)
+        } else {
+            state.page_cache_admit_base
+        };
+        if second_sighting && state.page_cache_admission.estimate(key_hash) < admit_base {
+            state.telemetry.record_cache_admission(false);
+            strip_control_headers(&mut parts.headers);
+            parts.headers.remove(CONTENT_ENCODING);
+            parts.headers.remove(TRANSFER_ENCODING);
+            parts
+                .headers
+                .insert(HDR_CACHE_STATUS, HeaderValue::from_static("miss"));
+            parts.extensions.insert(hj_compress::ProgressiveBody);
+            // There is no pending fill for followers to await.
+            drop(leader.take());
+            return Response::from_parts(parts, Body::Stream(inner));
+        }
         let mut lease = BodyBufferLease::new(state.body_budget.clone());
         if !lease.reserve(COLLECT_DEFAULT_CAPACITY as u64) {
             strip_control_headers(&mut parts.headers);
@@ -4095,6 +4224,7 @@ pub async fn cache_store_leading(
         let commit = FillCommit {
             state: state.clone(),
             entry: PendingEntry {
+                admit_base,
                 key_hash,
                 key,
                 identity,
@@ -4437,6 +4567,7 @@ pub async fn cache_store_leading(
                  identity,
                  url_vary,
              }| PendingEntry {
+                admit_base: state.page_cache_admit_base,
                 key_hash,
                 key,
                 identity,
@@ -4545,6 +4676,7 @@ fn is_xf_error_body(status: u16, content_type: &str, body: &[u8]) -> bool {
 
 /// A fully received miss, keyed and classified, ready for the admission check and store.
 struct PendingEntry {
+    admit_base: u8,
     key: hj_pagecache::PageCacheKey,
     key_hash: u64,
     identity: String,
@@ -4590,7 +4722,9 @@ fn store_admitted(
     // whole point is serving the SAME session's next request.
     retire_superseded_url_vary(store, &entry.url_vary);
     let is_private = matches!(entry.scope, PageScope::Private { .. });
-    let admitted = is_private || admission_bar_met(state, entry.key_hash, bytes.len() as u64);
+    let admitted = is_private
+        || state.page_cache_admission.estimate(entry.key_hash)
+            >= admission_threshold(entry.admit_base, bytes.len() as u64);
     state.telemetry.record_cache_admission(admitted);
     if !admitted {
         return None;
@@ -7024,6 +7158,62 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn progressive_fill_waits_for_second_sighting_before_capturing() {
+        let (state, ctx, store) =
+            cache_test_ctx_with(crate::state::XfCapsuleConfig::disabled(), |cfg| {
+                cfg.stream_fill_vhosts = vec!["forum.example".into()];
+                cfg.stream_fill_second_sighting_vhosts = vec!["forum.example".into()];
+            });
+        let method = Method::GET;
+        let cc = page_cc(
+            &method,
+            "/moon",
+            "https\nforum.example\n/moon",
+            store.purge_epoch(),
+        );
+        for attempt in 0..2 {
+            let CacheOutcome::Miss(key) = cache_lookup(&state, &ctx, &cc, None, false, None) else {
+                panic!("expected a miss");
+            };
+            let Enter::Leader(guard) = state.page_cache_inflight.enter(key, 0) else {
+                panic!("expected an available leader slot");
+            };
+            let (feed, resp) = fed_page(None);
+            let resp = cache_store_leading(&state, &ctx, &cc, resp, &mut Some(guard)).await;
+            assert!(
+                resp.extensions()
+                    .get::<hj_compress::ProgressiveBody>()
+                    .is_some()
+            );
+            let Body::Stream(mut body) = resp.into_body() else {
+                panic!("expected a progressive stream");
+            };
+            if attempt == 0 {
+                // No store to await. A competing request can lead the next render.
+                assert!(matches!(
+                    state.page_cache_inflight.enter(key, 0),
+                    Enter::Leader(_)
+                ));
+            }
+            feed.send(Ok(Bytes::from_static(b"<head>"))).unwrap();
+            assert_eq!(next_data(&mut body).await.unwrap(), "<head>");
+            drop(feed);
+            assert!(next_data(&mut body).await.is_none());
+            assert_eq!(
+                state
+                    .metrics
+                    .pagecache_stream_fill_stores
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                attempt
+            );
+        }
+        let CacheOutcome::Hit(hit) = cache_lookup(&state, &ctx, &cc, None, false, None) else {
+            panic!("the second completed request should have stored the entry");
+        };
+        assert!(matches!(hit.into_body(), Body::Full(bytes) if bytes.as_ref() == b"<head>"));
     }
 
     #[tokio::test]

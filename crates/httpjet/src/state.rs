@@ -510,6 +510,13 @@ impl H1ConnEnd {
 #[derive(Default)]
 pub struct H1ConnEnds([AtomicU64; H1ConnEnd::ALL.len()]);
 
+impl Metrics {
+    #[inline]
+    pub fn record_fast_memo_hit(&self) {
+        self.fast_memo_hits.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 impl H1ConnEnds {
     pub fn record(&self, end: H1ConnEnd) {
         if let Some(count) = self.0.get(end as usize) {
@@ -525,12 +532,53 @@ impl H1ConnEnds {
     }
 }
 
+/// 16-way cache-line-padded sharded counter. Eliminates cross-core MESI RFO
+/// cache-line bouncing on hot per-request counters (`fast_memo_hits`,
+/// `pagecache_variant_serves`) while preserving `.fetch_add` / `.load` API.
+pub struct ShardedAtomic([PaddedAtomic; 16]);
+
+impl Default for ShardedAtomic {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| PaddedAtomic::default()))
+    }
+}
+
+impl ShardedAtomic {
+    #[inline]
+    fn shard_slot() -> usize {
+        static NEXT_SHARD: AtomicU64 = AtomicU64::new(0);
+        thread_local! {
+            static SHARD: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+        }
+        SHARD.with(|c| {
+            let s = c.get();
+            if s != usize::MAX {
+                return s;
+            }
+            let assigned = (NEXT_SHARD.fetch_add(1, Ordering::Relaxed) as usize) & 15;
+            c.set(assigned);
+            assigned
+        })
+    }
+
+    #[inline]
+    pub fn fetch_add(&self, v: u64, ord: Ordering) -> u64 {
+        let slot = Self::shard_slot();
+        if let Some(c) = self.0.get(slot) {
+            c.fetch_add(v, ord)
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    pub fn load(&self, ord: Ordering) -> u64 {
+        self.0.iter().map(|c| c.load(ord)).sum()
+    }
+}
+
 #[derive(Default)]
 pub struct Metrics {
-    /// (OPS1) Total requests served, incremented at the access-log point.
-    /// (#321) Cache-line padded: incremented by EVERY worker at the access-log
-    /// point, so an unpadded line ping-pongs across cores on every request.
-    pub requests_total: Arc<PaddedAtomic>,
     /// (OPS1) Currently-open connections (the io_uring accept loop does ±1 around each
     /// connection task); the graceful-drain loop waits on this reaching the in-flight count.
     pub active_conns: Arc<AtomicU64>,
@@ -541,7 +589,7 @@ pub struct Metrics {
     /// (OPS3) Local loopback purges received on /__hj_cache_purge and applied.
     pub purges_received: Arc<AtomicU64>,
     /// (#349) Finished-response memo hits served on the on-core fast path.
-    pub fast_memo_hits: Arc<PaddedAtomic>,
+    pub fast_memo_hits: Arc<ShardedAtomic>,
     /// (#349) Finished-response memo stores (first full-pipeline serve per key/TTL).
     pub fast_memo_stores: Arc<AtomicU64>,
     /// (#349) Memo-eligible static requests whose `.htaccess` chain refused the store
@@ -611,7 +659,7 @@ pub struct Metrics {
     /// Precompressed page-cache variants built by first-hit fills, and hits served from one,
     /// per codec (zstd, br, gzip — see `lscache::VARIANT_CODECS`).
     pub pagecache_variant_fills: Arc<[PaddedAtomic; 3]>,
-    pub pagecache_variant_serves: Arc<[PaddedAtomic; 3]>,
+    pub pagecache_variant_serves: Arc<[ShardedAtomic; 3]>,
     /// Cacheable misses forwarded while the backend was still writing them
     /// (`--page-cache-stream-fill-vhosts`), and how many of those were stored at the end.
     pub pagecache_stream_fills: Arc<AtomicU64>,
@@ -1176,7 +1224,7 @@ impl ServerState {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(30);
-            Some(Arc::new(AccessLogger::spawn_with_syslog(
+            Some(Arc::new(AccessLogger::spawn_coalesced(
                 path,
                 crate::state::access_log_format(),
                 rolling_bytes,
@@ -1218,12 +1266,13 @@ impl ServerState {
             vhost_access_logs.insert(
                 name.clone(),
                 VhostAccessLogger {
-                    logger: Arc::new(AccessLogger::spawn(
+                    logger: Arc::new(AccessLogger::spawn_coalesced(
                         &redirect_log_path(&spec.path),
                         vhost_access_log_format(spec.log_headers),
                         spec.rolling_bytes,
                         spec.keep_days,
                         false,
+                        None,
                     )),
                 },
             );

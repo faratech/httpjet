@@ -150,16 +150,17 @@ struct LsphpReloadArgs {
 }
 
 fn h3_udp_settings(
-    engine: uring::h3::H3EngineMode,
+    engine: Option<uring::h3::H3EngineMode>,
     gso: Option<uring::h3::GsoSegments>,
     batch: Option<uring::h3::SendBatch>,
 ) -> (uring::h3::GsoSegments, uring::h3::SendBatch) {
     use uring::h3::{GsoSegments, H3EngineMode, SendBatch};
 
-    let defaults = if cfg!(target_arch = "x86_64") && engine != H3EngineMode::Legacy {
-        (GsoSegments::Twenty, SendBatch::Four)
-    } else {
-        (GsoSegments::Ten, SendBatch::One)
+    let defaults = match (engine, std::env::consts::ARCH) {
+        (Some(H3EngineMode::Auto | H3EngineMode::Accelerated), "x86_64" | "aarch64") => {
+            (GsoSegments::Twenty, SendBatch::Four)
+        }
+        _ => (GsoSegments::Ten, SendBatch::One),
     };
     (gso.unwrap_or(defaults.0), batch.unwrap_or(defaults.1))
 }
@@ -168,24 +169,31 @@ fn h3_udp_settings(
 fn h3_udp_settings_keep_legacy_and_independent_operator_overrides() {
     use uring::h3::{GsoSegments as G, H3EngineMode as Mode, SendBatch as B};
 
-    assert_eq!(h3_udp_settings(Mode::Legacy, None, None), (G::Ten, B::One));
-    let defaults = if cfg!(target_arch = "x86_64") {
-        (G::Twenty, B::Four)
-    } else {
+    assert_eq!(h3_udp_settings(None, None, None), (G::Ten, B::One));
+    assert_eq!(
+        h3_udp_settings(Some(Mode::Legacy), None, None),
         (G::Ten, B::One)
+    );
+    let defaults = match std::env::consts::ARCH {
+        "x86_64" | "aarch64" => (G::Twenty, B::Four),
+        _ => (G::Ten, B::One),
     };
     for mode in [Mode::Auto, Mode::Accelerated] {
-        assert_eq!(h3_udp_settings(mode, None, None), defaults);
+        assert_eq!(h3_udp_settings(Some(mode), None, None), defaults);
         assert_eq!(
-            h3_udp_settings(mode, Some(G::Ten), None),
+            h3_udp_settings(Some(mode), Some(G::Ten), None),
             (G::Ten, defaults.1)
         );
         assert_eq!(
-            h3_udp_settings(mode, None, Some(B::One)),
+            h3_udp_settings(Some(mode), None, Some(B::One)),
             (defaults.0, B::One)
         );
         assert_eq!(
-            h3_udp_settings(mode, Some(G::Twenty), Some(B::One)),
+            h3_udp_settings(Some(mode), None, Some(B::Eight)),
+            (defaults.0, B::Eight)
+        );
+        assert_eq!(
+            h3_udp_settings(Some(mode), Some(G::Twenty), Some(B::One)),
             (G::Twenty, B::One)
         );
     }
@@ -212,20 +220,20 @@ struct ServeArgs {
     /// Number of accept-loop workers (SO_REUSEPORT sockets). Defaults to CPUs.
     #[arg(long)]
     workers: Option<usize>,
-    /// HTTP/3 request engine. The accelerated engine tries the shared on-core
-    /// cache path before dispatching misses through the io_uring bridge.
-    #[arg(long, value_enum, default_value_t = uring::h3::H3EngineMode::Legacy)]
-    h3_engine: uring::h3::H3EngineMode,
-    /// HTTP/3 GSO segment cap. On x86_64 the accelerated and auto modes default
-    /// to 20. All other configurations default to 10.
+    /// HTTP/3 request engine (default: auto). Auto and accelerated use the
+    /// shared on-core cache path with bridge fallback. Legacy always bridges.
+    #[arg(long, value_enum)]
+    h3_engine: Option<uring::h3::H3EngineMode>,
+    /// HTTP/3 GSO segment cap. Explicit accelerated and auto modes default to
+    /// 20 on x86_64 and aarch64. All other configurations default to 10.
     #[arg(long, value_enum)]
     h3_gso_segments: Option<uring::h3::GsoSegments>,
-    /// UDP messages per send syscall. On x86_64 the accelerated and auto modes
-    /// default to 4. All other configurations default to 1 (scalar sends).
+    /// UDP messages per send syscall. Explicit accelerated and auto modes
+    /// default to 4 on x86_64 and aarch64. All other configurations use 1.
     #[arg(long, value_enum)]
     h3_send_batch: Option<uring::h3::SendBatch>,
-    /// Ask HTTP/3 peers that support QUIC ACK_FREQUENCY to acknowledge every N
-    /// ack-eliciting packets instead of every second one. 0 (default) asks nothing.
+    /// Request an ACK from supporting HTTP/3 peers after more than N
+    /// ack-eliciting packets (7 requests an ACK on the eighth). 0 disables the request.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=255))]
     h3_ack_eliciting_threshold: u32,
     /// The max_ack_delay requested along with --h3-ack-eliciting-threshold.
@@ -291,8 +299,8 @@ struct ServeArgs {
     /// Bridge a cookieless request early when the page cache cannot answer the path
     /// and the static branch would decline. `scripts` checks configured script
     /// suffixes. `on` also checks route-shaped paths. `off` disables early bridging.
-    /// `shadow` counts predictions without bridging. By default x86_64 checks
-    /// scripts on all protocols and AArch64 checks scripts on accelerated H3.
+    /// `shadow` counts predictions without bridging. By default x86_64 and
+    /// AArch64 check script suffixes on all protocols.
     /// Env `HJ_FAST_EARLY_BRIDGE` is equivalent.
     #[arg(long)]
     fast_early_bridge: Option<String>,
@@ -582,6 +590,12 @@ struct PageCacheArgs {
     /// past the object cap is served but never stored. Empty = off.
     #[arg(long = "page-cache-stream-fill-vhosts", default_value = "")]
     stream_fill_vhosts: String,
+    /// Progressive-fill vhosts that require two sightings before capturing an ordinary public body.
+    #[arg(
+        long = "page-cache-stream-fill-second-sighting-vhosts",
+        default_value = ""
+    )]
+    stream_fill_second_sighting_vhosts: String,
     /// Comma-separated vhost names whose stored misses keep a dictionary-less zstd body
     /// (plain zstd) instead of being re-encoded against the vhost dictionary in the
     /// background. A miss answered with zstd (Cloudflare) stores the encode made for its own
@@ -1153,13 +1167,14 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
 
     let (gso_segments, send_batch) =
         h3_udp_settings(args.h3_engine, args.h3_gso_segments, args.h3_send_batch);
-    uring::h3::configure_engine_mode(args.h3_engine);
+    let h3_engine = args.h3_engine.unwrap_or_default();
+    uring::h3::configure_engine_mode(h3_engine);
     uring::h3::configure_gso_segments(gso_segments);
     uring::h3::configure_ack_frequency(args.h3_ack_eliciting_threshold, args.h3_max_ack_delay_us);
     uring::h3::configure_send_batch(send_batch);
     tracing::info!(segments = ?gso_segments, batch = ?send_batch, "HTTP/3 GSO segment limit selected");
 
-    tracing::info!(engine = ?args.h3_engine, "HTTP/3 request engine selected");
+    tracing::info!(engine = ?h3_engine, "HTTP/3 request engine selected");
 
     uring::configure_trusted_proxy_idle(
         args.trusted_proxy_idle_secs,
@@ -1193,10 +1208,7 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                 "--fast-early-bridge: expected off, shadow, scripts or on, got {mode:?}"
             )
         })?,
-        None => pipeline::early_bridge::Mode::default_for(
-            std::env::consts::ARCH,
-            args.h3_engine != uring::h3::H3EngineMode::Legacy,
-        ),
+        None => pipeline::early_bridge::Mode::default_for(std::env::consts::ARCH),
     };
     pipeline::early_bridge::DEFAULT_MODE.store(
         early_bridge_mode as u8,
@@ -1591,6 +1603,9 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                 private_cookies: split_csv(&args.page_cache.private_cookies),
                 standard_cc_vhosts: split_csv(&args.page_cache.standard_vhosts),
                 stream_fill_vhosts: split_csv(&args.page_cache.stream_fill_vhosts),
+                stream_fill_second_sighting_vhosts: split_csv(
+                    &args.page_cache.stream_fill_second_sighting_vhosts,
+                ),
                 egress_at_rest_vhosts: split_csv(&args.page_cache.egress_at_rest_vhosts),
                 path_presence: early_bridge_mode != pipeline::early_bridge::Mode::Off,
                 default_stale_secs: args.page_cache.stale_default_secs,
@@ -2268,10 +2283,35 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         // (so the monitor does not fight the intentional stop with a restart),
         // bounds the ticker stop, then gracefully drains the supervisor. The
         // supervisor's own Drop is the final backstop for any child.
-        if let Some(registry) = &php_registry {
-            registry.drain_all().await?;
-            tracing::info!("lsphp pools drained");
+        let php_drain = if let Some(registry) = &php_registry {
+            let result = registry.drain_all().await;
+            if result.is_ok() {
+                tracing::info!("lsphp pools drained");
+            }
+            result
+        } else {
+            Ok(())
+        };
+
+        // Transport workers have joined and shipped their final access chunks.
+        // Keep the application runtime alive until the writers drain that queue.
+        let mut log_drains = tokio::task::JoinSet::new();
+        for logger in state
+            .access_log
+            .iter()
+            .chain(state.vhost_access_logs.values().map(|log| &log.logger))
+        {
+            log_drains.spawn(logger.as_ref().clone().shutdown());
         }
+        if tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while log_drains.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            tracing::warn!("access log drain timed out");
+        }
+        php_drain?;
         Ok::<_, anyhow::Error>(())
     })
 }
@@ -4044,6 +4084,30 @@ mod tests {
                 .page_cache
                 .no_response_memo
         );
+    }
+
+    #[test]
+    fn h3_cli_defaults_to_auto_without_udp_tuning_and_accepts_legacy() {
+        use uring::h3::{GsoSegments, H3EngineMode, SendBatch};
+
+        for (flags, expected_mode) in [
+            (None, None),
+            (Some("--h3-engine=legacy"), Some(H3EngineMode::Legacy)),
+        ] {
+            let cli = Cli::try_parse_from(["httpjet", "serve"].into_iter().chain(flags)).unwrap();
+            let Some(Command::Serve(args)) = cli.command else {
+                panic!("expected serve command");
+            };
+            assert_eq!(args.h3_engine, expected_mode);
+            assert_eq!(
+                args.h3_engine.unwrap_or_default(),
+                expected_mode.unwrap_or(H3EngineMode::Auto),
+            );
+            assert_eq!(
+                h3_udp_settings(args.h3_engine, args.h3_gso_segments, args.h3_send_batch),
+                (GsoSegments::Ten, SendBatch::One),
+            );
+        }
     }
 
     #[test]

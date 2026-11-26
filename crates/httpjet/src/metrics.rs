@@ -411,7 +411,7 @@ mod profile {
 /// Snapshot the live counters into the Prometheus text body.
 fn render(state: &ServerState) -> String {
     let mut body = render_metrics(
-        state.metrics.requests_total.load(Ordering::Relaxed),
+        state.telemetry.requests_total(),
         state.metrics.active_conns.load(Ordering::Relaxed),
         state.metrics.active_requests.load(),
         PeerPurgeCounters {
@@ -869,25 +869,31 @@ fn append_connection_metrics(out: &mut String, metrics: &crate::state::Metrics) 
 
 /// Precompressed page-cache variants: built by first-hit fills vs served, per codec.
 fn append_variant_metrics(out: &mut String, metrics: &crate::state::Metrics) {
-    for (name, help, counts) in [
-        (
-            "httpjet_pagecache_variant_fill_total",
-            "Precompressed page-cache variants built by first-hit fills, per codec.",
-            &metrics.pagecache_variant_fills,
-        ),
-        (
-            "httpjet_pagecache_variant_serve_total",
-            "Page-cache hits served from a stored precompressed variant, per codec.",
-            &metrics.pagecache_variant_serves,
-        ),
-    ] {
-        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
-        for (codec, count) in ["zstd", "br", "gzip"].iter().zip(counts.iter()) {
-            out.push_str(&format!(
-                "{name}{{codec=\"{codec}\"}} {}\n",
-                count.load(Ordering::Relaxed)
-            ));
-        }
+    out.push_str(
+        "# HELP httpjet_pagecache_variant_fill_total Precompressed page-cache variants built by first-hit fills, per codec.\n\
+         # TYPE httpjet_pagecache_variant_fill_total counter\n",
+    );
+    for (codec, count) in ["zstd", "br", "gzip"]
+        .iter()
+        .zip(metrics.pagecache_variant_fills.iter())
+    {
+        out.push_str(&format!(
+            "httpjet_pagecache_variant_fill_total{{codec=\"{codec}\"}} {}\n",
+            count.load(Ordering::Relaxed)
+        ));
+    }
+    out.push_str(
+        "# HELP httpjet_pagecache_variant_serve_total Page-cache hits served from a stored precompressed variant, per codec.\n\
+         # TYPE httpjet_pagecache_variant_serve_total counter\n",
+    );
+    for (codec, count) in ["zstd", "br", "gzip"]
+        .iter()
+        .zip(metrics.pagecache_variant_serves.iter())
+    {
+        out.push_str(&format!(
+            "httpjet_pagecache_variant_serve_total{{codec=\"{codec}\"}} {}\n",
+            count.load(Ordering::Relaxed)
+        ));
     }
 }
 

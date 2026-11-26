@@ -373,7 +373,7 @@ fn encode_octets(out: &mut Vec<u8>, data: &[u8]) {
 }
 
 /// Root lookup width. Every code of at most ROOT_BITS bits resolves in one read of a
-/// 4 KiB table, which stays cache-resident between requests; the flat 2^16-entry
+/// 8 KiB table that can resolve two short codes together. The flat 2^16-entry
 /// (256 KiB) table it replaced was evicted at production request rates, so a decode
 /// paid a cache miss for nearly every symbol (~3x slower cold).
 const ROOT_BITS: u32 = 11;
@@ -384,11 +384,13 @@ const SUB_BITS: u32 = WIN_BITS - ROOT_BITS;
 /// Root entry flag: the low bits index `DecodeTables::sub` instead of naming a symbol.
 const SUB_TABLE: u16 = 0x8000;
 
-/// Entries are `code_len << 8 | symbol`. A sub-table entry of 0 means no code of at most
+/// The low 16 bits of a root entry are a symbol and its bit length, or a sub-table
+/// index. The high bytes optionally add a second symbol and the combined length.
+/// A sub-table entry of 0 means no code of at most
 /// WIN_BITS bits has that prefix (a long code, or padding). Every root entry is non-zero
 /// because the code is complete.
 struct DecodeTables {
-    root: [u16; 1 << ROOT_BITS],
+    root: [u32; 1 << ROOT_BITS],
     sub: Vec<[u16; 1 << SUB_BITS]>,
 }
 
@@ -411,25 +413,40 @@ fn decode_tables() -> &'static DecodeTables {
                 // Left-align the code and fill every index sharing this prefix.
                 let base = (code << (ROOT_BITS - len)) as usize;
                 if let Some(slots) = t.root.get_mut(base..base + (1 << (ROOT_BITS - len))) {
-                    slots.fill(entry);
+                    slots.fill(u32::from(entry));
                 }
                 continue;
             }
             let Some(slot) = t.root.get_mut((code >> (len - ROOT_BITS)) as usize) else {
                 continue;
             };
-            if *slot & SUB_TABLE == 0 {
+            if *slot & u32::from(SUB_TABLE) == 0 {
                 t.sub.push([0; 1 << SUB_BITS]);
-                *slot = SUB_TABLE | (t.sub.len() - 1) as u16;
+                *slot = u32::from(SUB_TABLE) | (t.sub.len() - 1) as u32;
             }
             if len <= WIN_BITS {
                 let low = (code & ((1 << (len - ROOT_BITS)) - 1)) as usize;
                 let base = low << (WIN_BITS - len);
                 let span = base..base + (1 << (WIN_BITS - len));
-                let sub = t.sub.get_mut((*slot & !SUB_TABLE) as usize);
+                let sub = t.sub.get_mut((*slot & !u32::from(SUB_TABLE)) as usize);
                 if let Some(slots) = sub.and_then(|sub| sub.get_mut(span)) {
                     slots.fill(entry);
                 }
+            }
+        }
+        // Keep the original entry in the low bits. If two symbols fit in one
+        // lookup, the high bytes hold the second symbol and total bit length.
+        let mask = t.root.len() - 1;
+        for index in 0..t.root.len() {
+            let first = t.root[index] as u16;
+            if first & SUB_TABLE != 0 {
+                continue;
+            }
+            let len = (first >> 8) as u32;
+            let second = t.root[(index << len) & mask] as u16;
+            let total = len + (second >> 8) as u32;
+            if second & SUB_TABLE == 0 && total <= ROOT_BITS {
+                t.root[index] |= ((total << 8) | u32::from(second as u8)) << 16;
             }
         }
         t
@@ -475,7 +492,11 @@ pub fn decode_into_limited(out: &mut Vec<u8>, data: &[u8], max_output: usize) ->
     out.clear();
     let t = decode_tables();
     let estimate = (data.len().saturating_mul(8) / 5).saturating_add(1);
-    out.reserve(estimate.min(max_output));
+    let cap = estimate.min(max_output);
+    out.reserve(cap);
+    let spare = out.spare_capacity_mut();
+    let dst = spare.get_mut(..cap)?;
+    let mut used = 0;
     let mut acc: u64 = 0;
     let mut nbits: u32 = 0;
     let mut i = 0;
@@ -504,11 +525,23 @@ pub fn decode_into_limited(out: &mut Vec<u8>, data: &[u8], max_output: usize) ->
             break;
         }
         // `window` masks to its width, so the root lookup cannot miss.
-        let mut e = t
+        let entry = t
             .root
             .get(window(acc, nbits, ROOT_BITS))
             .copied()
             .unwrap_or(0);
+        let pair_len = entry >> 24;
+        if pair_len != 0 && pair_len <= nbits {
+            let [first, second] = dst.get_mut(used..used + 2)? else {
+                return None;
+            };
+            first.write(entry as u8);
+            second.write((entry >> 16) as u8);
+            used += 2;
+            nbits -= pair_len;
+            continue;
+        }
+        let mut e = entry as u16;
         if e & SUB_TABLE != 0 {
             let w = window(acc, nbits, WIN_BITS) & ((1 << SUB_BITS) - 1);
             let sub = t.sub.get((e & !SUB_TABLE) as usize);
@@ -519,10 +552,8 @@ pub fn decode_into_limited(out: &mut Vec<u8>, data: &[u8], max_output: usize) ->
             if len > nbits {
                 break; // the matched prefix was padding, not a real code -> done
             }
-            if out.len() == max_output {
-                return None;
-            }
-            out.push(e as u8);
+            dst.get_mut(used)?.write(e as u8);
+            used += 1;
             nbits -= len;
         } else if nbits < WIN_BITS {
             break; // no full code and out of input -> remaining bits are padding
@@ -532,10 +563,8 @@ pub fn decode_into_limited(out: &mut Vec<u8>, data: &[u8], max_output: usize) ->
             if sym == 256 {
                 return None;
             }
-            if out.len() == max_output {
-                return None;
-            }
-            out.push(sym as u8);
+            dst.get_mut(used)?.write(sym as u8);
+            used += 1;
             nbits -= len;
         }
     }
@@ -549,6 +578,10 @@ pub fn decode_into_limited(out: &mut Vec<u8>, data: &[u8], max_output: usize) ->
         if pad != (1u64 << nbits) - 1 {
             return None;
         }
+    }
+    // SAFETY: `dst[..used]` was initialized in-order before advancing `used`.
+    unsafe {
+        out.set_len(used);
     }
     Some(())
 }
@@ -743,7 +776,7 @@ mod tests {
         let t = decode_tables();
         assert!(t.root.iter().all(|&e| e != 0), "every root prefix resolves");
         for w in 0..(1u32 << WIN_BITS) {
-            let mut e = t.root[(w >> SUB_BITS) as usize];
+            let mut e = t.root[(w >> SUB_BITS) as usize] as u16;
             if e & SUB_TABLE != 0 {
                 e = t.sub[(e & !SUB_TABLE) as usize][(w & ((1 << SUB_BITS) - 1)) as usize];
             }

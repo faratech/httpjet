@@ -5,6 +5,7 @@
 //! unbounded channel; the senders ([`crate::AccessLogger`] / [`crate::ErrorLogger`])
 //! only ever do a non-blocking `send`.
 
+use std::borrow::Cow;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -20,6 +21,8 @@ use crate::Msg;
 use crate::fmt;
 
 const MAX_ARCHIVE_JOBS: usize = 4;
+const ACCESS_COALESCE: Duration = Duration::from_millis(2);
+const MAX_RETAINED_RECORD_BYTES: usize = 16 * 1024;
 static ARCHIVE_JOB_SLOTS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(MAX_ARCHIVE_JOBS)));
 
@@ -358,7 +361,17 @@ pub async fn run(
     state: crate::LoggerState,
     syslog: Option<crate::SyslogTap>,
 ) {
-    run_with_archiver(cfg, rx, state, syslog, Arc::new(gzip_file)).await;
+    run_with_archiver(cfg, rx, state, syslog, Arc::new(gzip_file), false).await;
+}
+
+pub(super) async fn run_access(
+    cfg: RollConfig,
+    rx: mpsc::UnboundedReceiver<Msg>,
+    state: crate::LoggerState,
+    syslog: Option<crate::SyslogTap>,
+    coalesce: bool,
+) {
+    run_with_archiver(cfg, rx, state, syslog, Arc::new(gzip_file), coalesce).await;
 }
 
 async fn run_with_archiver(
@@ -367,6 +380,7 @@ async fn run_with_archiver(
     state: crate::LoggerState,
     syslog: Option<crate::SyslogTap>,
     archiver: Archiver,
+    coalesce_access: bool,
 ) {
     let depth = &state.depth;
     let mut writer = match Writer::open_with_archiver(cfg.clone(), archiver).await {
@@ -381,12 +395,13 @@ async fn run_with_archiver(
     // ErrorLogLayer drops them from the error file (recursion guard) — but they
     // still reach stdout via the fmt layer, which would flood. Cap to 1 per 5 s.
     let mut last_write_err: Option<std::time::Instant> = None;
+    let mut rendered = Vec::new();
 
     while let Some(first) = rx.recv().await {
-        // Process this message plus any already-queued ones (a burst), then
-        // flush ONCE. This keeps the per-line durability of a flush-after-write
-        // without paying a write/flush syscall per request under load — the
-        // BufWriter coalesces the burst into one write.
+        // Drain queued records as one burst. Access logging can keep a partial
+        // buffer open briefly between arrivals so sparse completions don't
+        // each wake the blocking file executor.
+        let mut coalesce_until = None;
         let mut wrote_line = false;
         let mut msg = Some(first);
         loop {
@@ -400,26 +415,34 @@ async fn run_with_archiver(
                     .queued_bytes
                     .fetch_sub(queued.queued_bytes(), std::sync::atomic::Ordering::Relaxed);
             }
-            let to_write: Option<String> = match msg.take() {
+            let to_write: Option<Cow<'_, str>> = match msg.take() {
                 Some(Msg::Line(line)) => {
+                    coalesce_until = None;
                     depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    Some(line)
+                    Some(Cow::Owned(line))
                 }
                 Some(Msg::Chunk(bytes, lines)) => {
+                    coalesce_until = None;
                     depth.fetch_sub(u64::from(lines), std::sync::atomic::Ordering::Relaxed);
                     raw_chunk = Some(bytes);
                     None
                 }
                 Some(Msg::Record(record, format, extra)) => {
                     depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    match extra {
-                        // Continuation rides in the SAME message as its record so the
-                        // pair is always adjacent and ordered in the file.
-                        Some(line) => Some(format!("{}\n{line}", record.render(format))),
-                        None => Some(record.render(format)),
+                    if coalesce_access && coalesce_until.is_none() {
+                        coalesce_until = Some(tokio::time::Instant::now() + ACCESS_COALESCE);
                     }
+                    rendered.clear();
+                    record.render_into(&mut rendered, format);
+                    // Keep a continuation adjacent to its record across file rolls.
+                    if let Some(line) = extra {
+                        rendered.push(b'\n');
+                        rendered.extend_from_slice(line.as_bytes());
+                    }
+                    Some(String::from_utf8_lossy(&rendered))
                 }
                 Some(Msg::Reopen) => {
+                    coalesce_until = None;
                     if let Some(w) = writer.as_mut() {
                         if let Err(e) = w.reopen().await {
                             tracing::error!(target: "hj_log", error = %e, "log reopen failed");
@@ -526,9 +549,23 @@ async fn run_with_archiver(
                     }
                 }
             }
-            // Drain any messages already waiting; stop when the queue is empty.
+            if rendered.capacity() > MAX_RETAINED_RECORD_BYTES {
+                rendered = Vec::new();
+            }
             match rx.try_recv() {
-                Ok(m) => msg = Some(m),
+                Ok(next) => msg = Some(next),
+                Err(mpsc::error::TryRecvError::Empty)
+                    if let Some(deadline) = coalesce_until
+                        && writer.as_ref().is_some_and(|w| !w.file.buffer().is_empty())
+                        && deadline > tokio::time::Instant::now() =>
+                {
+                    // Reopen and shutdown are still consumed in FIFO order,
+                    // with their existing flush before changing the file.
+                    match tokio::time::timeout_at(deadline, rx.recv()).await {
+                        Ok(Some(next)) => msg = Some(next),
+                        _ => break,
+                    }
+                }
                 Err(_) => break,
             }
         }
@@ -740,7 +777,14 @@ mod tests {
         });
         let state = logger_state();
         let (tx, rx) = mpsc::unbounded_channel();
-        let h = tokio::spawn(run_with_archiver(cfg, rx, state.clone(), None, archiver));
+        let h = tokio::spawn(run_with_archiver(
+            cfg,
+            rx,
+            state.clone(),
+            None,
+            archiver,
+            false,
+        ));
 
         let queue = |line: &str| {
             state

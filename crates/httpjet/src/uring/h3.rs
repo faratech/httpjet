@@ -74,6 +74,11 @@ const MAX_RECV_DRAIN_BATCHES: usize = 8;
 /// included in this total.
 const MAX_COMPLETION_DRAIN_BATCH: usize = 64;
 const MAX_PUMP_ROUNDS: usize = 64;
+const MAX_PUMP_TIME: Duration = Duration::from_micros(if cfg!(target_arch = "aarch64") {
+    1000
+} else {
+    250
+});
 const MAX_PEER_UNI_STREAMS: usize = 16;
 /// Advertised MAX_STREAMS for client request streams, and the admission bound the
 /// accept loop enforces itself so a transport bug that over-reports peer streams
@@ -690,9 +695,8 @@ fn server_config(rustls_cfg: Arc<rustls::ServerConfig>) -> io::Result<ServerConf
     transport.datagram_receive_buffer_size(None);
     let threshold = ACK_ELICITING_THRESHOLD.load(std::sync::atomic::Ordering::Relaxed);
     if threshold > 0 {
-        // Peers that advertise min_ack_delay (draft-ietf-quic-ack-frequency) then
-        // ACK every `threshold` ack-eliciting packets instead of every second one,
-        // and the PTO no longer adds their default 25 ms max_ack_delay.
+        // A capable peer sends an ACK when the packet count exceeds the
+        // threshold. Its ACK timer and reordering rules can trigger one earlier.
         let mut ack = quinn_proto::AckFrequencyConfig::default();
         ack.ack_eliciting_threshold(threshold.into())
             .max_ack_delay(Some(std::time::Duration::from_micros(u64::from(
@@ -2306,32 +2310,23 @@ fn pump_local_h3_setup<I: LocalUniIo>(io: &mut I, st: &mut H3State) -> Result<()
 /// serving + datagram flush are the caller's job (they differ between drivers).
 fn service_conn(
     endpoint: &mut Endpoint,
-    conns: &mut FxConnMap<quinn_proto::Connection>,
-    h3: &mut FxConnMap<H3State>,
+    conn: &mut quinn_proto::Connection,
+    st: &mut H3State,
     hd: ConnectionHandle,
     now: Instant,
     accepting_requests: bool,
     fallback_request_config: H3RequestConfig,
 ) {
-    let due = conns
-        .get_mut(&hd)
-        .and_then(|c| c.poll_timeout())
-        .is_some_and(|t| t <= now);
-    if due {
-        if let Some(c) = conns.get_mut(&hd) {
-            c.handle_timeout(now);
-        }
+    if conn.poll_timeout().is_some_and(|t| t <= now) {
+        conn.handle_timeout(now);
     }
     let mut endpoint_drained = false;
-    while let Some(ev) = conns.get_mut(&hd).and_then(|c| c.poll_endpoint_events()) {
+    while let Some(ev) = conn.poll_endpoint_events() {
         endpoint_drained |= ev.is_drained();
         if let Some(cev) = endpoint.handle_event(hd, ev) {
-            if let Some(c) = conns.get_mut(&hd) {
-                c.handle_event(cev);
-            }
+            conn.handle_event(cev);
         }
     }
-    let st = h3.entry(hd).or_default();
     st.endpoint_drained |= endpoint_drained;
     if !accepting_requests {
         st.draining = true;
@@ -2340,29 +2335,25 @@ fn service_conn(
     let mut readable: Vec<StreamId> = Vec::new();
     let mut stopped: Vec<StreamId> = Vec::new();
     let mut connection_lost = false;
-    while let Some(ev) = conns.get_mut(&hd).and_then(|c| c.poll()) {
+    while let Some(ev) = conn.poll() {
         match ev {
             Event::Connected => {
-                let leaf = conns.get(&hd).and_then(|conn| {
-                    conn.crypto_session()
-                        .peer_identity()
-                        .and_then(|identity| {
-                            identity
-                                .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
-                                .ok()
-                        })
-                        .and_then(|certificates| {
-                            certificate_chain_present(&certificates)
-                                .then(|| certificates[0].clone())
-                        })
-                });
-                let eligible = conns.get(&hd).is_some_and(|conn| {
-                    h3_client_eligible(
-                        st.client_auth.required(),
-                        leaf.is_some(),
-                        conn.remote_address(),
-                    )
-                });
+                let leaf = conn
+                    .crypto_session()
+                    .peer_identity()
+                    .and_then(|identity| {
+                        identity
+                            .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                            .ok()
+                    })
+                    .and_then(|certificates| {
+                        certificate_chain_present(&certificates).then(|| certificates[0].clone())
+                    });
+                let eligible = h3_client_eligible(
+                    st.client_auth.required(),
+                    leaf.is_some(),
+                    conn.remote_address(),
+                );
                 let budget = match st.pending_budget.take() {
                     Some(pending) => {
                         super::ConnectionPermit::try_acquire(pending.active, pending.cap)
@@ -2373,13 +2364,11 @@ fn service_conn(
                 };
                 if !eligible {
                     st.rejected = true;
-                    if let Some(conn) = conns.get_mut(&hd) {
-                        conn.close(
-                            now,
-                            quinn_proto::VarInt::from_u32(0x010b),
-                            bytes::Bytes::from_static(b"client certificate required"),
-                        );
-                    }
+                    conn.close(
+                        now,
+                        quinn_proto::VarInt::from_u32(0x010b),
+                        bytes::Bytes::from_static(b"client certificate required"),
+                    );
                 } else if let Ok(permit) = budget {
                     if permit.is_some() {
                         st._connection_permit = permit;
@@ -2393,19 +2382,17 @@ fn service_conn(
                         leaf.as_ref(),
                     ));
                     st.client_leaf = leaf;
-                    st.server_name = conns.get(&hd).and_then(h3_handshake_server_name);
+                    st.server_name = h3_handshake_server_name(conn);
                     st.connected = true;
                     tracing::info!("uring h3: QUIC handshake complete (Connected)");
                 } else {
                     H3_REFUSED_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     st.rejected = true;
-                    if let Some(conn) = conns.get_mut(&hd) {
-                        conn.close(
-                            now,
-                            quinn_proto::VarInt::from_u32(H3_EXCESSIVE_LOAD),
-                            bytes::Bytes::from_static(b"connection budget exhausted"),
-                        );
-                    }
+                    conn.close(
+                        now,
+                        quinn_proto::VarInt::from_u32(H3_EXCESSIVE_LOAD),
+                        bytes::Bytes::from_static(b"connection budget exhausted"),
+                    );
                 }
             }
             // A previously flow-control-blocked response stream can now write more.
@@ -2439,13 +2426,11 @@ fn service_conn(
     {
         H3_HANDSHAKE_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         st.rejected = true;
-        if let Some(conn) = conns.get_mut(&hd) {
-            conn.close(
-                now,
-                quinn_proto::VarInt::from_u32(H3_EXCESSIVE_LOAD),
-                Bytes::from_static(b"handshake timeout"),
-            );
-        }
+        conn.close(
+            now,
+            quinn_proto::VarInt::from_u32(H3_EXCESSIVE_LOAD),
+            Bytes::from_static(b"handshake timeout"),
+        );
     }
     // A discarded connection is serviced again when another datagram reaches it before
     // the reap; its slot must still be there for the reap to hold.
@@ -2456,22 +2441,19 @@ fn service_conn(
         if st.queue_readable_request(id) || !st.request_cancellations.contains_key(&id) {
             continue;
         }
-        let reset = conns.get_mut(&hd).is_some_and(|conn| {
-            conn.recv_stream(id)
-                .received_reset()
-                .ok()
-                .flatten()
-                .is_some()
-        });
+        let reset = conn
+            .recv_stream(id)
+            .received_reset()
+            .ok()
+            .flatten()
+            .is_some();
         if reset {
             cancel_dispatched_request(st, id);
-            if let Some(conn) = conns.get_mut(&hd) {
-                let _ = conn
-                    .send_stream(id)
-                    .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
-            }
+            let _ = conn
+                .send_stream(id)
+                .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
             if let Some(error) = charge_request_cancel(st, now) {
-                close_h3_connection(conns, st, hd, now, error);
+                close_h3_connection(conn, st, now, error);
                 return;
             }
         }
@@ -2482,40 +2464,32 @@ fn service_conn(
     }
     // Resume any large responses that were blocked on the stream window.
     for id in writable {
-        if let Some(c) = conns.get_mut(&hd) {
-            pump_stream(c, st, id);
-        }
+        pump_stream(conn, st, id);
     }
     if st.connected && !st.control_setup {
-        if let Some(c) = conns.get_mut(&hd) {
-            // Each prefix retains its accepted offset. QUIC may accept only a prefix or return
-            // Blocked when the peer's uni-stream data window is small; setup remains unlatched
-            // and retries after the corresponding Writable/MAX_STREAM_DATA event.
-            if pump_local_h3_setup(c, st).is_err() {
-                st.rejected = true;
-                c.close(
-                    now,
-                    quinn_proto::VarInt::from_u32(H3_CLOSED_CRITICAL_STREAM),
-                    Bytes::from_static(b"local HTTP/3 critical stream closed"),
-                );
-            }
+        // Each prefix retains its accepted offset. QUIC may accept only a prefix or return
+        // Blocked when the peer's uni-stream data window is small; setup remains unlatched
+        // and retries after the corresponding Writable/MAX_STREAM_DATA event.
+        if pump_local_h3_setup(conn, st).is_err() {
+            st.rejected = true;
+            conn.close(
+                now,
+                quinn_proto::VarInt::from_u32(H3_CLOSED_CRITICAL_STREAM),
+                Bytes::from_static(b"local HTTP/3 critical stream closed"),
+            );
         }
     }
     if st.draining {
-        if let Some(c) = conns.get_mut(&hd) {
-            send_h3_goaway(c, st);
-        }
+        send_h3_goaway(conn, st);
     }
-    if let Some(c) = conns.get_mut(&hd) {
-        if let Err(error) = service_peer_uni(c, st) {
-            st.rejected = true;
-            c.close(
-                now,
-                quinn_proto::VarInt::from_u32(error.code),
-                Bytes::from_static(error.reason),
-            );
-            return;
-        }
+    if let Err(error) = service_peer_uni(conn, st) {
+        st.rejected = true;
+        conn.close(
+            now,
+            quinn_proto::VarInt::from_u32(error.code),
+            Bytes::from_static(error.reason),
+        );
+        return;
     }
     // Read the clock only if this drive actually accepts a request stream. All
     // streams already available in the batch share one fresh acceptance time
@@ -2525,16 +2499,14 @@ fn service_conn(
     let mut accepted_at = None;
     let mut request_snapshot = None;
     let mut accepted_this_drive = 0u32;
-    while let Some(id) = conns.get_mut(&hd).and_then(|c| c.streams().accept(Dir::Bi)) {
+    while let Some(id) = conn.streams().accept(Dir::Bi) {
         if let Err(error) = admit_request_stream(st, &mut accepted_this_drive) {
             st.rejected = true;
-            if let Some(c) = conns.get_mut(&hd) {
-                c.close(
-                    now,
-                    quinn_proto::VarInt::from_u32(error.code),
-                    Bytes::from_static(error.reason),
-                );
-            }
+            conn.close(
+                now,
+                quinn_proto::VarInt::from_u32(error.code),
+                Bytes::from_static(error.reason),
+            );
             break;
         }
         if accepting_requests {
@@ -2551,10 +2523,10 @@ fn service_conn(
                     .expect("accepted request snapshot was initialized")
                     .clone(),
             );
-        } else if let Some(c) = conns.get_mut(&hd) {
+        } else {
             let code = quinn_proto::VarInt::from_u32(0x010b);
-            let _ = c.recv_stream(id).stop(code);
-            let _ = c.send_stream(id).reset(code);
+            let _ = conn.recv_stream(id).stop(code);
+            let _ = conn.send_stream(id).reset(code);
         }
     }
     if st.rejected {
@@ -2564,7 +2536,7 @@ fn service_conn(
     // stream tracked, or the stream would later be dispatched with no cancellation token.
     for id in stopped {
         if let Some(error) = reject_stopped_local_critical_stream(st, id) {
-            close_h3_connection(conns, st, hd, now, error);
+            close_h3_connection(conn, st, now, error);
             return;
         }
         let receiving = st.inflight_requests.contains_key(&id);
@@ -2573,39 +2545,34 @@ fn service_conn(
             reclaim_request(st, id);
         }
         cancel_dispatched_request(st, id);
-        if let Some(conn) = conns.get_mut(&hd) {
+        let _ = conn
+            .send_stream(id)
+            .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
+        if receiving {
             let _ = conn
-                .send_stream(id)
-                .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
-            if receiving {
-                let _ = conn
-                    .recv_stream(id)
-                    .stop(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
-            }
+                .recv_stream(id)
+                .stop(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
         }
         if unanswered && let Some(error) = charge_request_cancel(st, now) {
-            close_h3_connection(conns, st, hd, now, error);
+            close_h3_connection(conn, st, now, error);
             return;
         }
     }
 }
 
 fn close_h3_connection(
-    conns: &mut FxConnMap<quinn_proto::Connection>,
+    conn: &mut quinn_proto::Connection,
     st: &mut H3State,
-    hd: ConnectionHandle,
     now: Instant,
     error: H3ConnectionError,
 ) {
     st.rejected = true;
     cancel_all_dispatched_requests(st);
-    if let Some(conn) = conns.get_mut(&hd) {
-        conn.close(
-            now,
-            quinn_proto::VarInt::from_u32(error.code),
-            Bytes::from_static(error.reason),
-        );
-    }
+    conn.close(
+        now,
+        quinn_proto::VarInt::from_u32(error.code),
+        Bytes::from_static(error.reason),
+    );
 }
 
 /// Bound request-stream admission independently of the QUIC layer. A conformant
@@ -2701,6 +2668,10 @@ async fn flush_conn_with_tail(
     if udp.batch_enabled() {
         return flush_conn_batched(udp, conns, hd, now, tbuf, flush_tail);
     }
+    let Some(conn) = conns.get_mut(&hd) else {
+        tbuf.clear();
+        return false;
+    };
     let mut datagrams = 0usize;
     loop {
         tbuf.clear();
@@ -2708,12 +2679,8 @@ async fn flush_conn_with_tail(
         // never extends the existing cooperative budget, including after an
         // earlier short batch. Quinn still enforces cwnd/pacing per datagram.
         let seg_cap = udp.transmit_segment_cap(MAX_TX_DATAGRAMS - datagrams);
-        let t = match conns
-            .get_mut(&hd)
-            .and_then(|c| c.poll_transmit(now, seg_cap, tbuf))
-        {
-            Some(t) => t,
-            None => return false,
+        let Some(t) = conn.poll_transmit(now, seg_cap, tbuf) else {
+            return false;
         };
         datagrams += t.segment_size.map_or(1, |s| t.size.div_ceil(s));
         // quinn-proto and quinn-udp each define EcnCodepoint; map by codepoint bits.
@@ -2753,10 +2720,11 @@ fn flush_conn_batched(
         return true;
     }
     let mut datagrams = 0;
+    let mut conn = conns.get_mut(&hd);
     loop {
         tbuf.clear();
         let cap = udp.transmit_segment_cap(MAX_TX_DATAGRAMS - datagrams);
-        let transmit = conns.get_mut(&hd).and_then(|conn| {
+        let transmit = conn.as_deref_mut().and_then(|conn| {
             // Each pooled wire buffer is bounded at 64 KiB, even if a path
             // discovers a jumbo MTU. Quinn's MTU probes remain single datagrams.
             let cap = cap.min(MAX_DATAGRAM / usize::from(conn.current_mtu()).max(1));
@@ -3226,53 +3194,44 @@ async fn drive_one_conn(
     accepting_requests: bool,
     tx_scratch: &mut Vec<u8>,
 ) -> bool {
-    if !conns.contains_key(&hd) {
+    let Some(conn) = conns.get_mut(&hd) else {
         return false;
-    }
+    };
+    let st = h3.entry(hd).or_default();
     service_conn(
         endpoint,
-        conns,
-        h3,
+        conn,
+        st,
         hd,
         now,
         accepting_requests,
         fallback_request_config,
     );
-    if h3.get(&hd).is_some_and(|state| state.rejected) {
-        if let Some(state) = h3.get_mut(&hd) {
-            cancel_all_dispatched_requests(state);
-            reclaim_buffered_requests(state);
-        }
+    if st.rejected {
+        cancel_all_dispatched_requests(st);
+        reclaim_buffered_requests(st);
         return flush_conn(udp, conns, hd, now, tx_scratch).await;
     }
-    let epoch = h3.get(&hd).map(|s| s.epoch).unwrap_or(0);
-    let st = h3.entry(hd).or_default();
+    let epoch = st.epoch;
     let client_auth = st.client_auth;
 
     // A live connection can receive traffic on other streams forever, so QUIC's
     // connection-wide idle timer cannot bound an unfinished request. Expire these
     // streams independently and reset both halves to return MAX_STREAMS credit.
     for id in reclaim_expired_requests(st, now) {
-        if let Some(c) = conns.get_mut(&hd) {
-            let code = quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED);
-            let _ = c.recv_stream(id).stop(code);
-            let _ = c.send_stream(id).reset(code);
-        }
+        let code = quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED);
+        let _ = conn.recv_stream(id).stop(code);
+        let _ = conn.send_stream(id).reset(code);
     }
     // QUIC's idle timer restarts on any peer packet (a PING), so it cannot bound a
     // response the peer starves of flow-control credit.
     st.send_stall_timeout = fallback_request_config.timeout;
     for id in reclaim_stalled_sends(st, now) {
-        if let Some(c) = conns.get_mut(&hd) {
-            let _ = c
-                .send_stream(id)
-                .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
-        }
+        let _ = conn
+            .send_stream(id)
+            .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
     }
-    let finished = match conns.get_mut(&hd) {
-        Some(c) => receive_request_streams(c, st, now),
-        None => Vec::new(),
-    };
+    let finished = receive_request_streams(conn, st, now);
     if st.rejected {
         for id in finished {
             reclaim_request(st, id);
@@ -3292,29 +3251,27 @@ async fn drive_one_conn(
         let req_charge = req_frames.charged;
         let Some(request_snapshot) = request_snapshot else {
             release_request_charge(st, req_charge);
-            if let Some(c) = conns.get_mut(&hd) {
-                let code = quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED);
-                let _ = c.recv_stream(id).stop(code);
-                let _ = c.send_stream(id).reset(code);
-            }
+            let code = quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED);
+            let _ = conn.recv_stream(id).stop(code);
+            let _ = conn.send_stream(id).reset(code);
             continue;
         };
         // Peer + TLS params captured up front (no connection borrow into the task).
-        let peer = conns
-            .get(&hd)
-            .map(|c| c.remote_address())
-            .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+        let peer = conn.remote_address();
         // SERVER_ADDR is the interface the client reached, not a wildcard bind (the
         // TCP paths take it from getsockname; QUIC from the datagram's IP_PKTINFO).
-        let local = request_local_addr(local, conns.get(&hd).and_then(|c| c.local_ip()));
+        let local = request_local_addr(local, conn.local_ip());
         let sni = st.server_name.clone();
         let has_client_cert = st.client_leaf.is_some();
         let tls = st.tls.clone();
         if inflight.get() >= MAX_INFLIGHT_PER_CORE {
             // Backpressure: shed inline rather than spawning (bounds RAM under a flood).
-            if let Some(c) = conns.get_mut(&hd) {
-                queue_final_response(c, st, id, h3_error(http::StatusCode::SERVICE_UNAVAILABLE));
-            }
+            queue_final_response(
+                conn,
+                st,
+                id,
+                h3_error(http::StatusCode::SERVICE_UNAVAILABLE),
+            );
             release_request_charge(st, req_charge);
             continue;
         }
@@ -3620,9 +3577,9 @@ async fn recv_drain(
 /// drive the `to_drive` connections (each sends a bounded ≤20-datagram chunk), then process
 /// any ACKs those sends elicited, and repeat — so a connection streams its whole
 /// congestion-window of data back-to-back WITHOUT a per-chunk RTT wait, while ACK processing
-/// stays interleaved so loss detection doesn't misfire. Bounded by `MAX_PUMP_ROUNDS` so one
-/// connection can't monopolize the core; the endpoint retains the remainder and
-/// resumes it after a cooperative yield or another input/completion event.
+/// stays interleaved so loss detection doesn't misfire. The round cap and the x86-64
+/// accelerated engine's time budget keep the pump from owning the core indefinitely.
+/// The endpoint retains the remainder and resumes after a cooperative yield or I/O.
 #[allow(clippy::too_many_arguments)]
 async fn pump<const ROUND_LIMIT: usize>(
     udp: &IoUringDatagram,
@@ -3661,6 +3618,15 @@ async fn pump<const ROUND_LIMIT: usize>(
     });
     touched.clear();
     next.clear();
+    // Batched ARM sends can also keep the endpoint busy across successive
+    // rounds while request completions are waiting to run on the same core.
+    let bound_pump_time = (cfg!(target_arch = "x86_64")
+        || (cfg!(target_arch = "aarch64") && udp.batch_enabled()))
+        && runtime
+            .request_engine
+            .as_ref()
+            .is_some_and(H3RequestEngine::allows_inline);
+    let pump_started = (bound_pump_time && !to_drive.is_empty()).then(Instant::now);
     let mut rounds = 0;
     while !to_drive.is_empty() && rounds < ROUND_LIMIT {
         rounds += 1;
@@ -3710,6 +3676,14 @@ async fn pump<const ROUND_LIMIT: usize>(
         if udp.send_blocked() {
             // Pending work and payloads survive until the socket-writable arm;
             // the endpoint can still process RX, shutdown and absolute timers.
+            break;
+        }
+        // Each completed round serviced its ready handles and drained fresh
+        // ACKs. Yield between rounds when there is more work so completion
+        // events and other tasks get a chance to run.
+        if !to_drive.is_empty()
+            && pump_started.is_some_and(|start| start.elapsed() >= MAX_PUMP_TIME)
+        {
             break;
         }
     }
@@ -5010,6 +4984,12 @@ fn per_core_h3_pipeline(
             true,
             None,
         );
+        thread_local! {
+            static H3_CHUNK_TICKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        if !H3_CHUNK_TICKER.with(|started| started.replace(true)) {
+            monoio::spawn(super::access_chunk_flush_ticker(shutdown.clone()));
+        }
         if let Err(e) = endpoint_loop_concurrent(
             udp,
             endpoint,
@@ -5028,6 +5008,10 @@ fn per_core_h3_pipeline(
             let _ = ready.send(Err(format!("prepare or drive QUIC endpoint: {e}")));
             tracing::error!(core, error = %e, "uring h3-pipeline: endpoint loop ended");
         }
+        // The ticker can stop at the shutdown signal while established streams
+        // continue draining. Ship their final chunks on this same worker before
+        // it joins and main sends the access writers' shutdown barriers.
+        crate::pipeline::flush_access_chunks();
     });
 }
 
@@ -8113,7 +8097,15 @@ mod admission_tests {
         ) {
             let config = H3RequestConfig::new(H3RequestLimits::new(1024, 1024), None);
             for _ in 0..64 {
-                service_conn(&mut self.server, conns, h3, hd, now, true, config);
+                service_conn(
+                    &mut self.server,
+                    conns.get_mut(&hd).unwrap(),
+                    h3.entry(hd).or_default(),
+                    hd,
+                    now,
+                    true,
+                    config,
+                );
                 if h3[&hd].connected || h3[&hd].rejected {
                     return;
                 }
@@ -8246,7 +8238,15 @@ mod admission_tests {
         let (hd, conn, state) = h.accepted(spoofed(1), &datagram, now);
         let mut conns: FxConnMap<_> = [(hd, conn)].into_iter().collect();
         let mut h3: FxConnMap<_> = [(hd, state)].into_iter().collect();
-        service_conn(&mut h.server, &mut conns, &mut h3, hd, now, true, config);
+        service_conn(
+            &mut h.server,
+            conns.get_mut(&hd).unwrap(),
+            h3.entry(hd).or_default(),
+            hd,
+            now,
+            true,
+            config,
+        );
         assert!(
             !conns[&hd].is_drained(),
             "precondition: quinn would keep this connection until its idle timeout"
@@ -8295,9 +8295,25 @@ mod admission_tests {
         let (hd, conn, state) = h.accepted(spoofed(1), &datagram, now);
         let mut conns: FxConnMap<_> = [(hd, conn)].into_iter().collect();
         let mut h3: FxConnMap<_> = [(hd, state)].into_iter().collect();
-        service_conn(&mut h.server, &mut conns, &mut h3, hd, now, true, config);
+        service_conn(
+            &mut h.server,
+            conns.get_mut(&hd).unwrap(),
+            h3.entry(hd).or_default(),
+            hd,
+            now,
+            true,
+            config,
+        );
         assert!(h3[&hd].discard);
-        service_conn(&mut h.server, &mut conns, &mut h3, hd, now, true, config);
+        service_conn(
+            &mut h.server,
+            conns.get_mut(&hd).unwrap(),
+            h3.entry(hd).or_default(),
+            hd,
+            now,
+            true,
+            config,
+        );
         assert_eq!(
             h.handshakes.load(Relaxed),
             1,
@@ -8333,7 +8349,15 @@ mod admission_tests {
         let (hd, conn, state) = h.accepted(spoofed(2), &datagram, now);
         let mut conns: FxConnMap<_> = [(hd, conn)].into_iter().collect();
         let mut h3: FxConnMap<_> = [(hd, state)].into_iter().collect();
-        service_conn(&mut h.server, &mut conns, &mut h3, hd, now, true, config);
+        service_conn(
+            &mut h.server,
+            conns.get_mut(&hd).unwrap(),
+            h3.entry(hd).or_default(),
+            hd,
+            now,
+            true,
+            config,
+        );
         assert_eq!(h.server.open_connections(), 1);
 
         // The idle timer fires with no service pass afterwards.
@@ -8379,7 +8403,15 @@ mod admission_tests {
                         .accepted_state_with_policy(slot, now, 1, &h.policy());
                     conns.insert(hd, conn);
                     h3.insert(hd, state);
-                    service_conn(&mut h.server, &mut conns, &mut h3, hd, now, true, config);
+                    service_conn(
+                        &mut h.server,
+                        conns.get_mut(&hd).unwrap(),
+                        h3.entry(hd).or_default(),
+                        hd,
+                        now,
+                        true,
+                        config,
+                    );
                     reap_connections(
                         &mut h.server,
                         &mut conns,
@@ -9201,8 +9233,8 @@ mod admission_tests {
         let config = H3RequestConfig::new(H3RequestLimits::new(1024, 1024), None);
         service_conn(
             &mut h.server,
-            &mut e.conns,
-            &mut e.h3,
+            e.conns.get_mut(&e.hd).unwrap(),
+            e.h3.entry(e.hd).or_default(),
             e.hd,
             now,
             true,
@@ -9265,8 +9297,8 @@ mod admission_tests {
         let config = H3RequestConfig::new(H3RequestLimits::new(1024, 1024), None);
         service_conn(
             &mut h.server,
-            &mut e.conns,
-            &mut e.h3,
+            e.conns.get_mut(&e.hd).unwrap(),
+            e.h3.entry(e.hd).or_default(),
             e.hd,
             now,
             true,
@@ -9322,8 +9354,8 @@ mod admission_tests {
         let config = H3RequestConfig::new(H3RequestLimits::new(1024, 1024), None);
         service_conn(
             &mut h.server,
-            &mut e.conns,
-            &mut e.h3,
+            e.conns.get_mut(&e.hd).unwrap(),
+            e.h3.entry(e.hd).or_default(),
             e.hd,
             now,
             true,
@@ -9451,8 +9483,8 @@ mod admission_tests {
             h.to_server(&mut e.conns, &mut e.client, peer, now);
             service_conn(
                 &mut h.server,
-                &mut e.conns,
-                &mut e.h3,
+                e.conns.get_mut(&e.hd).unwrap(),
+                e.h3.entry(e.hd).or_default(),
                 e.hd,
                 now,
                 false,
@@ -9685,8 +9717,8 @@ mod admission_tests {
             h.to_server(&mut e.conns, &mut e.client, addr, now);
             service_conn(
                 &mut h.server,
-                &mut e.conns,
-                &mut e.h3,
+                e.conns.get_mut(&e.hd).unwrap(),
+                e.h3.entry(e.hd).or_default(),
                 e.hd,
                 now,
                 true,
@@ -9717,8 +9749,8 @@ mod admission_tests {
         h.to_server(&mut e.conns, &mut e.client, addr, now);
         service_conn(
             &mut h.server,
-            &mut e.conns,
-            &mut e.h3,
+            e.conns.get_mut(&e.hd).unwrap(),
+            e.h3.entry(e.hd).or_default(),
             e.hd,
             now,
             true,
@@ -9839,8 +9871,8 @@ mod admission_tests {
             }
             service_conn(
                 &mut h.server,
-                &mut e.conns,
-                &mut e.h3,
+                e.conns.get_mut(&e.hd).unwrap(),
+                e.h3.entry(e.hd).or_default(),
                 e.hd,
                 now,
                 true,
@@ -10112,8 +10144,8 @@ mod admission_tests {
         let before = H3_HANDSHAKE_TIMEOUTS.load(Relaxed);
         service_conn(
             &mut h.server,
-            &mut conns,
-            &mut h3,
+            conns.get_mut(&hd).unwrap(),
+            h3.entry(hd).or_default(),
             hd,
             now + Duration::from_secs(9),
             true,
@@ -10123,8 +10155,8 @@ mod admission_tests {
         assert_eq!(h.handshakes.load(Relaxed), 1);
         service_conn(
             &mut h.server,
-            &mut conns,
-            &mut h3,
+            conns.get_mut(&hd).unwrap(),
+            h3.entry(hd).or_default(),
             hd,
             now + H3_HANDSHAKE_TIMEOUT,
             true,

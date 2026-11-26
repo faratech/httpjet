@@ -9,8 +9,8 @@ use http::header::{AGE, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, ETAG, V
 use http::{HeaderMap, HeaderValue, StatusCode};
 
 use hj_compress::{
-    AcceptEncoding, Compress, Encoding, Levels, MAX_DECODE, PageDict, decode_bytes_sized,
-    encode_bytes, etag_variant,
+    AcceptEncoding, Compress, Encoding, Levels, MAX_DECODE, PageDict, decode_bytes_bounded,
+    decode_bytes_sized, encode_bytes, encode_compact_zstd_short_search, etag_variant,
 };
 use hj_core::{Body, FileBody, Response};
 use hj_pagecache::CachedResponse;
@@ -576,6 +576,78 @@ const FILL_LEVELS: Levels = Levels {
     brotli_lgwin: 19,
 };
 
+/// Try the denser variant only for normal page-sized public bodies. A strong
+/// origin validator may identify exact encoded bytes and keeps its old path.
+fn compact_zstd_eligible(headers: &[(http::HeaderName, HeaderValue)], len: usize) -> bool {
+    (16 * 1024..=256 * 1024).contains(&len)
+        && headers
+            .iter()
+            .all(|(name, value)| *name != ETAG || value.as_bytes().starts_with(b"W/\""))
+}
+
+fn encode_compact_variant(body: &[u8], initial_len: usize) -> Option<Vec<u8>> {
+    // Spend less search effort on documents that level 9 compresses less.
+    let encoded = if initial_len.saturating_mul(3) >= body.len() {
+        encode_compact_zstd_short_search(body)?
+    } else {
+        encode_bytes(
+            Encoding::Zstd,
+            body,
+            &Levels {
+                zstd: 15,
+                ..FILL_LEVELS
+            },
+        )?
+    };
+    (encoded.len() < initial_len).then_some(encoded)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ZstdCompaction {
+    Off,
+    HotPublic,
+    Full,
+}
+
+fn zstd_compaction() -> ZstdCompaction {
+    static COMPACT: std::sync::OnceLock<ZstdCompaction> = std::sync::OnceLock::new();
+    *COMPACT.get_or_init(
+        || match std::env::var_os("HJ_PAGECACHE_ZSTD_COMPACT_VARIANTS") {
+            Some(value) if value == "1" => ZstdCompaction::Full,
+            None if cfg!(target_arch = "x86_64") => ZstdCompaction::HotPublic,
+            _ => ZstdCompaction::Off,
+        },
+    )
+}
+
+pub(super) fn compact_zstd_enabled() -> bool {
+    zstd_compaction() != ZstdCompaction::Off
+}
+
+pub(super) fn compact_stored_zstd(
+    headers: &[(http::HeaderName, HeaderValue)],
+    frame: &[u8],
+) -> Option<Bytes> {
+    let body = decode_bytes_bounded(Encoding::Zstd, frame, 256 * 1024)?;
+    if !compact_zstd_eligible(headers, body.len()) {
+        return None;
+    }
+    let mut encoded = encode_compact_variant(&body, frame.len())?;
+    encoded.shrink_to_fit();
+    Some(Bytes::from(encoded))
+}
+
+fn encode_fill_variant(enc: Encoding, body: &[u8], compact_zstd: bool) -> Option<Vec<u8>> {
+    let baseline = encode_bytes(enc, body, &FILL_LEVELS)?;
+    if compact_zstd
+        && enc == Encoding::Zstd
+        && let Some(encoded) = encode_compact_variant(body, baseline.len())
+    {
+        return Some(encoded);
+    }
+    Some(baseline)
+}
+
 /// (PC2-lazy) Cheap predicate — could this body plausibly yield a useful precompressed variant
 /// for `accept_encoding`? Mirrors [`precompress_variants`]'s early-outs WITHOUT compressing, so
 /// the on-first-hit variant fill is spawned only when a variant could actually help (never for a
@@ -616,6 +688,7 @@ pub(super) fn precompress_variants(
     accept_encoding: AcceptEncoding,
     capsule_shell: bool,
     at_rest_zstd: bool,
+    compact_now: bool,
 ) -> Vec<(String, Bytes)> {
     if !eligible_for_variants(
         state,
@@ -627,6 +700,10 @@ pub(super) fn precompress_variants(
     ) {
         return Vec::new();
     }
+    let compact_zstd = !capsule_shell
+        && compact_zstd_eligible(headers, body.len())
+        && zstd_compaction() == ZstdCompaction::Full
+        && compact_now;
     fill_encodings(
         state.compress.cf_send_zstd(),
         accept_encoding,
@@ -635,7 +712,7 @@ pub(super) fn precompress_variants(
         at_rest_zstd,
     )
     .into_iter()
-    .filter_map(|enc| match encode_bytes(enc, body, &FILL_LEVELS) {
+    .filter_map(|enc| match encode_fill_variant(enc, body, compact_zstd) {
         Some(mut encoded) if encoded.len() < body.len() => {
             // Stored for the entry's whole TTL: exact-size it, or the encoder's
             // growth/compress-bound capacity pins an identity-scale block per variant
@@ -655,6 +732,28 @@ mod tests {
     use hj_pagecache::{PageBody, PageScope, PageStore, StoreConfig};
     use http::header::CONTENT_TYPE;
     use std::time::Duration;
+
+    #[test]
+    fn compact_zstd_variant_preserves_identity_and_never_grows() {
+        let source = b"<p>Example cached article with repeated sections</p>".repeat(1024);
+        let old = encode_fill_variant(Encoding::Zstd, &source, false).unwrap();
+        let new = encode_fill_variant(Encoding::Zstd, &source, true).unwrap();
+        assert!(new.len() <= old.len());
+        assert_eq!(
+            hj_compress::decode_bytes(Encoding::Zstd, &new).unwrap(),
+            source
+        );
+        assert!(compact_zstd_eligible(&[], source.len()));
+        assert!(compact_zstd_eligible(
+            &[(ETAG, HeaderValue::from_static("W/\"page\""))],
+            source.len()
+        ));
+        assert!(!compact_zstd_eligible(
+            &[(ETAG, HeaderValue::from_static("\"page\""))],
+            source.len()
+        ));
+        assert!(!compact_zstd_eligible(&[], 256 * 1024 + 1));
+    }
 
     // F16: the single-pass rewrite must keep the original fold/append semantics — never clobber
     // an existing Vary, and combine multiple Vary lines per RFC 9110.

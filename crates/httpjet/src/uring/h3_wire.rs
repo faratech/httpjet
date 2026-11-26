@@ -114,9 +114,7 @@ pub(super) const H3_NO_PROGRESS_FRAMES: u32 = 10_000;
 #[derive(Default)]
 pub(super) struct H3FrameCounter {
     pub(super) phase: H3FramePhase,
-    pub(super) varint: [u8; 8],
-    pub(super) varint_len: usize,
-    pub(super) varint_need: usize,
+    pub(super) varint: IncrementalVarInt,
     pub(super) frame_type: u64,
     pub(super) header_bytes: usize,
     pub(super) body_bytes: usize,
@@ -176,32 +174,6 @@ fn request_frame_forbidden(frame_type: u64) -> bool {
 }
 
 impl H3FrameCounter {
-    fn reset_varint(&mut self) {
-        self.varint_len = 0;
-        self.varint_need = 0;
-    }
-
-    fn consume_varint(&mut self, input: &[u8], pos: &mut usize) -> Option<u64> {
-        while *pos < input.len() {
-            let byte = input[*pos];
-            *pos += 1;
-            if self.varint_len == 0 {
-                self.varint_need = 1usize << (byte >> 6);
-            }
-            self.varint[self.varint_len] = byte;
-            self.varint_len += 1;
-            if self.varint_len == self.varint_need {
-                let mut value = u64::from(self.varint[0] & 0x3f);
-                for byte in &self.varint[1..self.varint_need] {
-                    value = (value << 8) | u64::from(*byte);
-                }
-                self.reset_varint();
-                return Some(value);
-            }
-        }
-        None
-    }
-
     /// Validate `input`, the next bytes of the request stream, appending its DATA
     /// payloads to `body`.
     pub(super) fn consume(
@@ -214,14 +186,14 @@ impl H3FrameCounter {
         while pos < input.len() {
             match self.phase {
                 H3FramePhase::Type => {
-                    let Some(frame_type) = self.consume_varint(input, &mut pos) else {
+                    let Some(frame_type) = self.varint.consume(input, &mut pos) else {
                         break;
                     };
                     self.frame_type = frame_type;
                     self.phase = H3FramePhase::Length;
                 }
                 H3FramePhase::Length => {
-                    let Some(length) = self.consume_varint(input, &mut pos) else {
+                    let Some(length) = self.varint.consume(input, &mut pos) else {
                         break;
                     };
                     if request_frame_forbidden(self.frame_type) {
@@ -356,7 +328,7 @@ impl H3FrameCounter {
         body: Vec<u8>,
         lease: Option<hj_core::budget::BodyBufferLease>,
     ) -> Option<(ParsedH3Request, Option<DecodedFieldSection>)> {
-        let at_frame_boundary = matches!(self.phase, H3FramePhase::Type) && self.varint_len == 0;
+        let at_frame_boundary = matches!(self.phase, H3FramePhase::Type) && self.varint.len == 0;
         if self.malformed || !at_frame_boundary {
             return None;
         }
@@ -397,31 +369,32 @@ impl H3FrameCounter {
     }
 }
 
+/// QUIC integers may span reads. Accumulate each arriving byte once and
+/// return single-byte values without touching the fragmented-read state.
 #[derive(Default)]
 pub(super) struct IncrementalVarInt {
-    pub(super) bytes: [u8; 8],
+    value: u64,
     pub(super) len: usize,
-    pub(super) need: usize,
+    need: usize,
 }
 
 impl IncrementalVarInt {
     pub(super) fn consume(&mut self, input: &[u8], pos: &mut usize) -> Option<u64> {
-        while *pos < input.len() {
-            let byte = input[*pos];
+        while let Some(&byte) = input.get(*pos) {
             *pos += 1;
             if self.len == 0 {
-                self.need = 1usize << (byte >> 6);
+                if byte < 64 {
+                    return Some(u64::from(byte));
+                }
+                self.need = 1 << (byte >> 6);
+                self.value = u64::from(byte & 0x3f);
+            } else {
+                self.value = (self.value << 8) | u64::from(byte);
             }
-            self.bytes[self.len] = byte;
             self.len += 1;
             if self.len == self.need {
-                let mut value = u64::from(self.bytes[0] & 0x3f);
-                for byte in &self.bytes[1..self.need] {
-                    value = (value << 8) | u64::from(*byte);
-                }
                 self.len = 0;
-                self.need = 0;
-                return Some(value);
+                return Some(self.value);
             }
         }
         None

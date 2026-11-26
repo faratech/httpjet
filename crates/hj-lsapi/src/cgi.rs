@@ -236,8 +236,10 @@ impl<'a> CgiEnvBuilder<'a> {
         // Request arrival time. REQUEST_TIME is whole seconds; the _FLOAT variant
         // carries microsecond precision (e.g. "1700000000.123456").
         if let Ok(since) = ctx.request_time.duration_since(std::time::UNIX_EPOCH) {
-            push!("REQUEST_TIME", since.as_secs().to_string());
-            push!("REQUEST_TIME_FLOAT", format!("{:.6}", since.as_secs_f64()));
+            let secs = since.as_secs();
+            let micros = since.subsec_micros();
+            push!("REQUEST_TIME", secs.to_string());
+            push!("REQUEST_TIME_FLOAT", format!("{secs}.{micros:06}"));
         }
 
         // (security #269) AUTH_TYPE / REMOTE_USER are SERVER-ASSERTED identity vars.

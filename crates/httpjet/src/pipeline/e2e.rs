@@ -3109,8 +3109,8 @@ async fn cookied_request_for_a_missing_path_bridges_before_the_prefix() {
     );
     let reasons: std::collections::HashMap<_, _> = state.metrics.fast_bridge.snapshot().collect();
     assert_eq!(reasons["cookied_no_target"], 2);
-    // `/missing.css` (cookied) and the cookieless route both left via the rewrite.
-    assert_eq!(reasons["rewritten"], 2);
+    // Both routes resolved to index.php and stayed on the script pipeline.
+    assert_eq!(reasons["script"], 2);
     std::fs::remove_dir_all(doc_root).unwrap();
 }
 
@@ -3230,6 +3230,45 @@ async fn cookieless_route_the_cache_cannot_hold_bridges_before_the_prefix() {
     std::fs::remove_dir_all(doc_root).unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scripts_mode_bridges_a_cold_php_path_and_serves_its_resident_page() {
+    let doc_root = temp_root("fastserve-script-cache");
+    std::fs::write(doc_root.join("index.php"), b"<?php").unwrap();
+    std::fs::write(doc_root.join(".htaccess"), "CacheLookup public on\n").unwrap();
+    let mut config = hj_pagecache::StoreConfig::default();
+    config.path_presence = true;
+    config.standard_cc_vhosts.push(VHOST.into());
+    let store = Arc::new(hj_pagecache::PageStore::new(config));
+    let state = build_state_full(
+        doc_root.clone(),
+        Vec::new(),
+        Vec::new(),
+        Some(store.clone()),
+        None,
+    );
+    state
+        .early_bridge
+        .set_mode(super::early_bridge::Mode::Scripts);
+    let early_misses = || {
+        state
+            .metrics
+            .fast_bridge
+            .snapshot()
+            .find(|(name, _)| *name == "early_cache_absent")
+            .unwrap()
+            .1
+    };
+    assert!(fast_serve_get(&state, "/index.php").await.is_none());
+    assert_eq!(early_misses(), 1);
+    seed_public_entry(&state, &store, "/index.php", b"rendered page").await;
+    let hit = fast_serve_get(&state, "/index.php").await.unwrap();
+    assert_eq!(hit.status(), 200);
+    assert_eq!(hit.headers()["x-litespeed-cache"], "hit");
+    assert_eq!(&body_bytes(hit.into_body())[..], b"rendered page");
+    assert_eq!(early_misses(), 1);
+    std::fs::remove_dir_all(doc_root).unwrap();
+}
+
 /// A cookied request for a script path can never serve on-core (no page-cache branch for
 /// cookies, and scripts never serve static), so it bridges before the prefix runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3302,18 +3341,19 @@ async fn static_branch_bridges_precede_the_target_policy_without_a_page_cache() 
     std::fs::remove_dir_all(root).ok();
 }
 
-/// A front-controller rewrite (XenForo's `^.*$ index.php`) leaves the static branch: the
-/// request bridges under `rewritten`, which is why cookied forum pages never memoize.
+/// A rewrite to a script remains on the full pipeline even when ordinary
+/// same-chain static rewrites can now be served on-core.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fast_serve_counts_a_rewritten_path_as_its_bridge_reason() {
+async fn fast_serve_keeps_a_rewritten_script_on_the_bridge() {
     let doc_root = temp_root("fastserve-rewritten");
     std::fs::write(doc_root.join("real.txt"), b"real").unwrap();
+    std::fs::write(doc_root.join("entry.php"), b"<?php echo 'fixture';").unwrap();
     std::fs::write(
         doc_root.join(".htaccess"),
-        "RewriteEngine On\nRewriteRule ^alias\\.txt$ real.txt [L]\n",
+        "RewriteEngine On\nRewriteRule ^alias$ entry.php [L]\n",
     )
     .unwrap();
-    let state = build_state_inner(
+    let mut state = build_state_inner(
         doc_root.clone(),
         Vec::new(),
         Vec::new(),
@@ -3322,15 +3362,299 @@ async fn fast_serve_counts_a_rewritten_path_as_its_bridge_reason() {
         None,
         |_| {},
     );
+    Arc::get_mut(&mut state).unwrap().generation = 0xd001_0000;
     assert!(
         fast_serve_get(&state, "/real.txt").await.is_some(),
         "control: on-core"
     );
-    assert!(fast_serve_get(&state, "/alias.txt").await.is_none());
+    assert!(fast_serve_get(&state, "/alias").await.is_none());
     let reasons: std::collections::HashMap<_, _> = state.metrics.fast_bridge.snapshot().collect();
-    assert_eq!(reasons["rewritten"], 1);
     assert_eq!(reasons.values().sum::<u64>(), 1);
+    assert_eq!(
+        run(&state, get(CANON_HOST, "/alias", None)).await.status(),
+        http::StatusCode::SERVICE_UNAVAILABLE,
+        "the isolated fixture has no PHP backend; the full pipeline decides"
+    );
     std::fs::remove_dir_all(doc_root).unwrap();
+}
+
+mod resolved_static_rewrite_e2e {
+    // Full static finalization may use block_in_place. The test body remains on
+    // Runtime::block_on's calling thread; memo probes are never spawned/migrated.
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn fresh_state(root: PathBuf, contexts: Vec<Context>) -> Arc<ServerState> {
+        static NEXT: AtomicU64 = AtomicU64::new(0xd100_0000);
+        let mut state = build_state_inner(root, contexts, Vec::new(), true, None, None, |_| {});
+        Arc::get_mut(&mut state).unwrap().generation = NEXT.fetch_add(1, Ordering::Relaxed);
+        state
+    }
+
+    fn request(path: &str, origin: Option<&str>) -> Request {
+        let mut request = get(CANON_HOST, path, None);
+        if let Some(origin) = origin {
+            request
+                .headers_mut()
+                .insert(header::ORIGIN, origin.parse().unwrap());
+        }
+        request
+    }
+
+    fn assert_same_response(full: Response, fast: Response, expected: &[u8]) {
+        assert_eq!(fast.status(), full.status());
+        let mut full_headers = full.headers().clone();
+        let mut fast_headers = fast.headers().clone();
+        // Generated Date is stamped at different serving boundaries. Every other
+        // header, including duplicate values, must remain identical.
+        full_headers.remove(header::DATE);
+        fast_headers.remove(header::DATE);
+        assert_eq!(fast_headers, full_headers);
+        assert_eq!(identity_bytes(full), expected);
+        assert_eq!(identity_bytes(fast), expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolved_static_rewrite_same_directory_matches_pipeline_and_memoizes() {
+        let root = temp_root("resolved-static-same-dir");
+        std::fs::write(root.join("target.txt"), b"same directory target").unwrap();
+        std::fs::write(
+            root.join(".htaccess"),
+            "RewriteEngine On\nRewriteRule ^alias$ target.txt [L]\n\
+             <Files \"target.txt\">\nHeader set X-Resolved target\n</Files>\n",
+        )
+        .unwrap();
+        let state = fresh_state(root.clone(), Vec::new());
+        let cold = request("/alias", None);
+        assert!(
+            fast_serve_req(&state, &cold).await.is_none(),
+            "a rewritten cache miss keeps file reads off-core"
+        );
+        let full = run(&state, request("/alias", None)).await;
+        assert_eq!(full.status(), http::StatusCode::OK);
+        let fast = fast_serve_req(&state, &request("/alias", None))
+            .await
+            .expect("same-directory static rewrite should serve on-core");
+        assert_eq!(fast.headers()["x-resolved"], "target");
+        assert_same_response(full, fast, b"same directory target");
+
+        let hits = state.metrics.fast_memo_hits.load(Ordering::Relaxed);
+        let repeated = fast_serve_req(&state, &request("/alias", None))
+            .await
+            .expect("a repeat remains on-core");
+        assert_eq!(identity_bytes(repeated), b"same directory target");
+        assert_eq!(
+            state.metrics.fast_memo_hits.load(Ordering::Relaxed),
+            hits + 1,
+            "memo admission must use the original alias key"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolved_static_rewrite_ancestor_preserves_final_scope_and_query_semantics() {
+        let root = temp_root("resolved-static-ancestor");
+        std::fs::create_dir(root.join("source")).unwrap();
+        std::fs::write(root.join("target.txt"), b"ancestor target").unwrap();
+        std::fs::write(
+            root.join(".htaccess"),
+            "<Files \"target.txt\">\nForceType application/x-rewritten-static\n\
+             Header set X-Resolved target\n</Files>\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("source/.htaccess"),
+            "RewriteEngine On\nRewriteRule ^alias$ /target.txt?rewritten=1 [L]\n\
+             Header set X-Source source\n\
+             SetEnvIf Query_String \"^original=1$\" ORIGINAL_QUERY\n\
+             Header set X-Original-Query yes env=ORIGINAL_QUERY\n",
+        )
+        .unwrap();
+        let state = fresh_state(root.clone(), Vec::new());
+        let path = "/source/alias?original=1";
+        let full = run(&state, request(path, None)).await;
+        assert_eq!(full.status(), http::StatusCode::OK);
+        let fast = fast_serve_req(&state, &request(path, None))
+            .await
+            .expect("the ancestor chain is already loaded");
+        assert_eq!(fast.headers()["x-resolved"], "target");
+        assert_eq!(fast.headers()["x-source"], "source");
+        assert_eq!(
+            fast.headers()[header::CONTENT_TYPE],
+            "application/x-rewritten-static"
+        );
+        assert_same_response(full, fast, b"ancestor target");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolved_static_rewrite_memo_keeps_origin_vary_and_generation() {
+        let root = temp_root("resolved-static-vary");
+        std::fs::create_dir(root.join("source")).unwrap();
+        std::fs::write(root.join("target.txt"), b"vary target").unwrap();
+        std::fs::write(
+            root.join("source/.htaccess"),
+            "RewriteEngine On\nRewriteRule ^alias$ /target.txt [L]\n\
+             SetEnvIf Origin \"^https://(a\\.test|b\\.test)$\" ORIGIN_ALLOWED=$0\n\
+             Header set Access-Control-Allow-Origin \"%{ORIGIN_ALLOWED}e\" env=ORIGIN_ALLOWED\n",
+        )
+        .unwrap();
+        let state = fresh_state(root.clone(), Vec::new());
+        let path = "/source/alias";
+        for origin in ["https://a.test", "https://b.test"] {
+            let full = run(&state, request(path, Some(origin))).await;
+            let before = state.metrics.fast_memo_hits.load(Ordering::Relaxed);
+            let fast = fast_serve_req(&state, &request(path, Some(origin)))
+                .await
+                .expect("keyable Origin-vary static rewrite should serve on-core");
+            assert_eq!(fast.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], origin);
+            assert_eq!(state.metrics.fast_memo_hits.load(Ordering::Relaxed), before);
+            assert_same_response(full, fast, b"vary target");
+            let repeated = fast_serve_req(&state, &request(path, Some(origin)))
+                .await
+                .unwrap();
+            assert_eq!(
+                repeated.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+                origin
+            );
+            assert_eq!(identity_bytes(repeated), b"vary target");
+            assert_eq!(
+                state.metrics.fast_memo_hits.load(Ordering::Relaxed),
+                before + 1
+            );
+        }
+        // The same request in a fresh configuration generation must populate its
+        // own entry, even on the same thread with the old memo still resident.
+        let next = fresh_state(root.clone(), Vec::new());
+        let full = run(&next, request(path, Some("https://a.test"))).await;
+        assert_eq!(identity_bytes(full), b"vary target");
+        let response = fast_serve_req(&next, &request(path, Some("https://a.test")))
+            .await
+            .unwrap();
+        assert_eq!(identity_bytes(response), b"vary target");
+        assert_eq!(next.metrics.fast_memo_hits.load(Ordering::Relaxed), 0);
+        assert_eq!(next.metrics.fast_memo_stores.load(Ordering::Relaxed), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolved_static_rewrite_head_and_literal_percent_match_pipeline() {
+        let root = temp_root("resolved-static-percent-head");
+        const PAYLOAD: &[u8] = b"literal percent target";
+        std::fs::write(root.join("percent%.txt"), PAYLOAD).unwrap();
+        std::fs::write(
+            root.join(".htaccess"),
+            "RewriteEngine On\nRewriteRule ^alias$ /percent\\%.txt [L]\n\
+             Header set X-Percent-Fixture yes\n",
+        )
+        .unwrap();
+        let state = fresh_state(root.clone(), Vec::new());
+        for method in [http::Method::GET, http::Method::HEAD] {
+            let make = || {
+                let mut req = request("/alias", None);
+                *req.method_mut() = method.clone();
+                req
+            };
+            let full = run(&state, make()).await;
+            assert_eq!(full.status(), http::StatusCode::OK, "{method}");
+            let fast = fast_serve_req(&state, &make())
+                .await
+                .expect("ordinary GET/HEAD rewrite remains on-core");
+            assert_eq!(fast.headers()["x-percent-fixture"], "yes");
+            let expected = if method == http::Method::HEAD {
+                &[][..]
+            } else {
+                PAYLOAD
+            };
+            assert_same_response(full, fast, expected);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolved_static_rewrite_protected_target_requires_the_full_pipeline() {
+        let root = temp_root("resolved-static-protected");
+        std::fs::write(root.join("protected.txt"), b"protected fixture").unwrap();
+        std::fs::write(
+            root.join("users"),
+            "Visitor:{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g=\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".htaccess"),
+            "RewriteEngine On\nRewriteRule ^alias$ /protected.txt [L]\n\
+             <Files \"protected.txt\">\nAuthType Basic\nAuthName Fixture\n\
+             AuthUserFile users\nRequire valid-user\n</Files>\n",
+        )
+        .unwrap();
+        let state = fresh_state(root.clone(), Vec::new());
+        for path in ["/protected.txt", "/alias"] {
+            assert!(fast_serve_req(&state, &request(path, None)).await.is_none());
+            let full = run(&state, request(path, None)).await;
+            assert_eq!(full.status(), http::StatusCode::UNAUTHORIZED, "{path}");
+            assert!(full.headers().contains_key(header::WWW_AUTHENTICATE));
+            assert_ne!(identity_bytes(full), b"protected fixture");
+        }
+        assert_eq!(state.metrics.fast_memo_stores.load(Ordering::Relaxed), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolved_static_rewrite_scripts_refusals_and_new_chains_keep_full_pipeline() {
+        let root = temp_root("resolved-static-fallbacks");
+        std::fs::create_dir_all(root.join("source/deep")).unwrap();
+        std::fs::create_dir(root.join("other")).unwrap();
+        std::fs::write(root.join("entry.php"), b"<?php echo 'fixture';").unwrap();
+        std::fs::write(root.join("refused.txt"), b"refused target").unwrap();
+        std::fs::write(root.join("denied.txt"), b"denied target").unwrap();
+        std::fs::write(root.join("other/target.txt"), b"lateral target").unwrap();
+        std::fs::write(root.join("source/deep/target.txt"), b"deeper target").unwrap();
+        std::fs::write(
+            root.join(".htaccess"),
+            "<Files \"denied.txt\">\nRequire all denied\n</Files>\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("source/.htaccess"),
+            "RewriteEngine On\n\
+             RewriteRule ^script$ /entry.php [L]\n\
+             RewriteRule ^refusal$ /refused.txt [L]\n\
+             RewriteRule ^denial$ /denied.txt [L]\n\
+             RewriteRule ^lateral$ /other/target.txt [L]\n\
+             RewriteRule ^deeper$ /source/deep/target.txt [L]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("other/.htaccess"),
+            "Header set X-Destination lateral\n",
+        )
+        .unwrap();
+        let mut refused = plain_context(ContextKind::Static, "/refused.txt");
+        refused.allow_browse = false;
+        let state = fresh_state(root.clone(), vec![refused]);
+        for (path, status) in [
+            ("/source/script", 503),
+            ("/source/refusal", 403),
+            ("/source/denial", 403),
+            ("/source/lateral", 200),
+            ("/source/deeper", 200),
+        ] {
+            assert!(
+                fast_serve_req(&state, &request(path, None)).await.is_none(),
+                "{path} must retain its existing full-pipeline route"
+            );
+            let full = run(&state, request(path, None)).await;
+            assert_eq!(full.status().as_u16(), status, "{path}");
+            if path.ends_with("lateral") {
+                assert_eq!(full.headers()["x-destination"], "lateral");
+                assert_eq!(identity_bytes(full), b"lateral target");
+            } else if path.ends_with("deeper") {
+                assert_eq!(identity_bytes(full), b"deeper target");
+            }
+        }
+        assert_eq!(state.metrics.fast_memo_stores.load(Ordering::Relaxed), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3938,7 +4262,6 @@ async fn non_ascii_request_headers_are_logged_escaped() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unrouted_and_reserved_endpoint_requests_are_counted_and_logged() {
     use crate::peer_purge::READY_PATH;
-    use std::sync::atomic::Ordering;
     let doc_root = temp_root("unrouted-log");
     let state = build_state_full(
         doc_root.clone(),
@@ -3947,7 +4270,7 @@ async fn unrouted_and_reserved_endpoint_requests_are_counted_and_logged() {
         None,
         Some(crate::peer_purge::PurgeForwarder::new()),
     );
-    let before = state.metrics.requests_total.load(Ordering::Relaxed);
+    let before = state.telemetry.requests_total();
     let unrouted = handle(
         state.clone(),
         "no-such-listener",
@@ -3976,7 +4299,7 @@ async fn unrouted_and_reserved_endpoint_requests_are_counted_and_logged() {
     assert_eq!(on_core.status(), 200);
     unified_access_line(&state, &format!("{READY_PATH}?core")).await;
     assert_eq!(
-        state.metrics.requests_total.load(Ordering::Relaxed) - before,
+        state.telemetry.requests_total() - before,
         3,
         "unrouted 404 + both ready probes are counted"
     );
@@ -4060,6 +4383,364 @@ RewriteRule ^.*$ index.php [NC,L]
         fast_serve_req(state, &r)
             .await
             .expect("static GET must be served on-core, not bridged")
+    }
+
+    fn borrowed_generation(state: &mut Arc<ServerState>) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0xb000_0000);
+        Arc::get_mut(state).unwrap().generation = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn borrowed_h2(
+        state: &Arc<ServerState>,
+        request: &Request,
+        tls: bool,
+    ) -> Option<(Arc<http::HeaderMap>, bytes::Bytes)> {
+        super::super::probe_borrowed_h2_memo(
+            state,
+            LISTENER,
+            Ipv4Addr::LOCALHOST.into(),
+            tls,
+            false,
+            false,
+            Proto::Http2,
+            None,
+            0,
+            request.method(),
+            request.uri(),
+            request.headers(),
+        )
+    }
+
+    #[tokio::test]
+    async fn borrowed_h2_memo_obeys_scope_vary_and_request_guards() {
+        let (root, mut state) = setup(
+            "borrowed-h2-guards",
+            "SetEnvIf Origin \"^https://(a\\.test|b\\.test)$\" ORIGIN_ALLOWED=$0\nHeader set Access-Control-Allow-Origin \"%{ORIGIN_ALLOWED}e\" env=ORIGIN_ALLOWED\n",
+        );
+        borrowed_generation(&mut state);
+        std::fs::write(root.join("borrowed.txt"), b"borrowed payload").unwrap();
+        let warm = req("/borrowed.txt", &[("origin", "https://a.test")]);
+        assert!(
+            borrowed_h2(&state, &warm, false).is_none(),
+            "cold lookup grants nothing"
+        );
+        let _ = serve(&state, warm).await;
+        let before = hits(&state);
+        let hit = borrowed_h2(
+            &state,
+            &req("/borrowed.txt", &[("origin", "https://a.test")]),
+            false,
+        )
+        .unwrap();
+        assert_eq!(&hit.1[..], b"borrowed payload");
+        assert_eq!(hit.0[header::ACCESS_CONTROL_ALLOW_ORIGIN], "https://a.test");
+        assert!(hit.0.contains_key(header::DATE));
+        assert_eq!(hits(&state), before + 1);
+        for headers in [
+            vec![("cookie", "")],
+            vec![("authorization", "Basic x")],
+            vec![("proxy-authorization", "Basic x")],
+            vec![("range", "bytes=0-1")],
+            vec![("if-none-match", "*")],
+            vec![("if-match", "missing")],
+            vec![("if-modified-since", "Mon, 01 Jan 2024 00:00:00 GMT")],
+            vec![("if-unmodified-since", "Mon, 01 Jan 2024 00:00:00 GMT")],
+            vec![("if-range", "missing")],
+            vec![("accept-encoding", "gzip")],
+            vec![("content-length", "0")],
+        ] {
+            assert!(
+                borrowed_h2(
+                    &state,
+                    &req(
+                        "/borrowed.txt",
+                        &[vec![("origin", "https://a.test")], headers.clone()].concat()
+                    ),
+                    false
+                )
+                .is_none(),
+                "{headers:?}"
+            );
+        }
+        assert!(
+            borrowed_h2(
+                &state,
+                &req("/borrowed.txt", &[("origin", "https://b.test")]),
+                false
+            )
+            .is_none()
+        );
+        for path in ["/different.txt", "/borrowed.txt?q=1"] {
+            assert!(
+                borrowed_h2(&state, &req(path, &[("origin", "https://a.test")]), false).is_none()
+            );
+        }
+        let mut changed = req("/borrowed.txt", &[("origin", "https://a.test")]);
+        changed
+            .headers_mut()
+            .insert(header::HOST, http::HeaderValue::from_static("other.test"));
+        assert!(borrowed_h2(&state, &changed, false).is_none());
+        let mut head = req("/borrowed.txt", &[("origin", "https://a.test")]);
+        *head.method_mut() = http::Method::HEAD;
+        assert!(borrowed_h2(&state, &head, false).is_none());
+        assert_eq!(
+            hits(&state),
+            before + 1,
+            "declines must not count as served hits"
+        );
+        // Native static memo replay remains valid with CC/Pragma; page memo
+        // replay is the narrower case tested separately below.
+        assert!(
+            borrowed_h2(
+                &state,
+                &req(
+                    "/borrowed.txt",
+                    &[
+                        ("origin", "https://a.test"),
+                        ("cache-control", "no-cache"),
+                        ("pragma", "no-cache")
+                    ]
+                ),
+                false
+            )
+            .is_some()
+        );
+        let (id_root, mut request_ids) = setup("borrowed-h2-request-id", "");
+        Arc::get_mut(&mut request_ids).unwrap().generation = state.generation;
+        assert!(
+            borrowed_h2(
+                &request_ids,
+                &req("/borrowed.txt", &[("origin", "https://a.test")]),
+                false
+            )
+            .is_some()
+        );
+        Arc::get_mut(&mut request_ids).unwrap().request_id_header = true;
+        assert!(
+            borrowed_h2(
+                &request_ids,
+                &req("/borrowed.txt", &[("origin", "https://a.test")]),
+                false
+            )
+            .is_none()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(id_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn borrowed_h2_memo_keeps_page_purge_generation_and_waf_gates() {
+        let root = temp_root("borrowed-h2-page");
+        std::fs::write(root.join("cached.php"), b"<?php echo 'dynamic';").unwrap();
+        let mut cfg = hj_pagecache::StoreConfig::default();
+        cfg.response_memo = true;
+        cfg.standard_cc_vhosts.push(VHOST.into());
+        let store = Arc::new(hj_pagecache::PageStore::new(cfg));
+        let mut state = build_state_full(
+            root.clone(),
+            Vec::new(),
+            Vec::new(),
+            Some(store.clone()),
+            None,
+        );
+        borrowed_generation(&mut state);
+        seed_public_entry(&state, &store, "/cached.php", b"public render").await;
+        let request = req("/cached.php", &[]);
+        assert!(fast_serve_req(&state, &request).await.is_some());
+        assert_eq!(
+            &borrowed_h2(&state, &request, false).unwrap().1[..],
+            b"public render"
+        );
+        assert!(
+            borrowed_h2(
+                &state,
+                &req("/cached.php", &[("cache-control", "no-cache")]),
+                false
+            )
+            .is_none()
+        );
+        let next_root = temp_root("borrowed-h2-next-generation");
+        let mut next = build_state_full(
+            next_root.clone(),
+            Vec::new(),
+            Vec::new(),
+            Some(store.clone()),
+            None,
+        );
+        Arc::get_mut(&mut next).unwrap().generation = state.generation;
+        assert!(
+            borrowed_h2(&next, &request, false).is_some(),
+            "positive control has the same page store, enabled response memo and generation"
+        );
+        borrowed_generation(&mut next);
+        assert_ne!(next.generation, state.generation);
+        assert!(
+            borrowed_h2(&next, &request, false).is_none(),
+            "old generation cannot replay"
+        );
+        let waf_root = temp_root("borrowed-h2-waf");
+        let mut waf = build_state_full(
+            waf_root.clone(),
+            Vec::new(),
+            Vec::new(),
+            Some(store.clone()),
+            None,
+        );
+        Arc::get_mut(&mut waf).unwrap().generation = state.generation;
+        assert!(
+            borrowed_h2(&waf, &request, false).is_some(),
+            "control has the same eligible page memo"
+        );
+        Arc::get_mut(&mut waf).unwrap().waf = Some(Arc::new(
+            crate::waf::Sidecar::new(
+                SocketAddr::from(([127, 0, 0, 1], 9)),
+                None,
+                "/inspect".into(),
+                std::time::Duration::from_secs(1),
+                1024,
+                2,
+                crate::waf::FailurePolicy::Closed,
+            )
+            .unwrap(),
+        ));
+        assert!(
+            borrowed_h2(&waf, &request, false).is_none(),
+            "even a same-generation memo cannot bypass WAF"
+        );
+        store.purge_all();
+        assert!(
+            borrowed_h2(&state, &request, false).is_none(),
+            "purged page must fall back"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(next_root).unwrap();
+        std::fs::remove_dir_all(waf_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn borrowed_h2_memo_rechecks_forwarded_acl_and_throttle() {
+        let (root, mut state) = forwarded_deny_state("borrowed-h2-forwarded-acl");
+        borrowed_generation(&mut state);
+        let warm = get(CANON_HOST, "/page.html", None);
+        assert!(fast_serve_tls(&state, &warm).await.is_some());
+        let before = hits(&state);
+        let denied = get_with(
+            CANON_HOST,
+            "/page.html",
+            &[("CF-Connecting-IP", "203.0.113.9")],
+        );
+        assert!(borrowed_h2(&state, &denied, true).is_none());
+        assert_eq!(
+            hits(&state),
+            before,
+            "ACL refusal is never an admitted serve"
+        );
+        assert!(borrowed_h2(&state, &warm, true).is_some());
+        let tuning = Tuning {
+            per_ip_rate: 1,
+            per_ip_rate_window: std::time::Duration::from_secs(60),
+            ..Tuning::default()
+        };
+        Arc::get_mut(&mut state).unwrap().client_throttle =
+            Arc::new(hj_acl::ClientThrottle::from_tuning(&tuning));
+        assert!(borrowed_h2(&state, &warm, true).is_some());
+        assert!(
+            borrowed_h2(&state, &warm, true).is_none(),
+            "rate checks remain live"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn borrowed_h2_memo_rechecks_configured_geo_denial_with_positive_controls() {
+        let (root, mut state) = forwarded_deny_state("borrowed-h2-geo");
+        borrowed_generation(&mut state);
+        let request = get_with(CANON_HOST, "/page.html", &[("CF-Connecting-IP", "8.8.8.8")]);
+        assert!(fast_serve_tls(&state, &request).await.is_some());
+        assert!(
+            borrowed_h2(&state, &request, true).is_some(),
+            "same memo and forwarded client are initially allowed"
+        );
+        let source = hj_geo::CidrList::parse("country US 8.8.8.0/24\n").unwrap();
+        let rules = hj_acl::GeoRules::resolve(&source, &[], &["US".to_owned()], &[], &[]).unwrap();
+        Arc::get_mut(&mut state).unwrap().geo = Arc::new(rules);
+        let before = hits(&state);
+        assert!(
+            borrowed_h2(&state, &request, true).is_none(),
+            "live configured Geo denial must override a matching memo"
+        );
+        assert_eq!(hits(&state), before);
+        let allowed = get_with(CANON_HOST, "/page.html", &[("CF-Connecting-IP", "1.1.1.1")]);
+        assert!(
+            borrowed_h2(&state, &allowed, true).is_some(),
+            "another allowed client still consumes the same memo"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn borrowed_h2_memo_rechecks_plaintext_mtls_gate_with_positive_controls() {
+        let (root, mut state) = setup("borrowed-h2-mtls", "");
+        borrowed_generation(&mut state);
+        std::fs::write(root.join("mtls.txt"), b"public before gate").unwrap();
+        let request = req("/mtls.txt", &[]);
+        let peer: IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(
+            super::super::fast_serve(
+                &state,
+                LISTENER,
+                peer,
+                SocketAddr::from(([127, 0, 0, 1], 80)),
+                40000,
+                false,
+                false,
+                false,
+                Proto::Http2,
+                None,
+                &request,
+            )
+            .await
+            .is_some()
+        );
+        let probe = |state: &Arc<ServerState>| {
+            super::super::probe_borrowed_h2_memo(
+                state,
+                LISTENER,
+                peer,
+                false,
+                false,
+                false,
+                Proto::Http2,
+                None,
+                0,
+                request.method(),
+                request.uri(),
+                request.headers(),
+            )
+        };
+        assert!(
+            probe(&state).is_some(),
+            "plaintext external peer initially matches the admitted memo"
+        );
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .mtls_required_vhosts
+            .insert(VHOST.to_owned());
+        let before = hits(&state);
+        assert!(
+            probe(&state).is_none(),
+            "mTLS redirect policy must precede cached bytes on plaintext"
+        );
+        assert_eq!(hits(&state), before);
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .mtls_required_vhosts
+            .remove(VHOST);
+        assert!(
+            probe(&state).is_some(),
+            "removing only the live gate restores the same hit"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Full-pipeline dispatch for auth tests: auth-protected trees decline the
@@ -5484,7 +6165,8 @@ async fn static_cache_promotion_reads_the_selected_descriptor_for_full_range_and
     std::fs::write(&fast_replacement, b"NEW-FAST").unwrap();
     std::fs::rename(fast_replacement, &fast_path).unwrap();
     let fast = file_response(fast_path, fast_fd, 8, None);
-    let fast = super::buffer_static_file(&state, 8, fast).expect("small file buffers in fast path");
+    let fast = super::buffer_static_file(&state, 8, fast, super::StaticReadMode::Direct)
+        .expect("small file buffers in fast path");
     assert_eq!(
         body_bytes(fast.into_body()),
         bytes::Bytes::from_static(b"OLD-FAST"),
@@ -6022,6 +6704,14 @@ async fn fast_path_memo_and_cache_hits_keep_the_bandwidth_stamp() {
         assert!(resp.is_some(), "iteration {i} served on-core");
         assert_eq!(rate(&resp), Some(250_000), "iteration {i}");
     }
+    assert!(
+        state
+            .metrics
+            .fast_memo_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0,
+        "static response must be replayed from the memo"
+    );
     let mut cfg = hj_pagecache::StoreConfig::default();
     cfg.standard_cc_vhosts.push(VHOST.into());
     let store = Arc::new(hj_pagecache::PageStore::new(cfg));

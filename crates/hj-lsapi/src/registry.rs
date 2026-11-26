@@ -156,6 +156,14 @@ impl PoolKey {
     }
 }
 
+/// Fast-path handle to the already-started default (un-jailed) LSAPI pool for
+/// on-core monoio `UnixStream` dispatch.
+pub struct MonoioPoolTarget {
+    pub socket_path: PathBuf,
+    pub handler: Arc<Lsapi>,
+    pub pool: Arc<LsapiPool>,
+}
+
 /// A single running pool quartet: supervisor + connection pool + monitor +
 /// handler, all sharing one lsphp master on one socket. Mirrors the wiring
 /// `main.rs` built for the global pool in Phase 3.
@@ -313,6 +321,9 @@ pub struct LsapiRegistry {
     /// adopts the persistent socket instead of binding (and the socket survives
     /// restarts). `None` (the common case) = self-bind as before.
     listen_fd: Mutex<Option<OwnedFd>>,
+    /// Lock-free cache of the started default pool's monoio fast-path target,
+    /// populated once when `PoolKey::default()` finishes starting.
+    default_monoio_cache: std::sync::OnceLock<Arc<MonoioPoolTarget>>,
 }
 
 /// Per-key slot guarding lazy async start. The map's write lock inserts the slot
@@ -381,6 +392,7 @@ impl LsapiRegistry {
             external_generation: RwLock::new(None),
             default_promotion_hook: RwLock::new(None),
             listen_fd: Mutex::new(None),
+            default_monoio_cache: std::sync::OnceLock::new(),
         })
     }
 
@@ -504,6 +516,27 @@ impl LsapiRegistry {
     pub fn default_pool_stats(&self) -> Option<PoolStats> {
         let slot = self.entries.read().get(&PoolKey::default()).cloned()?;
         Some(slot.cell.get()?.pool.stats())
+    }
+
+    /// Return a handle to the already-started default (un-jailed) LSAPI pool
+    /// for on-core monoio dispatch, or `None` if draining, not yet started, or
+    /// currently unadmitted (bad supervisor / open circuit breaker).
+    pub fn default_monoio_target(&self) -> Option<Arc<MonoioPoolTarget>> {
+        if self.draining.load(Ordering::Acquire) {
+            return None;
+        }
+        if let Some(cached) = self.default_monoio_cache.get() {
+            return cached.handler.is_admitted_fast().then(|| cached.clone());
+        }
+        let slot = self.entries.read().get(&PoolKey::default()).cloned()?;
+        let entry = slot.cell.get()?;
+        let target = Arc::new(MonoioPoolTarget {
+            socket_path: slot.socket_path.clone(),
+            handler: entry.handler.clone(),
+            pool: entry.pool.clone(),
+        });
+        let cached = self.default_monoio_cache.get_or_init(|| target);
+        cached.handler.is_admitted_fast().then(|| cached.clone())
     }
 
     /// `(checked out now, peak since the previous call)` for the started default client

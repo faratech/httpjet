@@ -22,20 +22,14 @@ pub(crate) enum Mode {
     Shadow = 1,
     On = 2,
     Scripts = 3,
-    H3Scripts = 4,
 }
 
 impl Mode {
-    pub(crate) fn default_for(arch: &str, accelerated_h3: bool) -> Self {
+    pub(crate) fn default_for(arch: &str) -> Self {
         match arch {
-            "x86_64" => Self::Scripts,
-            "aarch64" if accelerated_h3 => Self::H3Scripts,
+            "x86_64" | "aarch64" => Self::Scripts,
             _ => Self::Off,
         }
-    }
-
-    pub(crate) fn checks_script_suffix(self, proto: hj_core::Proto) -> bool {
-        self == Self::Scripts || (self == Self::H3Scripts && proto == hj_core::Proto::Http3)
     }
 
     pub(crate) fn parse(s: &str) -> Option<Mode> {
@@ -53,7 +47,6 @@ impl Mode {
             1 => Mode::Shadow,
             2 => Mode::On,
             3 => Mode::Scripts,
-            4 => Mode::H3Scripts,
             _ => Mode::Off,
         }
     }
@@ -145,14 +138,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn arm_accelerated_h3_default_checks_scripts_only_over_h3() {
-        let mode = Mode::default_for("aarch64", true);
-        assert_eq!(Mode::from_u8(mode as u8), Mode::H3Scripts);
-        assert!(mode.checks_script_suffix(hj_core::Proto::Http3));
-        assert!(!mode.checks_script_suffix(hj_core::Proto::Http1));
-        assert!(!mode.checks_script_suffix(hj_core::Proto::Http2));
-        assert_eq!(Mode::default_for("aarch64", false), Mode::Off);
-        assert_eq!(Mode::default_for("x86_64", false), Mode::Scripts);
+    fn supported_origins_check_script_suffixes_by_default() {
+        assert_eq!(Mode::default_for("aarch64"), Mode::Scripts);
+        assert_eq!(Mode::default_for("x86_64"), Mode::Scripts);
+        assert_eq!(Mode::default_for("riscv64"), Mode::Off);
     }
 
     #[test]

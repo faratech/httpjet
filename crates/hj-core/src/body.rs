@@ -25,6 +25,12 @@ pub fn empty_incoming() -> IncomingBody {
         .boxed()
 }
 
+/// True when `body` is known to yield no frames (e.g. `empty_incoming()`).
+#[inline]
+pub fn is_empty_incoming(body: &IncomingBody) -> bool {
+    HttpBody::is_end_stream(body)
+}
+
 /// A streaming response body.
 pub type StreamBody = BoxBody<Bytes, BoxError>;
 

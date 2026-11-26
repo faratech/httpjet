@@ -627,6 +627,17 @@ async fn seeded_redirect_status_bypasses_outcome_cache() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn differential_replay_production_corpus() {
+    if let Ok(cfg) = hj_config::load(Path::new("/usr/local/lsws"))
+        && !cfg
+            .vhosts
+            .values()
+            .any(|decl| decl.name == "windowsforum.com")
+    {
+        println!(
+            "SKIP: live config declares no windowsforum.com vhost; WindowsForum rewrite corpus is not applicable"
+        );
+        return;
+    }
     let Ok(live) = std::fs::read_to_string(LIVE_HTACCESS) else {
         println!("SKIP: {LIVE_HTACCESS} unreadable on this machine");
         return;

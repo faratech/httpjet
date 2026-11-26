@@ -1,6 +1,7 @@
 //! Connection-local H1 scratch, transferred into every submitted write.
 
 use std::io;
+use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
 
@@ -12,15 +13,118 @@ const RETAIN_HEAD_CAPACITY: usize = 16384;
 #[derive(Default)]
 pub(super) struct ResponseBuffers {
     head: Vec<u8>,
+    // Valid only for a rendered HTTP/1.1 keep-alive 200 GET header ending in `\r\n\r\n`.
+    shared_head: Option<(Weak<http::HeaderMap>, usize)>,
+    // Complete pre-assembled `[head][body]` wire buffer for repeated small responses
+    // whose shared `HeaderMap` and `Bytes` body backing `(ptr, len)` both match.
+    wire: Vec<u8>,
+    shared_wire: Option<(Weak<http::HeaderMap>, usize, usize)>,
     iovecs: Option<Box<[libc::iovec; 2]>>,
+    pub(super) send_slot: super::write_watch::Slot,
 }
 
 impl ResponseBuffers {
     pub(super) fn take_head(&mut self) -> Vec<u8> {
+        self.shared_head = None;
+        self.shared_wire = None;
         std::mem::take(&mut self.head)
     }
 
+    /// Return a complete pre-assembled `[head][body]` wire buffer when both the
+    /// shared `HeaderMap` pointer and the `Bytes` body backing `(ptr, len)` match.
+    /// Avoids both header serialization AND per-hit `head.extend_from_slice(&body)`.
+    pub(super) fn take_shared_wire(
+        &mut self,
+        headers: &Arc<http::HeaderMap>,
+        body: &Bytes,
+    ) -> Option<Vec<u8>> {
+        let (owner, previous_len, body_ptr) = self.shared_wire.as_ref()?;
+        if *previous_len == body.len()
+            && *body_ptr == body.as_ptr() as usize
+            && owner.as_ptr() == Arc::as_ptr(headers)
+            && !self.wire.is_empty()
+        {
+            Some(std::mem::take(&mut self.wire))
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn take_shared_head(
+        &mut self,
+        headers: &Arc<http::HeaderMap>,
+        body_len: usize,
+    ) -> Option<Vec<u8>> {
+        self.shared_wire = None;
+        let (owner, previous_len) = self.shared_head.as_ref()?;
+        if *previous_len == body_len
+            && owner.as_ptr() == Arc::as_ptr(headers)
+            && !self.head.is_empty()
+        {
+            Some(std::mem::take(&mut self.head))
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn invalidate_after_wire_error(&mut self) {
+        self.shared_head = None;
+        self.shared_wire = None;
+        self.head = Vec::new();
+        self.wire = Vec::new();
+    }
+
+    /// Fast-path recycle after a `take_shared_wire` hit: `shared_head` and
+    /// `shared_wire` already hold the matching `Weak`s, avoiding 4 atomic ops.
+    pub(super) fn recycle_shared_wire_fast(&mut self, wire: Vec<u8>) {
+        self.wire = wire;
+    }
+
+    pub(super) fn recycle_shared_wire(
+        &mut self,
+        wire: Vec<u8>,
+        head_len: usize,
+        headers: &Arc<http::HeaderMap>,
+        body: &Bytes,
+    ) {
+        if wire.capacity() > RETAIN_HEAD_CAPACITY {
+            self.shared_head = None;
+            self.shared_wire = None;
+            return;
+        }
+        if self.head.is_empty()
+            && let Some(h) = wire.get(..head_len)
+        {
+            self.head.extend_from_slice(h);
+        }
+        self.shared_head = Some((Arc::downgrade(headers), body.len()));
+        self.shared_wire = Some((Arc::downgrade(headers), body.len(), body.as_ptr() as usize));
+        self.wire = wire;
+    }
+
+    pub(super) fn recycle_shared_head(
+        &mut self,
+        mut wire: Vec<u8>,
+        head_len: usize,
+        headers: &Arc<http::HeaderMap>,
+        body_len: usize,
+    ) {
+        if wire.capacity() > RETAIN_HEAD_CAPACITY {
+            self.shared_head = None;
+            self.shared_wire = None;
+            return;
+        }
+        // The next response always appends its own body. The Weak protects the
+        // header map's identity across eviction and copy-on-write Date updates.
+        wire.truncate(head_len);
+        self.shared_head = Some((Arc::downgrade(headers), body_len));
+        self.shared_wire = None;
+        self.head = wire;
+    }
+
     pub(super) fn recycle_head(&mut self, mut head: Vec<u8>) {
+        self.shared_head = None;
+        self.shared_wire = None;
         if head.capacity() <= RETAIN_HEAD_CAPACITY {
             head.clear();
             self.head = head;
@@ -289,6 +393,144 @@ mod tests {
             assert_eq!(cache.iovecs.as_ref().unwrap().as_ptr(), metadata);
         });
         assert_eq!(*events.lock().unwrap(), [hj_core::ResponseEnd::Complete; 3]);
+    }
+
+    #[test]
+    fn repeated_shared_headers_reuse_only_framing_and_send_the_current_body() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = super::super::build_core_runtime().unwrap();
+        runtime.block_on(async {
+            let mut cache = ResponseBuffers::default();
+            let mut headers = Arc::new(http::HeaderMap::new());
+            Arc::make_mut(&mut headers).insert("x-test", http::HeaderValue::from_static("first"));
+            Arc::make_mut(&mut headers).insert(
+                http::header::LINK,
+                http::HeaderValue::from_static("</style.css>; rel=preload"),
+            );
+            static LARGE: [u8; 4097] = [b'x'; 4097];
+            for (index, (body, status, head_only, keep, http10)) in [
+                (&b"one"[..], 200, false, true, false),
+                (&b"two"[..], 200, false, true, false),
+                (&b"different length"[..], 200, false, true, false),
+                (&b"different length"[..], 200, false, true, false),
+                (&b"head"[..], 200, true, true, false),
+                (&b"old"[..], 200, false, true, true),
+                (&b"err"[..], 404, false, true, false),
+                (&LARGE[..], 200, false, true, false),
+                (&b"end"[..], 200, false, false, false),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if index == 3 {
+                    Arc::make_mut(&mut headers)
+                        .insert("x-test", http::HeaderValue::from_static("second"));
+                }
+                let status = http::StatusCode::from_u16(status).unwrap();
+                let mut shared = response(body, status, "ignored", events.clone());
+                shared.shared_headers = Some(headers.clone());
+                let mut ordinary = response(body, status, "ignored", events.clone());
+                ordinary.headers = (*headers).clone();
+                let shutdown = tokio_util::sync::CancellationToken::new();
+                let mut got = PartialWriter::default();
+                let mut want = PartialWriter::default();
+                let result = super::super::write_h1_response_reusing(
+                    &mut got, shared, head_only, keep, http10, &mut None, None, None, &shutdown,
+                    &mut cache,
+                )
+                .await;
+                let reference = super::super::write_h1_response_reusing(
+                    &mut want,
+                    ordinary,
+                    head_only,
+                    keep,
+                    http10,
+                    &mut None,
+                    None,
+                    None,
+                    &shutdown,
+                    &mut ResponseBuffers::default(),
+                )
+                .await;
+                assert!(!result.failed && !reference.failed);
+                assert_eq!(got.wire, want.wire);
+                if index <= 3 {
+                    assert!(cache.shared_head.is_some());
+                    assert!(cache.head.ends_with(b"\r\n\r\n"));
+                } else {
+                    assert!(cache.shared_head.is_none());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn failed_warmed_shared_head_rebuilds_the_next_response() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = super::super::build_core_runtime().unwrap();
+        runtime.block_on(async {
+            let mut cache = ResponseBuffers::default();
+            let mut headers = http::HeaderMap::new();
+            headers.insert("x-test", http::HeaderValue::from_static("shared"));
+            let headers = Arc::new(headers);
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            for (body, fail) in [
+                (&b"old"[..], false),
+                (&b"bad"[..], true),
+                (&b"rebuilt"[..], false),
+            ] {
+                if fail {
+                    assert!(cache.shared_head.is_some());
+                    assert!(!cache.head.is_empty());
+                }
+                let mut resp = response(body, http::StatusCode::OK, "ignored", events.clone());
+                resp.shared_headers = Some(headers.clone());
+                let mut writer = PartialWriter {
+                    fail,
+                    ..Default::default()
+                };
+                let outcome = super::super::write_h1_response_reusing(
+                    &mut writer,
+                    resp,
+                    false,
+                    true,
+                    false,
+                    &mut None,
+                    None,
+                    None,
+                    &shutdown,
+                    &mut cache,
+                )
+                .await;
+                if fail {
+                    assert!(outcome.failed && outcome.close);
+                    assert_eq!(cache.head.capacity(), 0);
+                    assert!(cache.take_shared_head(&headers, body.len()).is_none());
+                    assert!(writer.wire.is_empty());
+                } else {
+                    assert!(!outcome.failed && !outcome.close);
+                    let mut expected = super::super::serialize_h1_response_head(
+                        http::StatusCode::OK,
+                        &headers,
+                        body.len(),
+                        false,
+                        true,
+                    );
+                    expected.extend_from_slice(body);
+                    assert_eq!(writer.wire, expected);
+                    assert_eq!(cache.shared_head.as_ref().unwrap().1, body.len());
+                    assert!(cache.head.ends_with(b"\r\n\r\n"));
+                }
+            }
+        });
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                hj_core::ResponseEnd::Complete,
+                hj_core::ResponseEnd::Error,
+                hj_core::ResponseEnd::Complete,
+            ]
+        );
     }
 
     #[test]

@@ -53,7 +53,7 @@ const VHOST_OVERFLOW: usize = MAX_VHOSTS - 1;
 pub const PHASE_SAMPLE_RATE: u64 = 16;
 
 /// Lock-free latency histogram. `record` is one branchless-ish bucket search +
-/// three `fetch_add(Relaxed)`. Buckets store the count that fell **in** each
+/// two `fetch_add(Relaxed)`. Buckets store the count that fell **in** each
 /// bucket (non-cumulative); the Prometheus render accumulates them.
 #[derive(Default)]
 pub struct AtomicHistogram {
@@ -62,8 +62,6 @@ pub struct AtomicHistogram {
     inf: AtomicU64,
     /// Sum of all recorded durations, in microseconds.
     sum_us: AtomicU64,
-    /// Total number of recorded samples.
-    count: AtomicU64,
 }
 
 impl AtomicHistogram {
@@ -83,7 +81,6 @@ impl AtomicHistogram {
             self.inf.fetch_add(1, Relaxed);
         }
         self.sum_us.fetch_add(us, Relaxed);
-        self.count.fetch_add(1, Relaxed);
     }
 
     fn snapshot(&self) -> HistogramSnapshot {
@@ -91,11 +88,12 @@ impl AtomicHistogram {
         for (i, b) in self.buckets.iter().enumerate() {
             buckets[i] = b.load(Relaxed);
         }
+        let inf = self.inf.load(Relaxed);
         HistogramSnapshot {
             buckets,
-            inf: self.inf.load(Relaxed),
+            inf,
             sum_us: self.sum_us.load(Relaxed),
-            count: self.count.load(Relaxed),
+            count: buckets.iter().copied().sum::<u64>() + inf,
         }
     }
 }
@@ -301,10 +299,8 @@ impl TelemetryShard {
         dur: Duration,
         vhost_idx: usize,
     ) {
-        // Record duration and status class ONLY into the per-vhost bucket (5 atomic
-        // RMWs instead of 10). Global `request_duration` and `status_{2..5}xx` are
-        // summed across `per_vhost` at scrape/flush time, and `vh.duration.count`
-        // doubles as `vh.requests`.
+        // Record duration and status class only into the per-vhost bucket.
+        // Scrapes derive the sample count from that histogram's buckets.
         let vh = &self.per_vhost[vhost_idx.min(VHOST_OVERFLOW)];
         vh.duration.record(dur);
         if status >= 400
@@ -594,6 +590,17 @@ impl Telemetry {
         self.shard().record_request(proto, status, dur, vhost_idx);
     }
 
+    /// Every served request increments exactly one protocol counter. Read the
+    /// same sharded counters for the total instead of incrementing it again.
+    pub fn requests_total(&self) -> u64 {
+        self.shards.iter().fold(0u64, |total, shard| {
+            total
+                .wrapping_add(shard.0.proto_h1.load(Relaxed))
+                .wrapping_add(shard.0.proto_h2.load(Relaxed))
+                .wrapping_add(shard.0.proto_h3.load(Relaxed))
+        })
+    }
+
     /// Record the response-level cache disposition (see
     /// [`TelemetryShard::record_cache_disposition`]).
     pub fn record_cache_disposition(&self, d: &hj_pagecache::Disposition) {
@@ -694,16 +701,15 @@ impl Telemetry {
         agg
     }
 
-    /// Sum the `i`-th vhost bucket's `(requests, 2xx, 3xx, 4xx, 5xx)` across shards.
-    fn aggregate_vhost_counters(&self, i: usize) -> [u64; 5] {
-        let mut acc = [0u64; 5];
+    /// Sum the vhost's final response status classes across shards.
+    fn aggregate_vhost_status_classes(&self, i: usize) -> [u64; 4] {
+        let mut acc = [0u64; 4];
         for s in &self.shards {
             let v = &s.0.per_vhost[i];
-            acc[0] += v.duration.count.load(Relaxed);
-            acc[1] += v.status_2xx.load(Relaxed);
-            acc[2] += v.status_3xx.load(Relaxed);
-            acc[3] += v.status_4xx.load(Relaxed);
-            acc[4] += v.status_5xx.load(Relaxed);
+            acc[0] += v.status_2xx.load(Relaxed);
+            acc[1] += v.status_3xx.load(Relaxed);
+            acc[2] += v.status_4xx.load(Relaxed);
+            acc[3] += v.status_5xx.load(Relaxed);
         }
         acc
     }
@@ -735,28 +741,34 @@ impl Telemetry {
         let active: Vec<usize> = (0..MAX_VHOSTS)
             .filter(|&i| !self.vhost_names[i].is_empty())
             .collect();
-        let counters: Vec<(usize, [u64; 5])> = active
+        let per_vhost: Vec<_> = active
             .iter()
-            .map(|&i| (i, self.aggregate_vhost_counters(i)))
+            .map(|&i| {
+                (
+                    i,
+                    self.aggregate_vhost_status_classes(i),
+                    self.aggregate_vhost_histogram(i),
+                )
+            })
             .collect();
         out.push_str(
             "# HELP httpjet_requests_by_vhost Requests per vhost.\n\
              # TYPE httpjet_requests_by_vhost counter\n",
         );
-        for (i, c) in &counters {
+        for (i, _, histogram) in &per_vhost {
             let name = label_escape(&self.vhost_names[*i]);
             out.push_str(&format!(
                 "httpjet_requests_by_vhost{{vhost=\"{name}\"}} {}\n",
-                c[0]
+                histogram.count
             ));
         }
         out.push_str(
             "# HELP httpjet_responses_by_vhost Responses per vhost by status class.\n\
              # TYPE httpjet_responses_by_vhost counter\n",
         );
-        for (i, c) in &counters {
+        for (i, classes, _) in &per_vhost {
             let name = label_escape(&self.vhost_names[*i]);
-            for (class, val) in ["2xx", "3xx", "4xx", "5xx"].iter().zip(&c[1..]) {
+            for (class, val) in ["2xx", "3xx", "4xx", "5xx"].iter().zip(classes) {
                 out.push_str(&format!(
                     "httpjet_responses_by_vhost{{vhost=\"{name}\",class=\"{class}\"}} {val}\n"
                 ));
@@ -792,9 +804,8 @@ impl Telemetry {
             "# HELP httpjet_request_duration_by_vhost_seconds Per-vhost handle() wall time.\n\
              # TYPE httpjet_request_duration_by_vhost_seconds histogram\n",
         );
-        for &i in &active {
-            let name = label_escape(&self.vhost_names[i]);
-            let h = self.aggregate_vhost_histogram(i);
+        for (i, _, h) in &per_vhost {
+            let name = label_escape(&self.vhost_names[*i]);
             let mut cum = 0u64;
             for b in 0..NB {
                 cum += h.buckets[b];
@@ -1435,6 +1446,7 @@ mod tests {
         let v = t.counter_values();
         assert_eq!(counter(&v, "proto_h2"), 2);
         assert_eq!(counter(&v, "proto_h1"), 1);
+        assert_eq!(t.requests_total(), 3);
         assert_eq!(counter(&v, "status_2xx"), 1);
         assert_eq!(counter(&v, "status_3xx"), 1);
         assert_eq!(counter(&v, "status_5xx"), 1);

@@ -101,6 +101,16 @@ impl ChunkVecBuffer {
         first
     }
 
+    /// Take the sole queued chunk when there is exactly one unconsumed chunk.
+    /// Avoids a copy into an intermediate write buffer on single-record flushes.
+    pub(crate) fn pop_single(&mut self) -> Option<Vec<u8>> {
+        if self.chunks.len() == 1 && self.prefix_used == 0 {
+            self.chunks.pop_front()
+        } else {
+            None
+        }
+    }
+
     #[cfg(read_buf)]
     /// Read data out of this object, writing it into `cursor`.
     pub(crate) fn read_buf(
@@ -156,6 +166,20 @@ impl ChunkVecBuffer {
         Ok(offs)
     }
 
+    #[cfg(feature = "std")]
+    #[inline]
+    pub(crate) fn read_into_spare(&mut self, dst: &mut [mem::MaybeUninit<u8>]) -> usize {
+        let mut written = 0;
+        while written < dst.len() && !self.is_empty() {
+            let chunk = &self.chunks[0][self.prefix_used..];
+            let len = cmp::min(chunk.len(), dst.len() - written);
+            dst[written..written + len].write_copy_of_slice(&chunk[..len]);
+            self.consume(len);
+            written += len;
+        }
+        written
+    }
+
     pub(crate) fn consume_first_chunk(&mut self, used: usize) {
         // this backs (infallible) `BufRead::consume`, where `used` is
         // user-supplied.
@@ -192,20 +216,24 @@ impl ChunkVecBuffer {
 
     /// Read data out of this object, passing it `wr`
     pub(crate) fn write_to(&mut self, wr: &mut dyn io::Write) -> io::Result<usize> {
-        if self.is_empty() {
+        let Some(first) = self.chunk() else {
             return Ok(0);
-        }
-
-        let mut prefix = self.prefix_used;
-        let mut bufs = [io::IoSlice::new(&[]); 64];
-        for (iov, chunk) in bufs.iter_mut().zip(self.chunks.iter()) {
-            *iov = io::IoSlice::new(&chunk[prefix..]);
-            prefix = 0;
-        }
-        let len = cmp::min(bufs.len(), self.chunks.len());
-        let bufs = &bufs[..len];
-        let used = wr.write_vectored(bufs)?;
-        let available_bytes = bufs.iter().map(|ch| ch.len()).sum();
+        };
+        let (used, available_bytes) = if self.chunks.len() == 1 {
+            // Small responses normally queue one record. Preserve the writer's
+            // vectored contract without preparing an array of 64 descriptors.
+            (wr.write_vectored(&[io::IoSlice::new(first)])?, first.len())
+        } else {
+            let mut prefix = self.prefix_used;
+            let mut bufs = [io::IoSlice::new(&[]); 64];
+            for (iov, chunk) in bufs.iter_mut().zip(self.chunks.iter()) {
+                *iov = io::IoSlice::new(&chunk[prefix..]);
+                prefix = 0;
+            }
+            let len = cmp::min(bufs.len(), self.chunks.len());
+            let bufs = &bufs[..len];
+            (wr.write_vectored(bufs)?, bufs.iter().map(|ch| ch.len()).sum())
+        };
 
         if used > available_bytes {
             // This is really unrecoverable, since the amount of data written
@@ -234,8 +262,38 @@ impl ChunkVecBuffer {
 mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
+    use std::io::{self, IoSlice, Write};
 
     use super::ChunkVecBuffer;
+
+    #[test]
+    fn write_to_preserves_the_suffix_of_a_single_record() {
+        struct ShortWriter;
+
+        impl Write for ShortWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                panic!("expected write_vectored");
+            }
+
+            fn write_vectored(&mut self, slices: &[IoSlice<'_>]) -> io::Result<usize> {
+                assert_eq!(slices.len(), 1);
+                assert_eq!(&*slices[0], b"abcdef");
+                Ok(2)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut buffer = ChunkVecBuffer::new(None);
+        buffer.append(b"abcdef".to_vec());
+        assert_eq!(buffer.write_to(&mut ShortWriter).unwrap(), 2);
+        let mut remaining = Vec::new();
+        assert_eq!(buffer.write_to(&mut remaining).unwrap(), 4);
+        assert_eq!(remaining, b"cdef");
+        assert!(buffer.is_empty());
+    }
 
     #[test]
     fn short_append_copy_with_limit() {
@@ -262,6 +320,20 @@ mod tests {
         }
 
         assert_eq!(cvb.read(&mut [0]).unwrap(), 0);
+    }
+
+    #[test]
+    fn reads_into_spare_across_partially_consumed_chunks() {
+        let mut buf = ChunkVecBuffer::new(None);
+        buf.append(b"ab".to_vec());
+        buf.append(b"cdef".to_vec());
+        let mut out = [core::mem::MaybeUninit::uninit(); 4];
+        assert_eq!(buf.read_into_spare(&mut out[..1]), 1);
+        assert_eq!(buf.read_into_spare(&mut out), 4);
+        let mut remainder = [0];
+        assert_eq!(buf.read(&mut remainder).unwrap(), 1);
+        assert_eq!(remainder, *b"f");
+        assert_eq!(buf.read_into_spare(&mut out), 0);
     }
 
     #[test]

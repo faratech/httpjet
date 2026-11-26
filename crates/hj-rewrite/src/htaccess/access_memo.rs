@@ -21,7 +21,7 @@ const MAX_KEY_BYTES: usize = 1024;
 
 #[derive(Default)]
 pub struct AccessMatchMemo {
-    shards: [RwLock<FxHashMap<Box<str>, Arc<[u16]>>>; SHARDS],
+    shards: [RwLock<FxHashMap<Box<[u8]>, Arc<[u16]>>>; SHARDS],
 }
 
 impl std::fmt::Debug for AccessMatchMemo {
@@ -38,7 +38,7 @@ impl std::fmt::Debug for AccessMatchMemo {
 }
 
 thread_local! {
-    static KEY: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static KEY: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl AccessMatchMemo {
@@ -63,21 +63,20 @@ impl AccessMatchMemo {
         KEY.with(|k| {
             let mut key = k.borrow_mut();
             key.clear();
-            // Length prefixes make the concatenation injective.
-            use std::fmt::Write;
-            let _ = write!(
-                key,
-                "{}:{method}{}:{rel_path}{request_path}",
-                method.len(),
-                rel_path.len()
-            );
+            // Each field fits the 1024-byte limit checked above. Fixed-size
+            // length prefixes distinguish arbitrary paths without formatting.
+            key.extend_from_slice(&(method.len() as u16).to_le_bytes());
+            key.extend_from_slice(&(rel_path.len() as u16).to_le_bytes());
+            key.extend_from_slice(method.as_bytes());
+            key.extend_from_slice(rel_path.as_bytes());
+            key.extend_from_slice(request_path.as_bytes());
             let mut h = FxBuildHasher.build_hasher();
-            h.write(key.as_bytes());
+            h.write(key.as_slice());
             let Some(shard) = self.shards.get((h.finish() as usize) % SHARDS) else {
                 return false;
             };
             if let Ok(guard) = shard.read()
-                && let Some(hit) = guard.get(key.as_str())
+                && let Some(hit) = guard.get(key.as_slice())
             {
                 for &i in hit.iter() {
                     visit(usize::from(i));
@@ -95,7 +94,7 @@ impl AccessMatchMemo {
                 if map.len() >= SHARD_CAP {
                     map.clear();
                 }
-                map.insert(key.as_str().into(), indices);
+                map.insert(key.as_slice().into(), indices);
             }
             true
         })
@@ -121,18 +120,17 @@ impl AccessMatchMemo {
         KEY.with(|k| {
             let mut key = k.borrow_mut();
             key.clear();
-            // Length prefixes make the concatenation injective.
-            use std::fmt::Write;
-            let _ = write!(
-                key,
-                "{}:{method}{}:{rel_path}{request_path}",
-                method.len(),
-                rel_path.len()
-            );
+            // Each field fits the 1024-byte limit checked above. Fixed-size
+            // length prefixes distinguish arbitrary paths without formatting.
+            key.extend_from_slice(&(method.len() as u16).to_le_bytes());
+            key.extend_from_slice(&(rel_path.len() as u16).to_le_bytes());
+            key.extend_from_slice(method.as_bytes());
+            key.extend_from_slice(rel_path.as_bytes());
+            key.extend_from_slice(request_path.as_bytes());
             let mut h = FxBuildHasher.build_hasher();
-            h.write(key.as_bytes());
+            h.write(key.as_slice());
             let shard = self.shards.get((h.finish() as usize) % SHARDS)?;
-            if let Some(hit) = shard.read().ok()?.get(key.as_str()) {
+            if let Some(hit) = shard.read().ok()?.get(key.as_slice()) {
                 return Some(hit.clone());
             }
             let indices: Arc<[u16]> = scan()
@@ -143,7 +141,7 @@ impl AccessMatchMemo {
             if map.len() >= SHARD_CAP {
                 map.clear();
             }
-            map.insert(key.as_str().into(), indices.clone());
+            map.insert(key.as_slice().into(), indices.clone());
             Some(indices)
         })
     }
@@ -160,6 +158,40 @@ impl AccessMatchMemo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_boundaries_preserve_arbitrary_request_fields() {
+        let memo = AccessMatchMemo::default();
+        let inputs = [
+            ("/ab", "/c", "GET"),
+            ("/a", "/bc", "GET"),
+            ("/a:1", "/b", "1"),
+            ("/a", "/1:b", "1"),
+            ("/é", "/x\0y", "GET"),
+            ("/x\0y", "/é", "GET"),
+        ];
+        for round in 0..2 {
+            for (i, (rel, path, method)) in inputs.iter().enumerate() {
+                let got = memo
+                    .matched(rel, path, method, inputs.len(), || {
+                        assert_eq!(round, 0);
+                        vec![i]
+                    })
+                    .unwrap();
+                assert_eq!(&*got, &[i as u16]);
+            }
+        }
+        assert_eq!(memo.len(), inputs.len());
+        let exact_limit = "x".repeat(MAX_KEY_BYTES - 3);
+        assert!(
+            memo.matched(&exact_limit, "", "GET", 1, || vec![0])
+                .is_some()
+        );
+        assert!(
+            memo.matched(&exact_limit, "x", "GET", 1, || panic!("too long"))
+                .is_none()
+        );
+    }
 
     #[test]
     fn memoizes_per_key_and_scans_once() {

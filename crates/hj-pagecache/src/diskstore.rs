@@ -1833,15 +1833,16 @@ pub fn key_hash(key: &PageCacheKey) -> u64 {
 
 /// Borrowed-key equivalent of [`key_hash`], guaranteed to produce identical output.
 pub fn key_hash_ref(key: &crate::key::PageCacheKeyRef<'_>) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01B3;
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut eat = |bytes: &[u8]| {
         for &b in bytes {
             h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01B3);
+            h = h.wrapping_mul(PRIME);
         }
         // Field separator so ("ab","c") never hashes like ("a","bc").
         h ^= 0xFF;
-        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+        h = h.wrapping_mul(PRIME);
     };
     eat(&key.vhost_id.to_le_bytes());
     eat(&[key.secure as u8]);
@@ -1849,7 +1850,14 @@ pub fn key_hash_ref(key: &crate::key::PageCacheKeyRef<'_>) -> u64 {
     eat(key.path.as_bytes());
     eat(key.normalized_query.as_bytes());
     eat(key.vary_value.as_bytes());
-    eat(&key.private_owner.to_le_bytes());
+    if key.private_owner == 0 {
+        // A public key ends with eight zero owner bytes. Each multiplies the
+        // hash by PRIME, followed by the same field separator as a private key.
+        h = h.wrapping_mul(PRIME.wrapping_pow(8));
+        h = (h ^ 0xFF).wrapping_mul(PRIME);
+    } else {
+        eat(&key.private_owner.to_le_bytes());
+    }
     // NIL-sentinel guard: the store uses `CacheKeyId(u64::MAX)` as its intrusive-LRU list
     // terminator, so a real key must never hash to that bit pattern. Collapse the one
     // colliding value into bucket 0 (a one-in-2⁶⁴ reassignment; the identity guard makes any

@@ -53,6 +53,7 @@ use crate::metablob::{DecodedMeta, MetaBlob, MetaError, cloned_file_path};
 /// Mask for the low-bits shard selector (`SHARDS` is a power of two).
 const SHARD_MASK: u64 = SHARDS as u64 - 1;
 const DICT_ATTEMPT_VARIANT_TOKEN: &str = "__hj_dict_attempted";
+const COMPACT_ZSTD_ATTEMPT: &str = "__hj_compact_zstd_attempted";
 /// Exact durable tag tombstones stay precise through ordinary restarts. Only an exceptional
 /// cardinality overflow falls back to the conservative all-tag wall floor.
 const MAX_PEER_TAG_PURGE_TOMBSTONES: usize = 262_144;
@@ -485,6 +486,13 @@ impl CachedResponse {
     /// [`PageBody::Derived`]. Such an entry always has `dict_gen == 0`.
     pub fn is_derived(&self) -> bool {
         matches!(self.body, PageBody::Derived { .. })
+    }
+
+    /// Whether the ordinary Zstd variant was considered for compact encoding.
+    pub fn compact_zstd_attempted(&self) -> bool {
+        self.variants
+            .iter()
+            .any(|(token, _)| token == COMPACT_ZSTD_ATTEMPT)
     }
 
     /// Whether dictionary recompression has already been attempted for this resident version.
@@ -1240,6 +1248,8 @@ pub struct StoreConfig {
     /// forwarded as the backend produces them and stored once the body completes. Elsewhere a
     /// miss is buffered whole before its first byte goes out. Empty = off.
     pub stream_fill_vhosts: Vec<String>,
+    /// Progressive fills that wait for repeat demand before capturing the body.
+    pub stream_fill_second_sighting_vhosts: Vec<String>,
     /// Keep a filter of which (vhost, path) pairs may have a resident page entry
     /// ([`PageStore::may_hold_path`]). Off: no filter is allocated and every path may.
     pub path_presence: bool,
@@ -1303,6 +1313,7 @@ impl Default for StoreConfig {
             private_cookies: Vec::new(),
             standard_cc_vhosts: Vec::new(),
             stream_fill_vhosts: Vec::new(),
+            stream_fill_second_sighting_vhosts: Vec::new(),
             path_presence: false,
             egress_at_rest_vhosts: Vec::new(),
             default_stale_secs: 0,
@@ -1778,6 +1789,48 @@ enum BodyReadOp {
 pub struct BodyReadFailures(std::cell::RefCell<Vec<(BodyReadOp, Arc<Path>, ReadError)>>);
 
 /// Unified page-response and static-file body store.
+/// 16-way cache-line-padded sharded counter for `PageStore::hits` — eliminates
+/// cross-core MESI RFO contention across worker threads on hot cache hits.
+struct ShardedHits([CachePaddedAtomic; 16]);
+
+impl ShardedHits {
+    fn new() -> Self {
+        Self(std::array::from_fn(|_| CachePaddedAtomic::new(0)))
+    }
+
+    #[inline]
+    fn shard_slot() -> usize {
+        static NEXT_SHARD: AtomicU64 = AtomicU64::new(0);
+        thread_local! {
+            static SHARD: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+        }
+        SHARD.with(|c| {
+            let s = c.get();
+            if s != usize::MAX {
+                return s;
+            }
+            let assigned = (NEXT_SHARD.fetch_add(1, Ordering::Relaxed) as usize) & 15;
+            c.set(assigned);
+            assigned
+        })
+    }
+
+    #[inline]
+    fn fetch_add(&self, v: u64, ord: Ordering) -> u64 {
+        let slot = Self::shard_slot();
+        if let Some(c) = self.0.get(slot) {
+            c.fetch_add(v, ord)
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    fn load(&self, ord: Ordering) -> u64 {
+        self.0.iter().map(|c| c.load(ord)).sum()
+    }
+}
+
 pub struct PageStore {
     /// The shared sharded byte-weighted LRU index (`hj_cache::sharded`) for page and static entries.
     inner: ShardedCache<CacheKeyId, CacheEntry, StoreEvict>,
@@ -1866,7 +1919,7 @@ pub struct PageStore {
     // The four per-request counters are cache-line padded: packed together they
     // shared one 64-byte line, so every worker's increment invalidated it across
     // cores on EVERY request (true ping-pong under load).
-    hits: CachePaddedAtomic,
+    hits: ShardedHits,
     misses: CachePaddedAtomic,
     stores: CachePaddedAtomic,
     purges: CachePaddedAtomic,
@@ -2126,7 +2179,7 @@ impl PageStore {
             scan_loaded: AtomicU64::new(0),
             scan_dir_errors: AtomicU64::new(0),
             body_id_seq: AtomicU64::new(1),
-            hits: CachePaddedAtomic::new(0),
+            hits: ShardedHits::new(),
             misses: CachePaddedAtomic::new(0),
             stores: CachePaddedAtomic::new(0),
             purges: CachePaddedAtomic::new(0),
@@ -3289,6 +3342,59 @@ impl PageStore {
             }
             true
         });
+    }
+
+    /// Claim the compact encode for this exact cached version.
+    pub fn mark_compact_zstd_attempt(
+        &self,
+        key: &PageCacheKey,
+        identity: &str,
+        stored_at: Instant,
+    ) -> bool {
+        self.mutate_if_matches(key, identity, stored_at, |node| {
+            if !node.variants_filled
+                || !node.variants.iter().any(|(token, _)| token == "zstd")
+                || node
+                    .variants
+                    .iter()
+                    .any(|(token, _)| token == COMPACT_ZSTD_ATTEMPT)
+            {
+                return false;
+            }
+            node.variants
+                .push((COMPACT_ZSTD_ATTEMPT.to_owned(), Bytes::new()));
+            node.invalidate_snapshot();
+            true
+        })
+    }
+
+    /// Replace a verified variant only when it is smaller and the cached version is live.
+    pub fn install_compact_zstd(
+        &self,
+        key: &PageCacheKey,
+        identity: &str,
+        stored_at: Instant,
+        body: Bytes,
+    ) -> bool {
+        self.mutate_if_matches(key, identity, stored_at, |node| {
+            if !node
+                .variants
+                .iter()
+                .any(|(token, _)| token == COMPACT_ZSTD_ATTEMPT)
+            {
+                return false;
+            }
+            let Some((_, current)) = node.variants.iter_mut().find(|(token, _)| token == "zstd")
+            else {
+                return false;
+            };
+            if body.is_empty() || body.len() >= current.len() {
+                return false;
+            }
+            *current = body;
+            node.invalidate_snapshot();
+            true
+        })
     }
 
     /// Claim the one dictionary-recompression attempt for this exact resident version.
@@ -6578,6 +6684,39 @@ mod tests {
             matches!(s.get_entry(&k, "id", later), EntryState::Miss),
             "fill preserved stored_at: entry expires on its original deadline, not reset"
         );
+    }
+
+    #[test]
+    fn compact_encode_uses_one_claim_and_preserves_expiry() {
+        let store = PageStore::new(cfg());
+        let key = PageCacheKey::public(1, true, "h", "/compact", "");
+        let ttl = Duration::from_secs(60);
+        let entry = entry(b"body longer than these encodings", &[], ttl);
+        let (id, stored_at) = (entry.identity.clone(), entry.stored_at);
+        store.store(key.clone(), entry);
+        assert!(!store.mark_compact_zstd_attempt(&key, &id, stored_at));
+        store.fill_variants(
+            &key,
+            &id,
+            stored_at,
+            vec![("zstd".to_owned(), Bytes::from_static(b"original"))],
+            None,
+        );
+        assert!(store.mark_compact_zstd_attempt(&key, &id, stored_at));
+        assert!(!store.mark_compact_zstd_attempt(&key, &id, stored_at));
+        assert!(!store.install_compact_zstd(
+            &key,
+            &id,
+            stored_at,
+            Bytes::from_static(b"too long!")
+        ));
+        assert!(store.install_compact_zstd(&key, &id, stored_at, Bytes::from_static(b"new")));
+        let cached = store.lookup(&key, &id, Instant::now()).unwrap();
+        assert!(cached.compact_zstd_attempted());
+        assert_eq!(cached.variants[0].1, Bytes::from_static(b"new"));
+        assert_eq!((cached.stored_at, cached.ttl), (stored_at, ttl));
+        store.invalidate_key(&key);
+        assert!(!store.install_compact_zstd(&key, &id, stored_at, Bytes::from_static(b"x")));
     }
 
     /// Regression: the marker must reach hits served from an ALREADY-built snapshot. Without

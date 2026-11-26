@@ -350,7 +350,9 @@ pub struct Encoder {
     /// is below the currently active `max_size` (RFC 7541 §4.2 intermediate-minimum rule).
     pending_min_size: Option<usize>,
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    shared_response: Option<SharedHeaderBlock>,
+    shared_responses: [Option<SharedHeaderBlock>; 4],
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    shared_response_next: usize,
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -382,7 +384,9 @@ impl Default for Encoder {
             pending_size_update: None,
             pending_min_size: None,
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-            shared_response: None,
+            shared_responses: [const { None }; 4],
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            shared_response_next: 0,
         }
     }
 }
@@ -409,15 +413,26 @@ impl Encoder {
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub(crate) fn replay_shared_response(&self, headers: &Arc<http::HeaderMap>) -> Option<&[u8]> {
-        let cached = self.shared_response.as_ref()?;
-        if self.table_position() != Some(cached.position)
-            || !std::ptr::eq(cached.headers.as_ptr(), Arc::as_ptr(headers))
+        let pos = self.table_position()?;
+        let ptr = Arc::as_ptr(headers);
+        // Fast-path slot 0 before scanning the remaining slots.
+        if let Some(cached) = self.shared_responses[0].as_ref()
+            && cached.position == pos
+            && std::ptr::eq(cached.headers.as_ptr(), ptr)
         {
-            return None;
+            return Some(&cached.wire);
         }
-        // Holding a Weak prevents pointer reuse and forces Arc::make_mut to
-        // dissociate the old allocation before changing that header map.
-        Some(&cached.wire)
+        for slot in &self.shared_responses[1..] {
+            if let Some(cached) = slot.as_ref()
+                && cached.position == pos
+                && std::ptr::eq(cached.headers.as_ptr(), ptr)
+            {
+                // Holding a Weak prevents pointer reuse and forces Arc::make_mut to
+                // dissociate the old allocation before changing that header map.
+                return Some(&cached.wire);
+            }
+        }
+        None
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -428,14 +443,28 @@ impl Encoder {
         wire: &[u8],
     ) {
         let Some(position) = before else { return };
-        if self.table_position() != Some(position) || wire.len() > 1024 {
+        if self.table_position() != Some(position) || wire.len() > 2048 {
             return;
         }
-        self.shared_response = Some(SharedHeaderBlock {
+        let ptr = Arc::as_ptr(headers);
+        let entry = SharedHeaderBlock {
             headers: Arc::downgrade(headers),
             position,
             wire: wire.to_vec(),
-        });
+        };
+        for slot in &mut self.shared_responses {
+            if let Some(existing) = slot.as_ref()
+                && std::ptr::eq(existing.headers.as_ptr(), ptr)
+            {
+                *slot = Some(entry);
+                return;
+            }
+        }
+        let idx = self.shared_response_next % self.shared_responses.len();
+        self.shared_response_next = self.shared_response_next.wrapping_add(1);
+        if let Some(slot) = self.shared_responses.get_mut(idx) {
+            *slot = Some(entry);
+        }
     }
 
     /// Apply the peer's advertised SETTINGS_HEADER_TABLE_SIZE (RFC 7541 §6.3, RFC 7540
@@ -678,7 +707,7 @@ impl Encoder {
                 encode_string(out, name);
             }
         }
-        if name == "date" {
+        if name == "date" || name == "expires" {
             encode_date_literal(out, value);
         } else if value_is_secret(name) {
             encode_string_literal(out, value);

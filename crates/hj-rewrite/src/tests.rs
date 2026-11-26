@@ -3527,3 +3527,35 @@ mod page_cache_keying {
         );
     }
 }
+
+#[test]
+fn sparse_prefilter_keeps_chains_skips_and_rewrites_in_source_order() {
+    use std::fmt::Write;
+    let mut rules = String::from("RewriteEngine On\n");
+    for i in 0..80 {
+        writeln!(rules, "RewriteRule ^unrelated{i}$ -").unwrap();
+    }
+    rules.push_str(
+        "RewriteRule ^chain$ - [C]\n\
+         RewriteRule ^probe$ /wrong [L]\n\
+         RewriteRule ^probe$ /correct [L]\n\
+         RewriteRule ^skip$ - [S=1]\n\
+         RewriteRule ^skip$ /wrong [L]\n\
+         RewriteRule ^skip$ /correct [L]\n\
+         RewriteRule ^rewrite$ /edited\n\
+         RewriteRule ^edited$ /correct [L]\n",
+    );
+    let rs = RuleSet::parse(&rules).unwrap();
+    assert!(rs.prefilter.get().is_some(), "fixture requires a built DFA");
+    assert!(matches!(
+        evaluate(&rs, &input("/unmatched")),
+        RewriteOutcome::Unchanged { .. }
+    ));
+    for path in ["/probe", "/skip", "/rewrite"] {
+        let result = evaluate(&rs, &input(path));
+        assert!(
+            matches!(result, RewriteOutcome::Rewritten { ref new_uri, .. } if new_uri == "/correct"),
+            "{path}: {result:?}"
+        );
+    }
+}

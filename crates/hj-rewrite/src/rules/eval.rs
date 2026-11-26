@@ -773,10 +773,26 @@ pub(super) fn run_pass(
     input: &RewriteInput,
     state: &mut EvalState,
     hits: Option<&PatternSet>,
+    candidates: Option<&[usize]>,
 ) -> PassResult {
     let rules = &rs.rules;
     let mut idx = 0usize;
+    let mut candidate_cursor = 0usize;
     while idx < rules.len() {
+        if state.prefilter_valid
+            && let Some(candidates) = candidates
+        {
+            while candidates
+                .get(candidate_cursor)
+                .is_some_and(|next| *next < idx)
+            {
+                candidate_cursor += 1;
+            }
+            let Some(&next) = candidates.get(candidate_cursor) else {
+                break;
+            };
+            idx = next;
+        }
         let rule = &rules[idx];
         match apply_rule(rs, input, state, rule, hits) {
             None => {

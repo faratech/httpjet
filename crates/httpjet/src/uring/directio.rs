@@ -17,6 +17,66 @@ use monoio::buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRent, Split};
 use monoio::net::TcpStream;
 
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MediumTlsWrite {
+    Direct,
+    Ring,
+    Adaptive,
+}
+
+#[cfg(any(target_arch = "aarch64", test))]
+#[derive(Clone, Copy)]
+struct MediumWriteBurst {
+    start: std::time::Instant,
+    last: std::time::Instant,
+    writes: u8,
+    carried: bool,
+}
+
+#[cfg(any(target_arch = "aarch64", test))]
+impl MediumWriteBurst {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            start: now,
+            last: now,
+            writes: 0,
+            carried: false,
+        }
+    }
+
+    fn record(&mut self, now: std::time::Instant) -> bool {
+        use std::time::Duration;
+        const BUSY_WRITES: u8 = 12;
+        // At low offered rates an isolated write takes the direct path.
+        // Reuse a busy window only while writes keep arriving.
+        if now.duration_since(self.last) >= Duration::from_micros(200) {
+            *self = Self::new(now);
+        } else if now.duration_since(self.start) >= Duration::from_millis(1) {
+            self.carried = self.writes >= BUSY_WRITES;
+            self.start = now;
+            self.writes = 0;
+        }
+        self.last = now;
+        self.writes = self.writes.saturating_add(1);
+        self.carried || self.writes >= BUSY_WRITES
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn medium_write_burst() -> bool {
+    thread_local! {
+        static BURST: std::cell::Cell<Option<MediumWriteBurst>> = const { std::cell::Cell::new(None) };
+    }
+    BURST.with(|slot| {
+        let now = std::time::Instant::now();
+        let mut burst = slot.get().unwrap_or_else(|| MediumWriteBurst::new(now));
+        let batching = burst.record(now);
+        slot.set(Some(burst));
+        batching
+    })
+}
+
 pub(crate) struct DirectWriteSocket {
     inner: TcpStream,
     fd: RawFd,
@@ -24,15 +84,27 @@ pub(crate) struct DirectWriteSocket {
     /// so many keep-alive sockets' responses batch into shared enters
     /// (+7% h1/empty/c50, 5/5 pairs). H2 stays direct-always — its tiny
     /// control-frame writes are latency-sensitive and measured -3..-5% when
-    /// ringed. Large writes always take the direct syscall (the loopback bulk
+    /// ringed. Bulk writes take the direct syscall (the loopback bulk
     /// case this module exists for).
     ring_small: bool,
+    #[cfg(target_arch = "aarch64")]
+    medium_tls: MediumTlsWrite,
 }
 
 impl DirectWriteSocket {
     pub(crate) fn new_for(inner: TcpStream, ring_small: bool) -> Self {
         let mut s = Self::new(inner);
         s.ring_small = ring_small;
+        #[cfg(target_arch = "aarch64")]
+        if ring_small {
+            static MODE: std::sync::OnceLock<MediumTlsWrite> = std::sync::OnceLock::new();
+            s.medium_tls =
+                *MODE.get_or_init(|| match std::env::var("HJ_H1_RING_MEDIUM_TLS").as_deref() {
+                    Ok("1") => MediumTlsWrite::Ring,
+                    Ok("adaptive") => MediumTlsWrite::Adaptive,
+                    _ => MediumTlsWrite::Direct,
+                });
+        }
         s
     }
 
@@ -51,6 +123,8 @@ impl DirectWriteSocket {
             inner,
             fd,
             ring_small: false,
+            #[cfg(target_arch = "aarch64")]
+            medium_tls: MediumTlsWrite::Direct,
         }
     }
 }
@@ -103,6 +177,20 @@ impl AsyncWriteRent for DirectWriteSocket {
             if count == 0 {
                 return (Ok(0), buf_vec);
             }
+            #[cfg(target_arch = "aarch64")]
+            if self.medium_tls != MediumTlsWrite::Direct && (1..=3).contains(&count) {
+                // SAFETY: IoVecBuf owns these initialized descriptors for the rental.
+                let segments =
+                    unsafe { std::slice::from_raw_parts(buf_vec.read_iovec_ptr(), count) };
+                let bytes = segments.iter().fold(0usize, |total, segment| {
+                    total.saturating_add(segment.iov_len)
+                });
+                if (16 * 1024..=32 * 1024 + 512).contains(&bytes)
+                    && (self.medium_tls == MediumTlsWrite::Ring || medium_write_burst())
+                {
+                    return self.inner.writev(buf_vec).await;
+                }
+            }
             // SAFETY: an all-zero msghdr is an empty C message header. Set
             // only the iovecs so both libc layouts retain zeroed padding.
             let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
@@ -142,4 +230,21 @@ impl AsRawFd for DirectWriteSocket {
     fn as_raw_fd(&self) -> RawFd {
         self.fd
     }
+}
+
+#[cfg(test)]
+#[test]
+fn medium_write_burst_requires_current_demand() {
+    use std::time::{Duration, Instant};
+    let start = Instant::now();
+    let mut burst = MediumWriteBurst::new(start);
+    let at = |us| start + Duration::from_micros(us);
+    for n in 0..11 {
+        assert!(!burst.record(at(n * 50)));
+    }
+    for n in 11..=20 {
+        assert!(burst.record(at(n * 50)));
+    }
+    assert!(!burst.record(at(1250)));
+    assert!(!burst.record(at(2250)));
 }

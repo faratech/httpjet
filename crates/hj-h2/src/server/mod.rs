@@ -29,7 +29,6 @@ mod state;
 
 pub use send::{is_early_hint_link, set_io_handle};
 
-use std::collections::VecDeque;
 use std::future::Future;
 // FxHashMap/FxHashSet (rustc-hash): the per-connection stream maps are keyed by u32 stream IDs,
 // where SipHash's DoS resistance is pure overhead. Internal/trusted keys only.
@@ -45,8 +44,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::frame::{self, FrameHeader, error_code, settings};
 use recv::{FrameOutcome, process_frame_with_ready};
 use send::{
-    Pulls, apply_pull, begin_response, cancel_outstream, pump_streams, reset_drain_idle_streams,
-    reset_stalled_streams,
+    Pulls, SendSchedule, apply_pull, begin_ready_response, begin_response, cancel_outstream,
+    pump_streams, reset_drain_idle_streams, reset_stalled_streams,
 };
 use state::{OutStream, PeerSettings, Recv, StreamState};
 
@@ -361,6 +360,41 @@ pub struct RequestHead<'a> {
     pub headers: &'a http::HeaderMap,
 }
 
+/// A previously validated, complete single-frame END_STREAM GET head.
+/// Headers already reflect :authority -> Host exactly as build_request does.
+/// Borrowing ends before any async handler or send operation is started.
+pub struct BorrowedRequestHead<'a> {
+    pub template_id: u64,
+    pub method: &'a http::Method,
+    pub uri: &'a http::Uri,
+    pub headers: &'a http::HeaderMap,
+}
+
+/// An authorized status-200 full response with the same pre-sanitized shared
+/// header contract as hj_core::SharedHeaders. This is a response, not a cached
+/// permission result. The normal H2 sender still enforces frames and windows.
+pub struct SharedFullResponse {
+    pub headers: std::sync::Arc<http::HeaderMap>,
+    pub body: bytes::Bytes,
+}
+
+pub type BorrowedMemoProbeFn =
+    dyn Fn(&BorrowedRequestHead<'_>) -> Option<SharedFullResponse> + Send + Sync;
+
+#[derive(Clone)]
+pub struct BorrowedMemoProbe(pub std::sync::Arc<BorrowedMemoProbeFn>);
+
+impl std::fmt::Debug for BorrowedMemoProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BorrowedMemoProbe(..)")
+    }
+}
+
+pub(super) enum ReadyResponse {
+    Ordinary(Response),
+    SharedFull(SharedFullResponse),
+}
+
 /// Decides from its head whether a body-carrying request is refused outright. A
 /// `Some((status, headers))` is sent as a complete bodiless response before any DATA is
 /// accepted or `100 Continue` is sent; the stream is then reset with NO_ERROR and its
@@ -431,6 +465,9 @@ pub struct Config {
     /// head-of-line-blocks the connection by design. The H1 path refines per context;
     /// h2 multiplexing makes a per-response rate ill-defined.
     pub bandwidth_limit: u64,
+    /// Reserve 1 KiB of the native DATA batch for HTTP/2 framing when the
+    /// transport normally accepts 64 KiB of plaintext in one write.
+    pub reserve_tls_framing: bool,
     /// Send-progress deadline, per response: a response with bytes waiting on the peer's
     /// flow-control credit that delivers less than `SEND_STALL_MIN_PROGRESS` within this
     /// window is reset (RST_STREAM CANCEL), releasing its pinned body and backend. Each
@@ -453,6 +490,9 @@ pub struct Config {
     /// Consulted only for a request whose header block completes without END_STREAM;
     /// `None` (default) never inspects a request before its body.
     pub early_reject: Option<EarlyReject>,
+    /// Optional synchronous memo probe, offered only an exact stable, complete
+    /// bodiless GET head. A miss takes the unchanged Request/handler path.
+    pub borrowed_memo_probe: Option<BorrowedMemoProbe>,
 }
 
 impl Default for Config {
@@ -472,10 +512,12 @@ impl Default for Config {
             request_body_timeout: Some(std::time::Duration::from_secs(60)),
             request_body_ceiling: hj_core::body_deadline::BODY_DEADLINE_CEILING,
             bandwidth_limit: 0,
+            reserve_tls_framing: false,
             send_stall_timeout: Some(std::time::Duration::from_secs(60)),
             goaway_drain_timeout: GOAWAY_DRAIN_TIMEOUT,
             shutdown_idle_stream_timeout: Some(SHUTDOWN_IDLE_STREAM_TIMEOUT),
             early_reject: None,
+            borrowed_memo_probe: None,
         }
     }
 }
@@ -779,7 +821,7 @@ where
     // connection-level send window (RFC 7540 §6.9, default 65535 until the peer grows it).
     let mut outstreams: FxHashMap<u32, OutStream> = FxHashMap::default();
     let mut drain_idle: FxHashMap<u32, std::time::Instant> = FxHashMap::default();
-    let mut send_schedule = VecDeque::new();
+    let mut send_schedule = SendSchedule::default();
     let mut pulls: Pulls = Pulls::new();
     let mut send_conn: i64 = 65535;
     // Per-stream send-window credit that arrived (WINDOW_UPDATE) before the response was
@@ -795,7 +837,7 @@ where
     // Per-stream cancellation handles for handler futures in `inflight`. A reset removes and
     // fires the handle immediately; the two drain sites remove it on normal completion.
     let mut inflight_sids: FxHashMap<u32, AbortHandle> = FxHashMap::default();
-    let mut ready_responses: Vec<(u32, bool, Response)> = Vec::new();
+    let mut ready_responses: Vec<(u32, bool, ReadyResponse)> = Vec::new();
 
     let mut inbuf: Vec<u8> = Vec::with_capacity(H2_INBUF_IDLE);
     let mut cursor = 0usize;
@@ -803,6 +845,7 @@ where
     let mut accepting = true;
     let mut draining = false;
     let mut shutdown_drain = false;
+    let mut shutdown_fut = std::pin::pin!(shutdown_signal(shutdown.as_ref()));
     let cap = config.max_frame_size.min(1 << 24);
     let frame_read_timeout = config.frame_read_timeout;
     let request_body_timeout = config.request_body_timeout;
@@ -882,9 +925,17 @@ where
                 &mut cancelled,
                 &mut inflight_sids,
                 Some(&mut ready_responses),
+                None,
+                |fut| {
+                    if spare_cores() {
+                        TaggedInner::Spawned(AbortOnDrop(tokio::spawn(fut)))
+                    } else {
+                        TaggedInner::Inline(fut)
+                    }
+                },
             );
             for (sid, is_head, resp) in ready_responses.drain(..) {
-                begin_response(
+                begin_ready_response(
                     sid,
                     is_head,
                     resp,
@@ -965,8 +1016,11 @@ where
                                     error_code::FLOW_CONTROL_ERROR,
                                 )
                             });
-                            st.done = true;
+                            cancel_outstream(&mut outstreams, stream_id);
                         } else if was_blocked && st.window > 0 {
+                            if !st.pending.is_empty() {
+                                send_schedule.wake(stream_id, st);
+                            }
                             // (#241) Real forward progress: a blocked response body can
                             // now write again. Grants on idle/closed/never-blocked
                             // streams do NOT clear the flood counter.
@@ -1037,9 +1091,13 @@ where
                 FrameOutcome::InitialWindowDelta(delta) => {
                     // §6.9.2: shift every in-flight stream's send window by the change.
                     let mut overflow = false;
-                    for st in outstreams.values_mut() {
+                    for (&sid, st) in &mut outstreams {
+                        let was_blocked = st.window <= 0;
                         st.window += delta;
                         overflow |= st.window > i32::MAX as i64;
+                        if was_blocked && st.window > 0 && !st.pending.is_empty() {
+                            send_schedule.wake(sid, st);
+                        }
                     }
                     for &credit in pending_window.values() {
                         overflow |= peer.initial_window + credit > i32::MAX as i64;
@@ -1148,7 +1206,14 @@ where
             if !drain_idle.is_empty() {
                 drain_idle.remove(&sid);
             }
-            apply_pull(sid, body, res, &mut outstreams, &mut out);
+            apply_pull(
+                sid,
+                body,
+                res,
+                &mut outstreams,
+                &mut out,
+                &mut send_schedule,
+            );
         }
         // Write as much body as the send windows allow (and queue further chunk pulls).
         pump_streams(
@@ -1223,12 +1288,12 @@ where
                 if !drain_idle.is_empty() {
                 drain_idle.remove(&sid);
             }
-            apply_pull(sid, body, res, &mut outstreams, &mut out);
+            apply_pull(sid, body, res, &mut outstreams, &mut out, &mut send_schedule);
             }
             // (OPS2) Graceful drain: on the shutdown signal, send GOAWAY and stop accepting
             // new streams. Keep reading frames so existing response bodies can receive flow
             // control credit and finish instead of being truncated at the initial window.
-            _ = shutdown_signal(shutdown.as_ref()), if !shutdown_drain => {
+            _ = shutdown_fut.as_mut(), if !shutdown_drain => {
                 shutdown_drain = true;
                 if reading && accepting {
                     let last = recv.goaway_last_stream_id();
@@ -1419,6 +1484,11 @@ pub(super) struct OutQueue {
     inline: Vec<u8>,
     segs: Vec<Seg>,
     completions: Vec<hj_core::ResponseCompletion>,
+    data_remaining: Option<usize>,
+    #[cfg(any(target_arch = "aarch64", test))]
+    reserve_headroom_on_bulk: bool,
+    #[cfg(feature = "monoio")]
+    timing: Option<Box<send_timing::SendTiming>>,
     #[cfg(feature = "monoio")]
     write_backings: Vec<Bytes>,
     #[cfg(feature = "monoio")]
@@ -1427,12 +1497,17 @@ pub(super) struct OutQueue {
     write_storage: crate::owned_iovec::IoVecStorage,
 }
 
+const SMALL_BODY_INLINE_MAX: usize = 2048;
+const TLS_FRAMING_HEADROOM: usize = 1024;
+
 // Flush metadata kept between writes. One large response must not grow the scratch
 // of every idle connection for its lifetime.
 #[cfg(feature = "monoio")]
 const RETAINED_FLUSH_METADATA: usize = 64;
 #[cfg(test)]
 mod completion_tests;
+#[cfg(feature = "monoio")]
+mod send_timing;
 
 impl OutQueue {
     #[inline]
@@ -1480,14 +1555,44 @@ impl OutQueue {
             self.segs.push(Seg::Inline(start, len));
         }
     }
+    fn remaining_data(&self) -> usize {
+        self.data_remaining.unwrap_or(usize::MAX)
+    }
+
+    #[inline]
+    fn remaining_data_for(&self, bytes: usize) -> usize {
+        #[cfg(any(target_arch = "aarch64", test))]
+        if self.reserve_headroom_on_bulk && bytes > SMALL_BODY_INLINE_MAX {
+            return self.remaining_data().saturating_sub(TLS_FRAMING_HEADROOM);
+        }
+        let _ = bytes;
+        self.remaining_data()
+    }
+
+    /// ARM userspace TLS preserves the full budget for batches of short
+    /// responses. Reserve framing space once, when bulk DATA joins a batch.
+    #[inline]
+    fn reserve_bulk_headroom(&mut self, bytes: usize) {
+        #[cfg(any(target_arch = "aarch64", test))]
+        if self.reserve_headroom_on_bulk && bytes > SMALL_BODY_INLINE_MAX {
+            self.reserve_headroom_on_bulk = false;
+            if let Some(remaining) = self.data_remaining.as_mut() {
+                *remaining = remaining.saturating_sub(TLS_FRAMING_HEADROOM);
+            }
+        }
+        let _ = bytes;
+    }
+
     /// Append a DATA body chunk. Small bodies (<= 2 KiB) coalesce into `inline` so a
     /// multiplexed batch of small responses flushes as one contiguous segment instead of
     /// overflowing `STACK_IOV` / `RETAINED_FLUSH_METADATA` (64). Larger bodies stay zero-copy.
     #[inline]
     pub(super) fn body(&mut self, b: Bytes) {
-        const SMALL_BODY_INLINE_MAX: usize = 2048;
         if b.is_empty() {
             return;
+        }
+        if let Some(remaining) = self.data_remaining.as_mut() {
+            *remaining -= b.len();
         }
         if b.len() <= SMALL_BODY_INLINE_MAX {
             self.frames(|buf| buf.extend_from_slice(&b));
@@ -1587,7 +1692,19 @@ async fn monoio_flush<IO: monoio::io::AsyncWriteRent>(
     q: &mut OutQueue,
     ktls_fd: Option<i32>,
 ) -> std::io::Result<()> {
+    let measurement = q.timing.as_ref().filter(|_| !q.is_empty()).map(|_| {
+        (
+            q.total_bytes(),
+            q.segs.iter().any(|segment| matches!(segment, Seg::Body(_))),
+        )
+    });
     let result = monoio_flush_inner(stream, q, ktls_fd).await;
+    if let Some((bytes, bulk)) = measurement
+        && let Some(timing) = q.timing.as_mut()
+        && result.is_ok()
+    {
+        timing.flushed(bytes, bulk);
+    }
     q.finish_responses(result.is_ok());
     result
 }
@@ -1683,6 +1800,24 @@ async fn monoio_flush_inner<IO: monoio::io::AsyncWriteRent>(
             q.clear();
             return Ok(());
         }
+    }
+    // Fast path for non-kTLS single-inline batches (100% of Empty, Static, and
+    // Rewrite-heavy H2 flushes): write `q.inline` directly via `write_all` and
+    // reclaim the `Vec<u8>` without converting `Vec -> Bytes -> OwnedIoVec -> Vec`.
+    #[cfg(feature = "monoio")]
+    if q.segs.len() == 1
+        && matches!(q.segs.first(), Some(Seg::Inline(0, len)) if *len == q.inline.len())
+    {
+        let buf = std::mem::take(&mut q.inline);
+        q.segs.clear();
+        let (res, mut buf) = stream.write_all(buf).await;
+        buf.clear();
+        q.inline = buf;
+        if q.segs.capacity() > RETAINED_FLUSH_METADATA {
+            q.segs = Vec::new();
+        }
+        res?;
+        return Ok(());
     }
     // Non-kTLS writev: move the queue's allocations into the submitted IoVecBuf. Monoio
     // retains that value after future cancellation until the kernel completion is reaped;
@@ -1791,7 +1926,7 @@ where
     IO::OwnedRead: monoio::io::AsyncReadRent + 'static,
     IO::OwnedWrite: monoio::io::AsyncWriteRent + 'static,
     S: Fn(Request) -> F,
-    F: Future<Output = Response> + Send + 'static,
+    F: Future<Output = Response> + 'static,
 {
     serve_local_with_prefix(stream, Vec::new(), service, config, None, None).await
 }
@@ -1828,7 +1963,7 @@ where
     IO::OwnedRead: monoio::io::AsyncReadRent + 'static,
     IO::OwnedWrite: monoio::io::AsyncWriteRent + 'static,
     S: Fn(Request) -> F,
-    F: Future<Output = Response> + Send + 'static,
+    F: Future<Output = Response> + 'static,
 {
     let end = ConnEndGuard::new();
     let result = serve_local_conn(stream, prefix, service, config, shutdown, ktls_fd, &end).await;
@@ -1853,7 +1988,7 @@ where
     IO::OwnedRead: monoio::io::AsyncReadRent + 'static,
     IO::OwnedWrite: monoio::io::AsyncWriteRent + 'static,
     S: Fn(Request) -> F,
-    F: Future<Output = Response> + Send + 'static,
+    F: Future<Output = Response> + 'static,
 {
     use futures_util::stream::StreamExt;
     use monoio::io::{AsyncReadRent, AsyncWriteRent};
@@ -1916,7 +2051,29 @@ where
     }
     inbuf.drain(..crate::conn::PREFACE.len());
 
-    let mut out = OutQueue::default();
+    // Bound DATA batches so the connection loop can service newly ready
+    // streams between flushes. Keep the uncapped path for rollback and A/B.
+    const DATA_BATCH_LIMIT: usize = 64 * 1024;
+    static LIMIT_DATA_BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static MEASURE_SEND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let bulk_headroom = cfg!(target_arch = "aarch64") && config.reserve_tls_framing;
+    let batch = if config.reserve_tls_framing && !bulk_headroom {
+        DATA_BATCH_LIMIT - TLS_FRAMING_HEADROOM
+    } else {
+        DATA_BATCH_LIMIT
+    };
+    let data_limit = (*LIMIT_DATA_BATCH
+        .get_or_init(|| !std::env::var_os("HJ_H2_DATA_BATCH_64K").is_some_and(|v| v == "0")))
+    .then_some(batch);
+    let mut out = OutQueue {
+        data_remaining: data_limit,
+        #[cfg(any(target_arch = "aarch64", test))]
+        reserve_headroom_on_bulk: bulk_headroom && data_limit.is_some(),
+        timing: (*MEASURE_SEND
+            .get_or_init(|| std::env::var_os("HJ_H2_SEND_TIMING").is_some_and(|v| v == "1")))
+        .then(Box::default),
+        ..OutQueue::default()
+    };
     let mut block_scratch: Vec<u8> = Vec::new();
     out.frames(|b| {
         frame::write_settings(
@@ -1981,13 +2138,13 @@ where
     let mut inflight: Inflight<F> = Inflight::new();
     let mut outstreams: FxHashMap<u32, OutStream> = FxHashMap::default();
     let mut drain_idle: FxHashMap<u32, std::time::Instant> = FxHashMap::default();
-    let mut send_schedule = VecDeque::new();
+    let mut send_schedule = SendSchedule::default();
     let mut pulls: Pulls = Pulls::new();
     let mut send_conn: i64 = 65535;
     let mut pending_window: FxHashMap<u32, i64> = FxHashMap::default();
     let mut cancelled: FxHashSet<u32> = FxHashSet::default();
     let mut inflight_sids: FxHashMap<u32, AbortHandle> = FxHashMap::default();
-    let mut ready_responses: Vec<(u32, bool, Response)> = Vec::new();
+    let mut ready_responses: Vec<(u32, bool, ReadyResponse)> = Vec::new();
     let mut cursor = 0usize;
     let mut reading = true;
     let mut accepting = true;
@@ -2000,6 +2157,7 @@ where
     // The shutdown signal has been observed (whatever GOAWAY state the connection was in);
     // from here a response idle on its backend is ended (#1034).
     let mut shutdown_drain = false;
+    let mut shutdown_fut = std::pin::pin!(shutdown_signal(shutdown.as_ref()));
     let mut peer_goaway_deadline: Option<std::time::Instant> = None;
     let cap = config.max_frame_size.min(1 << 24);
     // Deadline state mirroring the tokio `serve` loop: a partially-received frame
@@ -2021,7 +2179,8 @@ where
     // read can lose its owned buffer. The box is allocated once; after a completed read,
     // `Pin::set` replaces the future in place with the same concrete future type and hands its
     // returned Vec straight into the next read.
-    let mut read_fut = Box::pin(monoio_read_once(rh, vec![0u8; H2_READ_CHUNK]));
+    // The rental uses the Vec's capacity and initializes only the bytes read.
+    let mut read_fut = Box::pin(monoio_read_once(rh, Vec::with_capacity(H2_READ_CHUNK)));
     // A completed `read_fut` must never be polled again; only EOF leaves it so.
     let mut read_eof = false;
     // Lazy pinned idle timer: armed once per idle window instead of inserting
@@ -2081,9 +2240,11 @@ where
                 &mut cancelled,
                 &mut inflight_sids,
                 Some(&mut ready_responses),
+                config.borrowed_memo_probe.as_ref(),
+                TaggedInner::Inline,
             );
             for (sid, is_head, resp) in ready_responses.drain(..) {
-                begin_response(
+                begin_ready_response(
                     sid,
                     is_head,
                     resp,
@@ -2164,8 +2325,11 @@ where
                                     error_code::FLOW_CONTROL_ERROR,
                                 )
                             });
-                            st.done = true;
+                            cancel_outstream(&mut outstreams, stream_id);
                         } else if was_blocked && st.window > 0 {
+                            if !st.pending.is_empty() {
+                                send_schedule.wake(stream_id, st);
+                            }
                             // (#241) Real forward progress; grants on idle/closed/
                             // never-blocked streams do NOT clear the flood counter.
                             recv.no_progress_frames = 0;
@@ -2210,9 +2374,13 @@ where
                 }
                 FrameOutcome::InitialWindowDelta(delta) => {
                     let mut overflow = false;
-                    for st in outstreams.values_mut() {
+                    for (&sid, st) in &mut outstreams {
+                        let was_blocked = st.window <= 0;
                         st.window += delta;
                         overflow |= st.window > i32::MAX as i64;
+                        if was_blocked && st.window > 0 && !st.pending.is_empty() {
+                            send_schedule.wake(sid, st);
+                        }
                     }
                     for &credit in pending_window.values() {
                         overflow |= peer.initial_window + credit > i32::MAX as i64;
@@ -2316,9 +2484,16 @@ where
             if !drain_idle.is_empty() {
                 drain_idle.remove(&sid);
             }
-            apply_pull(sid, body, res, &mut outstreams, &mut out);
+            apply_pull(
+                sid,
+                body,
+                res,
+                &mut outstreams,
+                &mut out,
+                &mut send_schedule,
+            );
         }
-        pump_streams(
+        let send_again = pump_streams(
             &mut outstreams,
             &mut send_schedule,
             &mut out,
@@ -2338,6 +2513,11 @@ where
 
         // 3) Flush queued output.
         paced_flush(&mut wh, &mut out, ktls_fd, &mut pacer).await?;
+        out.data_remaining = data_limit;
+        #[cfg(any(target_arch = "aarch64", test))]
+        {
+            out.reserve_headroom_on_bulk = bulk_headroom && data_limit.is_some();
+        }
 
         // 4) Termination — shared `should_close` with the tokio `serve` loop. Once
         // `reading` stops we must still drain `inflight` (running handlers) and `pulls`
@@ -2413,9 +2593,9 @@ where
                 if !drain_idle.is_empty() {
                 drain_idle.remove(&sid);
             }
-            apply_pull(sid, body, res, &mut outstreams, &mut out);
+            apply_pull(sid, body, res, &mut outstreams, &mut out, &mut send_schedule);
             }
-            _ = shutdown_signal(shutdown.as_ref()), if !shutdown_drain => {
+            _ = shutdown_fut.as_mut(), if !shutdown_drain => {
                 end.note(ConnEnd::Shutdown);
                 shutdown_drain = true;
                 if reading && accepting {
@@ -2458,6 +2638,9 @@ where
                     }
                 }
             }
+            // With credit still available, pump again even if the peer has no
+            // new frames to send. Give reads, completions and timers first poll.
+            _ = std::future::ready(()), if send_again => {}
         }
         if let Some((res, mut b, reader)) = read_done {
             last_activity = std::time::Instant::now();
@@ -2475,7 +2658,7 @@ where
                     if inbuf.is_empty() && cursor == 0 {
                         b.truncate(n);
                         std::mem::swap(&mut inbuf, &mut b);
-                        b.resize(H2_READ_CHUNK, 0);
+                        b.reserve(H2_READ_CHUNK);
                     } else {
                         inbuf.extend_from_slice(&b[..n]);
                     }
@@ -3731,6 +3914,191 @@ mod tests {
             no_progress_frames: 0,
             early_reject: None,
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn borrowed_h2_hit_avoids_handler_construction_and_keeps_stream_guards() {
+        use crate::frame::{flags, kind};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let _connections: Vec<_> = (0..worker_count()).map(|_| ConnGuard::new()).collect();
+        let calls = std::cell::Cell::new(0usize);
+        let service = |_request: Request| {
+            calls.set(calls.get() + 1);
+            std::future::ready(Response::new(hj_core::Body::Empty))
+        };
+        let hits = Arc::new(AtomicUsize::new(0));
+        let first_head = Arc::new(AtomicUsize::new(0));
+        let (hit_count, head_identity) = (hits.clone(), first_head.clone());
+        let probe = BorrowedMemoProbe(Arc::new(move |head| {
+            assert_eq!(head.method, &http::Method::GET);
+            assert_eq!(head.headers[http::header::HOST], "first.local");
+            let address = head.headers as *const http::HeaderMap as usize;
+            let previous = head_identity.swap(address, Ordering::Relaxed);
+            if previous != 0 {
+                assert_eq!(previous, address, "the same normalized map is borrowed");
+            }
+            hit_count.fetch_add(1, Ordering::Relaxed);
+            Some(SharedFullResponse {
+                headers: Arc::new(http::HeaderMap::new()),
+                body: Bytes::from_static(b"ok"),
+            })
+        }));
+        let mut dec = Decoder::new(4096, 8192);
+        dec.decode_octets(b"\x41\x0bfirst.local", |_, _| {})
+            .unwrap();
+        let block = b"\x82\x87\x04\x06/stuff\xbe";
+        let mut recv = recv_for_header_test(0);
+        let mut streams = FxHashMap::default();
+        let mut enc = Encoder::new();
+        let mut out = OutQueue::default();
+        let mut peer = PeerSettings::default();
+        let mut inflight: Inflight<std::future::Ready<Response>> = Inflight::new();
+        let mut cancelled = FxHashSet::default();
+        let mut inflight_sids = FxHashMap::default();
+        let mut ready = Vec::new();
+        for sid in [1, 3, 5, 7] {
+            let result = process_frame_with_ready(
+                FrameHeader {
+                    length: block.len() as u32,
+                    kind: kind::HEADERS,
+                    flags: flags::END_HEADERS | flags::END_STREAM,
+                    stream_id: sid,
+                },
+                block,
+                &mut streams,
+                &mut dec,
+                &mut enc,
+                &mut out,
+                &mut peer,
+                &mut recv,
+                0,
+                true,
+                &service,
+                &mut inflight,
+                &mut cancelled,
+                &mut inflight_sids,
+                Some(&mut ready),
+                Some(&probe),
+                TaggedInner::Inline,
+            );
+            assert!(matches!(result, FrameOutcome::Continue));
+            assert_eq!(ready.len(), 1);
+            assert_eq!(matches!(ready[0].2, ReadyResponse::SharedFull(_)), sid >= 5);
+            ready.clear();
+            assert!(inflight.is_empty() && streams.is_empty());
+            assert_eq!(recv.pending_header_bytes, 0);
+        }
+        assert_eq!(
+            calls.get(),
+            2,
+            "warm hits must not even construct the service future"
+        );
+        assert_eq!(hits.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            recv.last_client_stream, 7,
+            "borrowed hits advance the processed stream bound"
+        );
+        assert_eq!(
+            recv.goaway_last_stream_id(),
+            7,
+            "GOAWAY must include the borrowed hit"
+        );
+        // No GOAWAY was sent by this inspection; continue independent parser
+        // guard cases with the ordinary not-yet-draining fixture state.
+        recv.goaway_last = None;
+        dec.decode_octets(b"\x41\x0csecond.local", |_, _| {})
+            .unwrap();
+        for (sid, limit) in [(9, 100), (11, 0)] {
+            recv.max_concurrent = limit;
+            let _ = process_frame_with_ready(
+                FrameHeader {
+                    length: block.len() as u32,
+                    kind: kind::HEADERS,
+                    flags: flags::END_HEADERS | flags::END_STREAM,
+                    stream_id: sid,
+                },
+                block,
+                &mut streams,
+                &mut dec,
+                &mut enc,
+                &mut out,
+                &mut peer,
+                &mut recv,
+                0,
+                true,
+                &service,
+                &mut inflight,
+                &mut cancelled,
+                &mut inflight_sids,
+                Some(&mut ready),
+                Some(&probe),
+                TaggedInner::Inline,
+            );
+            if sid == 9 {
+                assert!(matches!(ready[0].2, ReadyResponse::Ordinary(_)));
+            } else {
+                assert!(
+                    ready.is_empty(),
+                    "concurrency refusal must precede the hook"
+                );
+            }
+            ready.clear();
+        }
+        assert_eq!(calls.get(), 3);
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            2,
+            "changed HPACK state must not borrow the old authority"
+        );
+        let result = process_frame_with_ready(
+            FrameHeader {
+                length: 1,
+                kind: kind::PING,
+                flags: 0,
+                stream_id: 0,
+            },
+            &[0],
+            &mut streams,
+            &mut dec,
+            &mut enc,
+            &mut out,
+            &mut peer,
+            &mut recv,
+            0,
+            true,
+            &service,
+            &mut inflight,
+            &mut cancelled,
+            &mut inflight_sids,
+            Some(&mut ready),
+            Some(&probe),
+            TaggedInner::Inline,
+        );
+        assert!(matches!(result, FrameOutcome::StopReading));
+        let mut wire = out.inline.as_slice();
+        let mut saw_goaway = false;
+        while !wire.is_empty() {
+            let header = FrameHeader::parse(wire).unwrap();
+            let end = FrameHeader::LEN + header.length as usize;
+            if header.kind == kind::GOAWAY {
+                let last = u32::from_be_bytes(
+                    wire[FrameHeader::LEN..FrameHeader::LEN + 4]
+                        .try_into()
+                        .unwrap(),
+                ) & 0x7fff_ffff;
+                assert!(
+                    last >= 7,
+                    "GOAWAY cannot mark a served borrowed stream retryable"
+                );
+                saw_goaway = true;
+            }
+            wire = &wire[end..];
+        }
+        assert!(saw_goaway);
     }
 
     /// The rapid-reset budget is a burst refilled by time alone: nothing but elapsed time

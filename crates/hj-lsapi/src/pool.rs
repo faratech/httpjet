@@ -1064,6 +1064,10 @@ pub struct LsapiPool {
     breaker: Option<Arc<DialBreaker>>,
     /// Peak checked-out connections since the last [`Self::take_inflight_max`].
     inflight_max: AtomicU64,
+    /// Shared LIFO idle UDS connections for on-core monoio LSAPI dispatch,
+    /// governed by the same `sem` (`max_conns`) permit cap so idle sockets on
+    /// one worker can never pin `lsphp` children and starve another worker (#896).
+    monoio_idle: Mutex<Vec<(std::os::unix::net::UnixStream, u64, Instant)>>,
 }
 
 /// Default idle TTL when the config carries no `pc_keep_alive_timeout`.
@@ -1102,6 +1106,7 @@ impl LsapiPool {
             retry_timeout: Duration::ZERO,
             breaker: None,
             inflight_max: AtomicU64::new(0),
+            monoio_idle: Mutex::new(Vec::new()),
         }
     }
 
@@ -1173,6 +1178,64 @@ impl LsapiPool {
         self.max_conns
     }
 
+    /// Acquire one permit from this pool's `max_conns` semaphore for on-core
+    /// monoio LSAPI dispatch. Fast-paths uncontended `try_acquire_owned()`.
+    pub async fn acquire_monoio_permit(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, PoolError> {
+        if let Ok(permit) = self.sem.clone().try_acquire_owned() {
+            return Ok(permit);
+        }
+        self.sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| PoolError::Closed)
+    }
+
+    /// Pop the newest live idle UDS socket for `generation` (LIFO), discarding
+    /// stale or expired entries.
+    pub fn pop_monoio_idle(&self, generation: u64) -> Option<std::os::unix::net::UnixStream> {
+        if self.idle_ttl.is_zero() {
+            return None;
+        }
+        let now = Instant::now();
+        let mut idle = self.monoio_idle.lock();
+        while let Some((stream, entry_gen, since)) = idle.pop() {
+            if entry_gen == generation && now.saturating_duration_since(since) < self.idle_ttl {
+                return Some(stream);
+            }
+        }
+        drop(idle);
+        // If Tokio's idle pool holds a live socket (e.g. from cache priming),
+        // transfer its fd to monoio so the two idle lists never pin lsphp
+        // children against each other (#896).
+        let mut tokio_idle = self.idle.lock();
+        while let Some(entry) = tokio_idle.pop_back() {
+            if entry.generation == generation
+                && now.saturating_duration_since(entry.since) < self.idle_ttl
+                && let Ok(std_stream) = entry.stream.into_std()
+            {
+                return Some(std_stream);
+            }
+        }
+        None
+    }
+
+    /// Return a clean UDS socket to the shared monoio idle pool for `generation`.
+    pub fn push_monoio_idle(&self, stream: std::os::unix::net::UnixStream, generation: u64) {
+        if self.idle_ttl.is_zero() {
+            return;
+        }
+        let mut idle = self.monoio_idle.lock();
+        if idle.first().is_some_and(|(_, g, _)| *g != generation) {
+            idle.retain(|(_, entry_gen, _)| *entry_gen == generation);
+        }
+        if idle.len() < self.max_conns {
+            idle.push((stream, generation, Instant::now()));
+        }
+    }
+
     /// Number of currently-idle pooled connections (does not prune).
     pub fn idle_count(&self) -> usize {
         self.idle.lock().len()
@@ -1199,6 +1262,12 @@ impl LsapiPool {
     /// A request body was refused before any of it reached lsphp.
     pub(crate) fn note_embedded_begin(&self) {
         note_embedded_begin(&self.counters);
+    }
+
+    pub(crate) fn note_body_conn_close(&self) {
+        self.counters
+            .body_conn_closes
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// An idempotent request is replayed after a pre-response reset (`exhausted`:
@@ -1258,6 +1327,7 @@ impl LsapiPool {
                 let mut idle = self.idle.lock();
                 idle.drain(..).collect::<Vec<_>>()
             };
+            self.monoio_idle.lock().clear();
             let dropped = stale.len();
             discard_stale_entries(stale, self.external_generation.as_ref(), &self.counters);
             self.counters
@@ -1289,6 +1359,7 @@ impl LsapiPool {
     /// refuse to re-pool once the generation advances.
     pub fn clear(&self) {
         self.idle.lock().clear();
+        self.monoio_idle.lock().clear();
     }
 
     /// Discard idle entries older than `ttl` or stamped against a stale
@@ -1308,6 +1379,9 @@ impl LsapiPool {
         }
         *idle = retained;
         drop(idle);
+        self.monoio_idle.lock().retain(|(_, entry_gen, since)| {
+            *entry_gen == cur && now.saturating_duration_since(*since) < ttl
+        });
         self.counters
             .stale_idle_drops
             .fetch_add(stale.len() as u64, Ordering::Relaxed);
@@ -1342,12 +1416,19 @@ impl LsapiPool {
     }
 
     async fn acquire_probed(&self, reuse: Reuse) -> Result<PooledConn, PoolError> {
-        let permit =
-            match tokio::time::timeout(self.init_timeout, self.sem.clone().acquire_owned()).await {
-                Ok(Ok(p)) => p,
-                Ok(Err(_)) => return Err(PoolError::Closed),
-                Err(_) => return Err(PoolError::Timeout(self.init_timeout)),
-            };
+        let permit = match self.sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(tokio::sync::TryAcquireError::Closed) => return Err(PoolError::Closed),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                match tokio::time::timeout(self.init_timeout, self.sem.clone().acquire_owned())
+                    .await
+                {
+                    Ok(Ok(p)) => p,
+                    Ok(Err(_)) => return Err(PoolError::Closed),
+                    Err(_) => return Err(PoolError::Timeout(self.init_timeout)),
+                }
+            }
+        };
         self.note_inflight();
 
         // Snapshot the generation we acquire against; the conn we hand out is
@@ -1401,7 +1482,30 @@ impl LsapiPool {
                             None => break None,
                         }
                     }
-                };
+                }
+                .or_else(|| {
+                    // Symmetric with `pop_monoio_idle`: if monoio workers parked
+                    // live UDS sockets in `monoio_idle`, transfer one back to the
+                    // Tokio pool so POST/streaming/bridged PHP requests never
+                    // starve waiting for lsphp children pinned in `monoio_idle` (#896).
+                    let mut monoio_idle = self.monoio_idle.lock();
+                    while let Some((std_stream, entry_gen, since)) = monoio_idle.pop() {
+                        if entry_gen == acquire_gen
+                            && now.saturating_duration_since(since) < ttl
+                            && std_stream.set_nonblocking(true).is_ok()
+                            && let Ok(stream) = UnixStream::from_std(std_stream)
+                        {
+                            return Some(IdleEntry {
+                                stream,
+                                since,
+                                generation: entry_gen,
+                                worker: None,
+                                worker_pid_hint: None,
+                            });
+                        }
+                    }
+                    None
+                });
                 match candidate {
                     Some(entry)
                         if matches!(reuse, Reuse::Unprobed) || is_socket_healthy(&entry.stream) =>
@@ -1414,16 +1518,18 @@ impl LsapiPool {
                 }
             }
         };
-        self.counters
-            .stale_idle_drops
-            .fetch_add(wrong_generation.len() as u64, Ordering::Relaxed);
-        discard_stale_entries(
-            wrong_generation,
-            self.external_generation.as_ref(),
-            &self.counters,
-        );
+        if !wrong_generation.is_empty() {
+            self.counters
+                .stale_idle_drops
+                .fetch_add(wrong_generation.len() as u64, Ordering::Relaxed);
+            discard_stale_entries(
+                wrong_generation,
+                self.external_generation.as_ref(),
+                &self.counters,
+            );
+        }
         if let Some(entry) = reused {
-            if self.refresh_external_generation() != acquire_gen {
+            if self.generation.load(Ordering::Acquire) != acquire_gen {
                 self.counters
                     .stale_idle_drops
                     .fetch_add(1, Ordering::Relaxed);
@@ -1771,6 +1877,11 @@ impl PooledConn {
     pub fn into_stream(mut self) -> UnixStream {
         self.reusable = false;
         self.stream.take().expect("stream present until drop")
+    }
+
+    /// Record the lsphp worker PID hint advertised in the initial STDERR packet.
+    pub fn record_worker_pid(&mut self, pid: u32) {
+        self.worker_pid_hint = Some(pid);
     }
 
     /// Mark this connection unusable; it will be dropped, not pooled, on release.

@@ -888,6 +888,16 @@ mod tests {
             crate::diskstore::key_hash(&owned),
             crate::diskstore::key_hash_ref(&borrowed)
         );
+        // These locators address files written by released versions.
+        for (owner, expected) in [
+            (0, 0x20e7_ad03_93b7_5261),
+            (99, 0x9346_a404_976b_e348),
+            (u64::MAX, 0xe113_2e3d_f68d_da79),
+        ] {
+            let mut key = owned.as_ref();
+            key.private_owner = owner;
+            assert_eq!(crate::diskstore::key_hash_ref(&key), expected);
+        }
         let mut diff = borrowed;
         diff.secure = false;
         assert!(!owned.eq_ref(&diff));

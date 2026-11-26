@@ -19,6 +19,7 @@ mod h3_wire;
 #[cfg(feature = "ktls")]
 pub(crate) mod ktls;
 pub(crate) mod ktls_policy;
+pub(crate) mod monoio_lsapi;
 pub(crate) mod proxy_protocol;
 mod proxy_protocol_wire;
 mod qpack;
@@ -140,7 +141,7 @@ impl CoreHandler {
         upgrade: bool,
         reusable_head: Option<&mut H1RequestHeadCache>,
     ) -> Option<bridge::BridgeResp> {
-        if !upgrade && let Some(response) = self.fast(&state, ctx, &req).await {
+        if !upgrade && let Some(response) = self.fast_local(&state, ctx, &req).await {
             if let Some(cache) = reusable_head {
                 cache.store(req);
             }
@@ -189,6 +190,35 @@ impl CoreHandler {
         req: &'a hj_core::Request,
     ) -> impl std::future::Future<Output = Option<hj_core::Response>> + 'a {
         Self::fast_for_listener(&self.listener_name, st, ctx, req)
+    }
+
+    /// Thread-local (`!Send`) on-core fast path for H1: includes direct
+    /// `monoio::net::UnixStream` LSAPI dispatch when page cache is off.
+    async fn fast_local(
+        &self,
+        st: &Arc<ServerState>,
+        ctx: &BridgeCtx,
+        req: &hj_core::Request,
+    ) -> Option<hj_core::Response> {
+        crate::pipeline::fast_serve_uring_local(
+            st,
+            &self.listener_name,
+            ctx.peer.ip(),
+            ctx.local,
+            ctx.peer.port(),
+            ctx.is_tls,
+            ctx.client_auth_requested,
+            ctx.peer_unix,
+            ctx.proto,
+            ctx.tls.as_ref(),
+            req,
+        )
+        .await
+        .map(|response| {
+            #[cfg(feature = "otel")]
+            crate::otel::execution_path(true);
+            hj_core::stamp_date(response)
+        })
     }
 
     /// Shared on-core entry point for protocol engines that already selected a
@@ -359,6 +389,25 @@ where
     }
 }
 
+/// Ship this worker thread's partial access chunks after traffic stops. The
+/// transport-specific thread-local guards keep one ticker per worker. An idle
+/// worker waits for a pending chunk without creating a periodic timer.
+async fn access_chunk_flush_ticker(shutdown: CancellationToken) {
+    loop {
+        monoio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = crate::pipeline::access_chunk_pending() => {}
+        }
+        monoio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = monoio::time::sleep(std::time::Duration::from_millis(250)) => {
+                crate::pipeline::flush_access_chunks();
+            }
+        }
+    }
+    crate::pipeline::flush_access_chunks();
+}
+
 /// Per-core accept loop with graceful drain. Accepts until the shutdown signal,
 /// then stops accepting and waits (bounded by [`URING_DRAIN_GRACE`]) for in-flight
 /// connection tasks to complete. `on_accept` builds the (owned, `'static`) handler
@@ -392,22 +441,7 @@ async fn accept_drain_loop<F, Fut>(
         static CHUNK_TICKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
     if !CHUNK_TICKER.with(|t| t.replace(true)) {
-        let ticker_shutdown = shutdown.clone();
-        monoio::spawn(async move {
-            loop {
-                monoio::select! {
-                    _ = ticker_shutdown.cancelled() => break,
-                    _ = crate::pipeline::access_chunk_pending() => {}
-                }
-                monoio::select! {
-                    _ = ticker_shutdown.cancelled() => break,
-                    _ = monoio::time::sleep(std::time::Duration::from_millis(250)) => {
-                        crate::pipeline::flush_access_chunks();
-                    }
-                }
-            }
-            crate::pipeline::flush_access_chunks();
-        });
+        monoio::spawn(access_chunk_flush_ticker(shutdown.clone()));
     }
     // Configure TCP_NODELAY, SO_KEEPALIVE (+ idle/interval), and TCP_USER_TIMEOUT
     // once on the listening socket so the Linux kernel copies them into every
@@ -1646,15 +1680,9 @@ async fn handle_tls_bridged(
     let mut stream =
         tls.map_io(|io| directio::DirectWriteSocket::new_for(io, proto != Proto::Http2));
     stream.enable_owned_ciphertext_writes();
-    #[cfg(target_arch = "aarch64")]
-    if proto == Proto::Http1 {
-        static H1_TLS_HEADROOM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *H1_TLS_HEADROOM.get_or_init(|| {
-            std::env::var_os("HJ_H1_TLS_HEADROOM").as_deref() != Some(std::ffi::OsStr::new("0"))
-        }) {
-            stream.enable_h1_write_headroom();
-        }
-    }
+    // 68 KiB gives a full 64 KiB H1 or H2 payload plus framing and 5 TLS record
+    // headers in one flush without splitting 64 KiB responses into 63K + 1K.
+    stream.session_mut().set_buffer_limit(Some(68 * 1024));
     match proto {
         Proto::Http2 => serve_h2_bridged(stream, prefix, ctx, core, shutdown, None).await,
         _ => handle_h1_bridged(stream, prefix, ctx, core, shutdown, None).await,
@@ -1947,6 +1975,9 @@ async fn serve_h2_bridged<S>(
     // (Tier 2) Per-connection egress pacing (h2 streams share one pipe, so the
     // rate is connection-wide here; the per-context override is an H1 refinement).
     h2_cfg.bandwidth_limit = state.serve_config.bandwidth_limit;
+    // Keep H2 bulk DATA batches aligned to 4 x 16 KiB TLS records (64 KiB - framing
+    // headroom <= 65,536 B) so 64 KiB responses never spill a 5th tiny 58 B TLS record.
+    h2_cfg.reserve_tls_framing = true;
     // h2c to an mTLS-gated vhost: refuse a body-carrying request from its head, as the H1
     // transport does, instead of buffering the body the pipeline gate then discards. Only
     // a non-exempt plaintext peer on a server with a gated vhost gets the hook at all.
@@ -1969,6 +2000,31 @@ async fn serve_h2_bridged<S>(
     // Fast responses borrow the TLS and peer metadata. Only the bridged
     // request needs its own context to carry the selected application snapshot.
     let dispatch = Arc::new((core, ctx));
+    if crate::pipeline::fast_memo::ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        let probe_dispatch = Arc::clone(&dispatch);
+        h2_cfg.borrowed_memo_probe =
+            Some(hj_h2::server::BorrowedMemoProbe(Arc::new(move |head| {
+                let (core, ctx) = probe_dispatch.as_ref();
+                // A declined read-only probe grants nothing. Use a lock-free
+                // Guard (`load()`) to avoid an atomic Arc clone+drop per stream.
+                let state = core.holder.load();
+                crate::pipeline::probe_borrowed_h2_memo(
+                    &state,
+                    &core.listener_name,
+                    ctx.peer.ip(),
+                    ctx.is_tls,
+                    ctx.client_auth_requested,
+                    ctx.peer_unix,
+                    ctx.proto,
+                    ctx.tls.as_ref(),
+                    head.template_id,
+                    head.method,
+                    head.uri,
+                    head.headers,
+                )
+                .map(|(headers, body)| hj_h2::server::SharedFullResponse { headers, body })
+            })));
+    }
     let service = move |req: hj_core::Request| {
         let dispatch = Arc::clone(&dispatch);
         #[cfg(feature = "otel")]
@@ -1983,7 +2039,7 @@ async fn serve_h2_bridged<S>(
             async move {
                 let (core, ctx) = dispatch.as_ref();
                 let state = core.holder.load_full();
-                if let Some(response) = core.fast(&state, ctx, &req).await {
+                if let Some(response) = core.fast_local(&state, ctx, &req).await {
                     return response;
                 }
                 let mut ctx = ctx.clone();
@@ -2095,11 +2151,17 @@ async fn handle_h1_bridged<S>(
         not(feature = "otel")
     ));
     let mut head_cache = H1RequestHeadCache::default();
+    let mut memo_hint: Option<crate::pipeline::H1MemoHint> = None;
+    let mut read_slot = write_watch::Slot::default();
     // (Tier 2) One bucket per CONNECTION — pacing must not reset per response. Rebuilt
     // inside the loop only when a response carries a different rate (context override or
     // a post-reload tuning change).
     let mut throttle =
         hj_http::BandwidthThrottle::new(core.holder.load().serve_config.bandwidth_limit);
+    // Pin `shutdown.cancelled()` ONCE per connection so idle keep-alive turns
+    // do not acquire/release `tokio::sync::Notify`'s global cross-core mutex twice
+    // per HTTP/1.1 request (~700–800k/s lock ops across cores).
+    let mut shutdown_fut = std::pin::pin!(shutdown.cancelled());
     loop {
         // Graceful drain: at a clean request boundary (no buffered bytes = idle
         // keep-alive), wait for either the next request OR the shutdown signal — on
@@ -2120,7 +2182,7 @@ async fn handle_h1_bridged<S>(
             let keep_alive_timeout = conn_idle_timeout(&core.holder.load(), &ctx);
             monoio::select! {
                 biased;
-                res = read_timeout(&mut stream, keep_alive_timeout, &mut read_scratch) => {
+                res = read_timeout_slot(&mut stream, keep_alive_timeout, &mut read_scratch, &mut read_slot) => {
                     match res {
                         Ok(n) if n > 0 => {
                             read_scratch.truncate(n);
@@ -2146,7 +2208,7 @@ async fn handle_h1_bridged<S>(
                         }
                     }
                 }
-                _ = shutdown.cancelled() => {
+                _ = shutdown_fut.as_mut() => {
                     let _ = stream.shutdown().await;
                     end.set(H1ConnEnd::Shutdown);
                     return;
@@ -2154,21 +2216,20 @@ async fn handle_h1_bridged<S>(
             }
         }
         // Select the request's generation only after idle waiting has received
-        // bytes. Compatible SIGHUPs must therefore remain visible to the next
-        // request on a persistent H1 connection. This exact Arc is then used
-        // for intake limits, the on-core fast path and any bridge dispatch.
-        let state = core.holder.load_full();
+        // bytes. Use a lock-free Guard (`load()`) for intake limits and the
+        // synchronous borrowed H1 memo fast path; only clone the Arc on a miss.
+        let state_guard = core.holder.load();
         // Request-size caps from the LiteSpeed config (maxReqHeaderSize/maxReqBodySize),
         // matching the tokio path — mirror hyper's `max_buf_size` 8 KiB floor for the head.
-        let max_head = state.serve_config.max_req_header_size.max(8192);
-        let max_body = state.serve_config.max_req_body_size;
+        let max_head = state_guard.serve_config.max_req_header_size.max(8192);
+        let max_body = state_guard.serve_config.max_req_body_size;
         // maxKeepAliveReq: close the connection after N requests (0 and 1 disable keep-alive).
-        let max_keepalive = state.serve_config.max_keepalive_requests;
-        let default_bw_rate = state.serve_config.bandwidth_limit;
-        let request_body_ceiling = state.serve_config.request_body_ceiling;
+        let max_keepalive = state_guard.serve_config.max_keepalive_requests;
+        let default_bw_rate = state_guard.serve_config.bandwidth_limit;
+        let request_body_ceiling = state_guard.serve_config.request_body_ceiling;
         // Parse a complete request head (drops the borrow before mutating `acc`).
         let mut request_start: Option<std::time::Instant> = None;
-        let header_read_timeout = state.serve_config.header_read_timeout;
+        let header_read_timeout = state_guard.serve_config.header_read_timeout;
         let mut reused_head = false;
         let parsed = loop {
             let step: ParsedReq =
@@ -2302,7 +2363,7 @@ async fn handle_h1_bridged<S>(
         ) = parsed;
         let retain_head = reused_head
             || (reuse_heads
-                && head_len <= 512
+                && head_len <= 1024
                 && matches!(framing, BodyFraming::Length(0))
                 && keep_alive
                 && !expect_continue
@@ -2310,7 +2371,6 @@ async fn handle_h1_bridged<S>(
                 && !has_upgrade
                 && (method == http::Method::GET || method == http::Method::HEAD)
                 && uri.authority().is_none()
-                && uri.query().is_none()
                 && !headers.contains_key(http::header::COOKIE)
                 && !headers.contains_key(http::header::AUTHORIZATION)
                 && !headers.contains_key(http::header::PROXY_AUTHORIZATION)
@@ -2327,6 +2387,83 @@ async fn handle_h1_bridged<S>(
         if keepalive_cap {
             keep_alive = false;
         }
+        // Synchronous borrowed H1 memo fast path: probe `fast_memo` directly
+        // from the parsed head before `finish_body`, `http::Request`, `Response`,
+        // `Extensions`, `BridgeResp`, and `Arc<ServerState>` cloning.
+        if !http10
+            && !has_upgrade
+            && !expect_continue
+            && matches!(framing, BodyFraming::Length(0))
+            && method == http::Method::GET
+            && crate::pipeline::fast_memo::ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some((shared_headers, body)) = crate::pipeline::probe_borrowed_h1_memo_with_hint(
+                &state_guard,
+                &core.listener_name,
+                ctx.peer.ip(),
+                ctx.is_tls,
+                ctx.client_auth_requested,
+                ctx.peer_unix,
+                ctx.tls.as_ref(),
+                &method,
+                &uri,
+                &headers,
+                reused_head,
+                &mut memo_hint,
+            )
+        {
+            acc.drain(..head_len);
+            if retain_head && keep_alive {
+                head_cache.store_parts(method, uri, headers);
+            }
+            if throttle
+                .as_ref()
+                .is_none_or(|t| t.rate_bps() != default_bw_rate)
+            {
+                throttle = hj_http::BandwidthThrottle::new(default_bw_rate);
+            }
+            if keep_alive && shutdown.is_cancelled() {
+                keep_alive = false;
+            }
+            let resp = bridge::BridgeResp {
+                status: http::StatusCode::OK,
+                headers: http::HeaderMap::new(),
+                shared_headers: Some(shared_headers),
+                body: bridge::BridgeBody::Full(body),
+                bw_rate: None,
+                completion: None,
+            };
+            drop(state_guard);
+            let outcome = write_h1_response_reusing(
+                &mut stream,
+                resp,
+                false,
+                keep_alive,
+                false,
+                &mut throttle,
+                sendfile_fd,
+                header_read_timeout,
+                &shutdown,
+                &mut response_buffers,
+            )
+            .await;
+            if outcome.close {
+                end.set(if outcome.failed {
+                    H1ConnEnd::IoError
+                } else if client_close {
+                    H1ConnEnd::ClientClose
+                } else if keepalive_cap {
+                    H1ConnEnd::KeepaliveCap
+                } else if shutdown.is_cancelled() {
+                    H1ConnEnd::Shutdown
+                } else {
+                    H1ConnEnd::ResponseClose
+                });
+                return;
+            }
+            continue;
+        }
+        let state = Arc::clone(&state_guard);
+        drop(state_guard);
         // A plaintext request the mTLS gate will refuse is answered from its head:
         // reserving body budget, sending 100 Continue or reading the body first would
         // spend all three on a request that is redirected regardless. The body stays
@@ -2829,6 +2966,17 @@ impl H1RequestHeadCache {
     fn store(&mut self, request: hj_core::Request) {
         if let Some(entry) = self.entry.as_deref_mut() {
             entry.parsed = Some(request.into_parts().0);
+        }
+    }
+
+    fn store_parts(&mut self, method: http::Method, uri: http::Uri, headers: http::HeaderMap) {
+        if let Some(entry) = self.entry.as_deref_mut() {
+            let mut req = http::Request::new(());
+            *req.method_mut() = method;
+            *req.uri_mut() = uri;
+            *req.version_mut() = http::Version::HTTP_11;
+            *req.headers_mut() = headers;
+            entry.parsed = Some(req.into_parts().0);
         }
     }
 }
@@ -3800,18 +3948,30 @@ const H1_FILE_READ_CHUNK: usize = 256 * 1024;
 /// Only time spent blocked writing to the client counts: bandwidth-throttle sleeps and
 /// waits on a streaming backend happen between writes, so neither a configured rate
 /// nor a slow backend can trip it. `window: None` (`connTimeout` disarmed) never fires.
-struct SendProgress {
+struct SendProgress<'a> {
     window: Option<std::time::Duration>,
     blocked: std::time::Duration,
     progressed: u64,
+    slot: Option<&'a mut write_watch::Slot>,
 }
 
-impl SendProgress {
+impl<'a> SendProgress<'a> {
+    #[cfg(test)]
     fn new(window: Option<std::time::Duration>) -> Self {
         Self {
             window,
             blocked: std::time::Duration::ZERO,
             progressed: 0,
+            slot: None,
+        }
+    }
+
+    fn with_slot(window: Option<std::time::Duration>, slot: &'a mut write_watch::Slot) -> Self {
+        Self {
+            window,
+            blocked: std::time::Duration::ZERO,
+            progressed: 0,
+            slot: Some(slot),
         }
     }
 
@@ -3851,7 +4011,7 @@ impl SendProgress {
     /// even a small one can block on a client that left earlier responses unread or
     /// shrank its receive window.
     async fn timed<F: std::future::Future>(
-        &self,
+        &mut self,
         len: usize,
         write: F,
     ) -> io::Result<(F::Output, std::time::Duration)> {
@@ -3859,6 +4019,45 @@ impl SendProgress {
             return Ok((write.await, std::time::Duration::ZERO));
         };
         let mut write = std::pin::pin!(write);
+        if let Some(slot) = self.slot.as_deref_mut() {
+            struct DisarmOnDrop<'s>(&'s mut write_watch::Slot);
+            impl Drop for DisarmOnDrop<'_> {
+                fn drop(&mut self) {
+                    self.0.disarm();
+                }
+            }
+            let guard = DisarmOnDrop(slot);
+            let mut started: Option<std::time::Instant> = None;
+            return std::future::poll_fn(|cx| {
+                if started.is_some() && guard.0.expired() {
+                    return std::task::Poll::Ready(Err(send_progress_timeout()));
+                }
+                match write.as_mut().poll(cx) {
+                    std::task::Poll::Ready(out) => {
+                        let elapsed = started.map_or(std::time::Duration::ZERO, |s| {
+                            if budget >= std::time::Duration::from_secs(1) {
+                                write_watch::coarse_now().saturating_duration_since(s)
+                            } else {
+                                s.elapsed()
+                            }
+                        });
+                        std::task::Poll::Ready(Ok((out, elapsed)))
+                    }
+                    std::task::Poll::Pending => {
+                        let s = *started.get_or_insert_with(|| {
+                            if budget >= std::time::Duration::from_secs(1) {
+                                write_watch::coarse_now()
+                            } else {
+                                std::time::Instant::now()
+                            }
+                        });
+                        guard.0.arm(s + budget, cx.waker());
+                        std::task::Poll::Pending
+                    }
+                }
+            })
+            .await;
+        }
         let mut state: Option<(std::time::Instant, write_watch::Deadline)> = None;
         std::future::poll_fn(|cx| {
             if let Some((_, ref deadline)) = state
@@ -3868,14 +4067,25 @@ impl SendProgress {
             }
             match write.as_mut().poll(cx) {
                 std::task::Poll::Ready(out) => {
-                    let elapsed = state
-                        .as_ref()
-                        .map_or(std::time::Duration::ZERO, |(started, _)| started.elapsed());
+                    let elapsed =
+                        state
+                            .as_ref()
+                            .map_or(std::time::Duration::ZERO, |(started, _)| {
+                                if budget >= std::time::Duration::from_secs(1) {
+                                    write_watch::coarse_now().saturating_duration_since(*started)
+                                } else {
+                                    started.elapsed()
+                                }
+                            });
                     std::task::Poll::Ready(Ok((out, elapsed)))
                 }
                 std::task::Poll::Pending => {
                     let (_, deadline) = state.get_or_insert_with(|| {
-                        let started = std::time::Instant::now();
+                        let started = if budget >= std::time::Duration::from_secs(1) {
+                            write_watch::coarse_now()
+                        } else {
+                            std::time::Instant::now()
+                        };
                         (started, write_watch::Deadline::new(started + budget))
                     });
                     deadline.arm(cx.waker());
@@ -4017,6 +4227,7 @@ where
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_h1_response_reusing<S>(
     stream: &mut S,
     mut resp: bridge::BridgeResp,
@@ -4033,7 +4244,8 @@ where
     S: AsyncWriteRent,
 {
     let completion = resp.completion.take();
-    let mut progress = SendProgress::new(send_window);
+    let mut send_slot = std::mem::take(&mut buffers.send_slot);
+    let mut progress = SendProgress::with_slot(send_window, &mut send_slot);
     // (Tier 2) 103 Early Hints over HTTP/1.1 — parity with the h2 emitter: the backend's
     // preload/preconnect Link headers go out as an interim response ahead of the final
     // head, in the same write (the final response is already complete). Upgrades (101)
@@ -4044,52 +4256,96 @@ where
             let body_forbidden = hj_core::response_body_forbidden(is_head, resp.status);
             let result = if throttle.is_none() {
                 let hdrs = resp.shared_headers.as_deref().unwrap_or(&resp.headers);
-                let mut head = buffers.take_head();
-                head.clear();
-                let est = 512 + hdrs.len() * 64;
-                if head.capacity() < est {
-                    head.reserve(est);
-                }
-                if emit_103 {
-                    append_103_early_hints(&mut head, hdrs);
-                }
-                append_h1_response_head_into(
-                    &mut head,
-                    resp.status,
-                    hdrs,
-                    body.len(),
-                    is_head,
-                    keep_alive,
-                );
-                if body_forbidden || body.is_empty() {
-                    match progress.write_all(stream, head).await {
-                        Ok(head) => {
-                            buffers.recycle_head(head);
+                const SMALL_RESPONSE_LIMIT: usize = 4096;
+                let share = resp.shared_headers.as_ref().filter(|_| {
+                    !is_head
+                        && keep_alive
+                        && !http10
+                        && resp.status == http::StatusCode::OK
+                        && body.len() <= SMALL_RESPONSE_LIMIT
+                });
+                if !body_forbidden
+                    && !body.is_empty()
+                    && let Some(headers_arc) = share
+                    && let Some(wire) = buffers.take_shared_wire(headers_arc, &body)
+                {
+                    match progress.write_all(stream, wire).await {
+                        Ok(wire) => {
+                            buffers.recycle_shared_wire_fast(wire);
                             Ok(())
                         }
-                        Err(error) => Err(error),
-                    }
-                } else if head.len() + body.len() <= 4096 {
-                    // Small-body coalescing: append into the reused head buffer and
-                    // submit a single IORING_OP_WRITE instead of Box<[iovec; 2]> + WRITEV.
-                    head.extend_from_slice(&body);
-                    match progress.write_all(stream, head).await {
-                        Ok(head) => {
-                            buffers.recycle_head(head);
-                            Ok(())
+                        Err(error) => {
+                            buffers.invalidate_after_wire_error();
+                            Err(error)
                         }
-                        Err(error) => Err(error),
                     }
                 } else {
-                    match buffers.full(head, body) {
-                        Ok(buffer) => match progress.write_full(stream, buffer).await {
-                            Ok(buffer) => {
-                                buffers.recycle_full(buffer);
+                    let mut head = if let Some(head) =
+                        share.and_then(|h| buffers.take_shared_head(h, body.len()))
+                    {
+                        head
+                    } else {
+                        let mut head = buffers.take_head();
+                        head.clear();
+                        let est = 512 + hdrs.len() * 64;
+                        if head.capacity() < est {
+                            head.reserve(est);
+                        }
+                        if emit_103 {
+                            append_103_early_hints(&mut head, hdrs);
+                        }
+                        append_h1_response_head_into(
+                            &mut head,
+                            resp.status,
+                            hdrs,
+                            body.len(),
+                            is_head,
+                            keep_alive,
+                        );
+                        head
+                    };
+                    let head_len = head.len();
+                    let small = head_len.saturating_add(body.len()) <= SMALL_RESPONSE_LIMIT;
+                    if body_forbidden || body.is_empty() || small {
+                        if !body_forbidden && !body.is_empty() {
+                            head.extend_from_slice(&body);
+                        }
+                        match progress.write_all(stream, head).await {
+                            Ok(wire) => {
+                                if let Some(headers_arc) = share.filter(|_| small) {
+                                    if !body_forbidden && !body.is_empty() {
+                                        buffers.recycle_shared_wire(
+                                            wire,
+                                            head_len,
+                                            headers_arc,
+                                            &body,
+                                        );
+                                    } else {
+                                        buffers.recycle_shared_head(
+                                            wire,
+                                            head_len,
+                                            headers_arc,
+                                            body.len(),
+                                        );
+                                    }
+                                } else {
+                                    buffers.recycle_head(wire);
+                                }
                                 Ok(())
                             }
                             Err(error) => Err(error),
-                        },
-                        Err(error) => Err(error),
+                        }
+                    } else {
+                        match buffers.full(head, body) {
+                            Ok(buffer) => match progress.write_full(stream, buffer).await {
+                                Ok(buffer) => {
+                                    buffers.recycle_full(buffer);
+                                    Ok(())
+                                }
+                                Err(error) => Err(error),
+                            },
+                            Err(error) => Err(error),
+                        }
                     }
                 }
             } else {
@@ -4158,6 +4414,8 @@ where
             hj_core::ResponseEnd::Complete
         });
     }
+    drop(progress);
+    buffers.send_slot = send_slot;
     outcome
 }
 
@@ -4175,7 +4433,7 @@ async fn write_h1_file<S>(
     keep_alive: bool,
     throttle: &mut Option<hj_http::BandwidthThrottle>,
     sendfile_fd: Option<std::os::fd::RawFd>,
-    progress: &mut SendProgress,
+    progress: &mut SendProgress<'_>,
 ) -> io::Result<()>
 where
     S: AsyncWriteRent,
@@ -4785,7 +5043,7 @@ async fn paced_h1_body<S>(
     head: Vec<u8>,
     body: bytes::Bytes,
     throttle: &mut hj_http::BandwidthThrottle,
-    progress: &mut SendProgress,
+    progress: &mut SendProgress<'_>,
 ) -> io::Result<()>
 where
     S: AsyncWriteRent,
@@ -4823,7 +5081,7 @@ async fn write_h1_stream<S>(
     keep_alive: bool,
     http10: bool,
     throttle: &mut Option<hj_http::BandwidthThrottle>,
-    progress: &mut SendProgress,
+    progress: &mut SendProgress<'_>,
     shutdown: &CancellationToken,
 ) -> WriteOutcome
 where
@@ -5253,6 +5511,58 @@ fn h2_service(_req: hj_core::Request) -> impl std::future::Future<Output = hj_co
 /// connection — monoio's rent API hands the Vec back after each op). Previously this
 /// allocated a fresh 8 KiB Vec per read, including each idle keep-alive timeout tick.
 /// Returns the number of bytes read; data lands in `scratch[..n]`.
+async fn read_timeout_slot<S>(
+    stream: &mut S,
+    timeout: Option<std::time::Duration>,
+    scratch: &mut Vec<u8>,
+    slot: &mut write_watch::Slot,
+) -> io::Result<usize>
+where
+    S: monoio::io::AsyncReadRent,
+{
+    let Some(d) = timeout else {
+        return read_timeout(stream, None, scratch).await;
+    };
+    if d < std::time::Duration::from_secs(1) {
+        return read_timeout(stream, Some(d), scratch).await;
+    }
+    scratch.clear();
+    if scratch.capacity() == 0 {
+        scratch.reserve(8192);
+    }
+    let buf = std::mem::take(scratch);
+    let mut armed = false;
+    let mut read_fut = std::pin::pin!(stream.read(buf));
+    let res = std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(out) = read_fut.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Ok(out));
+        }
+        if armed && slot.expired() {
+            return std::task::Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "read timed out",
+            )));
+        }
+        if !armed {
+            slot.arm(write_watch::coarse_now() + d, cx.waker());
+            armed = true;
+        }
+        std::task::Poll::Pending
+    })
+    .await;
+    if armed {
+        slot.disarm();
+    }
+    match res {
+        Ok((Ok(n), b)) => {
+            *scratch = b;
+            Ok(n)
+        }
+        Ok((Err(e), _)) => Err(e),
+        Err(e) => Err(e),
+    }
+}
+
 async fn read_timeout<S>(
     stream: &mut S,
     timeout: Option<std::time::Duration>,
@@ -5267,15 +5577,50 @@ where
     }
     let buf = std::mem::take(scratch);
     match timeout {
-        Some(d) => match monoio::time::timeout(d, stream.read(buf)).await {
-            Ok((Ok(n), b)) => {
-                *scratch = b;
-                Ok(n)
+        Some(d) if d < std::time::Duration::from_secs(1) => {
+            // Sub-second deadlines (e.g. tight body-deadline remainders) use
+            // monoio's exact timer wheel rather than the 100 ms lazy sweeper.
+            match monoio::time::timeout(d, stream.read(buf)).await {
+                Ok((Ok(n), b)) => {
+                    *scratch = b;
+                    Ok(n)
+                }
+                Ok((Err(e), _)) => Err(e),
+                Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "read timed out")),
             }
-            // The rented buffer died with the timed-out future; the next read re-reserves.
-            Ok((Err(e), _)) => Err(e),
-            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "read timed out")),
-        },
+        }
+        Some(d) => {
+            // Lazy per-core deadline slab (`write_watch::Deadline`) with
+            // `coarse_now()`: avoids both timer-wheel churn and `Instant::now()`
+            // vDSO calls on every H1 keep-alive read.
+            let mut deadline: Option<write_watch::Deadline> = None;
+            let mut read_fut = std::pin::pin!(stream.read(buf));
+            let res = std::future::poll_fn(|cx| {
+                if let std::task::Poll::Ready(out) = read_fut.as_mut().poll(cx) {
+                    return std::task::Poll::Ready(Ok(out));
+                }
+                let dl = deadline.get_or_insert_with(|| {
+                    write_watch::Deadline::new(write_watch::coarse_now() + d)
+                });
+                if dl.expired() {
+                    return std::task::Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "read timed out",
+                    )));
+                }
+                dl.arm(cx.waker());
+                std::task::Poll::Pending
+            })
+            .await;
+            match res {
+                Ok((Ok(n), b)) => {
+                    *scratch = b;
+                    Ok(n)
+                }
+                Ok((Err(e), _)) => Err(e),
+                Err(e) => Err(e),
+            }
+        }
         None => {
             let (res, b) = stream.read(buf).await;
             *scratch = b;
@@ -9664,22 +10009,7 @@ async fn accept_drain_loop_unix(
         static UDS_CHUNK_TICKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
     if !UDS_CHUNK_TICKER.with(|t| t.replace(true)) {
-        let ticker_shutdown = shutdown.clone();
-        monoio::spawn(async move {
-            loop {
-                monoio::select! {
-                    _ = ticker_shutdown.cancelled() => break,
-                    _ = crate::pipeline::access_chunk_pending() => {}
-                }
-                monoio::select! {
-                    _ = ticker_shutdown.cancelled() => break,
-                    _ = monoio::time::sleep(std::time::Duration::from_millis(250)) => {
-                        crate::pipeline::flush_access_chunks();
-                    }
-                }
-            }
-            crate::pipeline::flush_access_chunks();
-        });
+        monoio::spawn(access_chunk_flush_ticker(shutdown.clone()));
     }
     // A UDS peer has no address: both ends of the bridge see fabricated loopback.
     let peer = SocketAddr::from(([127, 0, 0, 1], 0));

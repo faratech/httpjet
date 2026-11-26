@@ -77,7 +77,7 @@ pub use proto::{
     SOCK_FILENO, SpecialEnvType, WireHeader, build_begin_request, build_begin_request_body,
     build_begin_request_framed, known_header_index, may_be_lsapi_begin_request, parse_resp_header,
 };
-pub use registry::{LsapiRegistry, PoolKey};
+pub use registry::{LsapiRegistry, MonoioPoolTarget, PoolKey};
 pub use supervisor::{
     LsphpSupervisor, PromotionHook, SocketSource, SupervisorConfig, WorkerState,
     validate_operator_dir,

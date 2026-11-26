@@ -1,3 +1,31 @@
+httpjet (0.2.7-1) stable; urgency=medium
+
+  * Reserve framing space in x86-64 userspace TLS writes for HTTP/1 and HTTP/2.
+  * Skip guaranteed misses in sparse rewrite rule sets.
+  * Yield between busy QUIC pump rounds on x86-64 accelerated HTTP/3.
+  * Bound batched ARM QUIC pump turns to one millisecond and default
+    accelerated and auto engines to four UDP messages per send.
+  * Reserve HTTP/2 TLS framing space on ARM when a batch carries bulk data.
+  * Compact hot public zstd cache variants in the background on x86-64.
+  * Hand uncached script requests to dispatch early on both native architectures.
+  * Reuse serialized headers for repeated small HTTP/1 responses on the
+    same connection, preserving current response bodies and framing.
+  * Reuse encoded HTTP/2 headers for short responses with ordinary Link
+    fields, retaining early-hint emission for preload and preconnect links.
+  * Avoid formatting access-rule memo keys on each request.
+  * Reduce repeated cache-key hashing in capsule and stale-error lookups,
+    preserving the locators of existing page-cache files.
+  * Reduce repeated URI, HPACK, access-log and telemetry processing, and
+    reuse initialized TLS receive storage without clearing spare capacity.
+  * Add borrowed HTTP/2 memo hints (static and page-cached), pre-rendered
+    CLF access-log prefixes, and single-inline HTTP/2 monoio flushes.
+  * Execute bodyless HTTP/1 and HTTP/2 PHP requests on-core via monoio
+    LSAPI with shared pool permits and symmetric Tokio/monoio idle reuse.
+  * Pin per-connection shutdown cancellation and reuse write_watch slots
+    across HTTP/1 reads and writes.
+
+ -- Mike Fara <35661811+faratech@users.noreply.github.com>  Thu, 26 Nov 2026 07:12:00 +0000
+
 httpjet (0.2.6-3) stable; urgency=medium
 
   * Preserve path-vendored Cargo inputs across Debian package cleanup.

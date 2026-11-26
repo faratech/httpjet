@@ -319,6 +319,16 @@ impl AccessRecord {
     /// newline). Quotes and backslashes inside header values are escaped so a
     /// crafted `User-Agent` cannot break the line structure.
     pub fn render(&self, format: LogFormat) -> String {
+        let mut out = Vec::with_capacity(192);
+        self.render_into(&mut out, format);
+        // The renderer emits escaped ASCII or copied UTF-8.
+        match String::from_utf8(out) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        }
+    }
+
+    fn render_into(&self, out: &mut Vec<u8>, format: LogFormat) {
         let escaped_reqid = (format != LogFormat::Json)
             .then(|| self.request_id.as_deref().map(escape))
             .flatten();
@@ -329,9 +339,8 @@ impl AccessRecord {
                 .map(|r| r as &dyn std::fmt::Display),
             _ => escaped_reqid.as_ref().map(|r| r as &dyn std::fmt::Display),
         };
-        let mut out = Vec::with_capacity(192);
         render_line(
-            &mut out,
+            out,
             format,
             &LineFields {
                 client_ip: self.client_ip,
@@ -351,12 +360,6 @@ impl AccessRecord {
                 peer_unix: self.peer_unix,
             },
         );
-        // Every byte the renderer emits is either escaped ASCII or a UTF-8 `&str`
-        // copied through, so this never actually takes the lossy branch.
-        match String::from_utf8(out) {
-            Ok(s) => s,
-            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-        }
     }
 }
 
@@ -502,22 +505,30 @@ fn render_line(out: &mut Vec<u8>, format: LogFormat, f: &LineFields<'_>) {
     use std::io::Write;
     if format == LogFormat::Json {
         fn push_json_str(out: &mut Vec<u8>, s: &str) {
-            for c in s.chars() {
-                match c {
-                    '"' => out.extend_from_slice(b"\\\""),
-                    '\\' => out.extend_from_slice(b"\\\\"),
-                    '\n' => out.extend_from_slice(b"\\n"),
-                    '\r' => out.extend_from_slice(b"\\r"),
-                    '\t' => out.extend_from_slice(b"\\t"),
-                    c if (c as u32) < 0x20 => {
-                        let _ = write!(out, "\\u{:04x}", c as u32);
-                    }
-                    c => {
-                        let mut enc = [0u8; 4];
-                        out.extend_from_slice(c.encode_utf8(&mut enc).as_bytes());
+            let bytes = s.as_bytes();
+            if !needs_log_escape(bytes) {
+                out.extend_from_slice(bytes);
+                return;
+            }
+            let mut start = 0;
+            for (i, &b) in bytes.iter().enumerate() {
+                if b >= 0x20 && b != b'"' && b != b'\\' {
+                    continue;
+                }
+                out.extend_from_slice(&bytes[start..i]);
+                match b {
+                    b'"' => out.extend_from_slice(b"\\\""),
+                    b'\\' => out.extend_from_slice(b"\\\\"),
+                    b'\n' => out.extend_from_slice(b"\\n"),
+                    b'\r' => out.extend_from_slice(b"\\r"),
+                    b'\t' => out.extend_from_slice(b"\\t"),
+                    _ => {
+                        let _ = write!(out, "\\u{b:04x}");
                     }
                 }
+                start = i + 1;
             }
+            out.extend_from_slice(&bytes[start..]);
         }
         fn push_json_bytes_opt(out: &mut Vec<u8>, v: Option<&[u8]>) {
             let Some(bytes) = v else {
@@ -692,11 +703,25 @@ fn push_ip(out: &mut Vec<u8>, ip: IpAddr) {
                 out.extend_from_slice(b"127.0.0.1");
                 return;
             }
-            for (index, octet) in v4.octets().into_iter().enumerate() {
-                if index > 0 {
-                    out.push(b'.');
+            // Store three digits and a dot; skip the leading zeroes at render time.
+            const OCTETS: [[u8; 4]; 256] = {
+                let mut table = [[0; 4]; 256];
+                let mut i = 0;
+                while i < table.len() {
+                    table[i] = [
+                        b'0' + (i / 100) as u8,
+                        b'0' + (i / 10 % 10) as u8,
+                        b'0' + (i % 10) as u8,
+                        b'.',
+                    ];
+                    i += 1;
                 }
-                push_decimal(out, u64::from(octet));
+                table
+            };
+            for (index, octet) in v4.octets().into_iter().enumerate() {
+                let start = usize::from(octet < 100) + usize::from(octet < 10);
+                let end = if index == 3 { 3 } else { 4 };
+                out.extend_from_slice(&OCTETS[usize::from(octet)][start..end]);
             }
         }
         IpAddr::V6(_) => {
@@ -710,10 +735,7 @@ fn push_ip(out: &mut Vec<u8>, ip: IpAddr) {
 fn push_quoted_bytes(out: &mut Vec<u8>, v: Option<&[u8]>) {
     match v {
         Some(s) if !s.is_empty() => {
-            if !s
-                .iter()
-                .any(|&b| b == b'"' || b == b'\\' || !(0x20..0x7f).contains(&b))
-            {
+            if !needs_log_escape(s) {
                 out.extend_from_slice(s);
             } else {
                 out.extend_from_slice(escape_bytes(s).as_bytes());
@@ -721,6 +743,40 @@ fn push_quoted_bytes(out: &mut Vec<u8>, v: Option<&[u8]>) {
         }
         _ => out.push(b'-'),
     }
+}
+
+/// Check printable ASCII runs eight bytes at a time, including the two
+/// printable characters that must be escaped inside quoted log fields.
+#[inline]
+fn needs_log_escape(bytes: &[u8]) -> bool {
+    const LOW_BITS: u64 = u64::from_ne_bytes([1; 8]);
+    const HIGH_BITS: u64 = u64::from_ne_bytes([0x80; 8]);
+    const PRINTABLE_OFFSET: u64 = u64::from_ne_bytes([0x60; 8]);
+
+    #[inline]
+    fn has_byte(word: u64, byte: u8) -> bool {
+        let lanes = word ^ u64::from_ne_bytes([byte; 8]);
+        // A zero lane makes its high bit survive both the subtract and mask.
+        (lanes.wrapping_sub(LOW_BITS) & !lanes & HIGH_BITS) != 0
+    }
+
+    let (words, remainder) = bytes.as_chunks::<8>();
+    for &word in words {
+        let word = u64::from_ne_bytes(word);
+        // With non-ASCII rejected first, adding 96 cannot carry into another
+        // byte. It sets each lane's high bit exactly when the input is >= 32.
+        if word & HIGH_BITS != 0
+            || (word + PRINTABLE_OFFSET) & HIGH_BITS != HIGH_BITS
+            || has_byte(word, b'"')
+            || has_byte(word, b'\\')
+            || has_byte(word, 0x7f)
+        {
+            return true;
+        }
+    }
+    remainder
+        .iter()
+        .any(|&b| b == b'"' || b == b'\\' || !(0x20..0x7f).contains(&b))
 }
 
 /// Escape control chars, `"` and `\` so log lines stay one-per-event and
@@ -741,10 +797,7 @@ fn push_hex_escape(out: &mut String, byte: u8) {
 }
 
 fn escape(s: &str) -> Cow<'_, str> {
-    let needs = s
-        .bytes()
-        .any(|b| b == b'"' || b == b'\\' || b < 0x20 || b >= 0x7f);
-    if !needs {
+    if !needs_log_escape(s.as_bytes()) {
         return Cow::Borrowed(s);
     }
     let mut out = String::with_capacity(s.len() + 8);
@@ -769,9 +822,7 @@ fn escape(s: &str) -> Cow<'_, str> {
 /// exactly as [`escape`] does, and every byte >= 0x80 becomes `\xNN`, so a
 /// non-ASCII `User-Agent` is logged instead of collapsing to `-`.
 fn escape_bytes(s: &[u8]) -> Cow<'_, str> {
-    if !s
-        .iter()
-        .any(|&b| b == b'"' || b == b'\\' || !(0x20..0x7f).contains(&b))
+    if !needs_log_escape(s)
         && let Ok(clean) = std::str::from_utf8(s)
     {
         return Cow::Borrowed(clean);
@@ -873,19 +924,14 @@ impl AccessLogger {
         keep_days: u64,
         compress_archive: bool,
     ) -> Self {
-        let cfg = RollConfig {
-            path: path.as_ref().to_path_buf(),
+        Self::spawn_with_syslog(
+            path,
+            format,
             rolling_size,
             keep_days,
             compress_archive,
-        };
-        let (tx, rx) = mpsc::unbounded_channel();
-        let state: LoggerState = Arc::new(LoggerStateInner::new());
-        supervise_writer(
-            tokio::spawn(writer::run(cfg, rx, state.clone(), None)),
-            "access-log",
-        );
-        AccessLogger { tx, format, state }
+            None,
+        )
     }
 
     /// [`AccessLogger::spawn`] plus a (Tier 2) syslog tap: every rendered line is
@@ -899,6 +945,47 @@ impl AccessLogger {
         compress_archive: bool,
         syslog: Option<SyslogTap>,
     ) -> Self {
+        Self::spawn_inner(
+            path,
+            format,
+            rolling_size,
+            keep_days,
+            compress_archive,
+            syslog,
+            false,
+        )
+    }
+
+    /// Spawn a writer which briefly coalesces partial file buffers between
+    /// access records. Requires a Tokio runtime with its time driver enabled.
+    pub fn spawn_coalesced(
+        path: impl AsRef<Path>,
+        format: LogFormat,
+        rolling_size: u64,
+        keep_days: u64,
+        compress_archive: bool,
+        syslog: Option<SyslogTap>,
+    ) -> Self {
+        Self::spawn_inner(
+            path,
+            format,
+            rolling_size,
+            keep_days,
+            compress_archive,
+            syslog,
+            true,
+        )
+    }
+
+    fn spawn_inner(
+        path: impl AsRef<Path>,
+        format: LogFormat,
+        rolling_size: u64,
+        keep_days: u64,
+        compress_archive: bool,
+        syslog: Option<SyslogTap>,
+        coalesce: bool,
+    ) -> Self {
         let cfg = RollConfig {
             path: path.as_ref().to_path_buf(),
             rolling_size,
@@ -908,7 +995,7 @@ impl AccessLogger {
         let (tx, rx) = mpsc::unbounded_channel();
         let state: LoggerState = Arc::new(LoggerStateInner::new());
         supervise_writer(
-            tokio::spawn(writer::run(cfg, rx, state.clone(), syslog)),
+            tokio::spawn(writer::run_access(cfg, rx, state.clone(), syslog, coalesce)),
             "access-log",
         );
         AccessLogger { tx, format, state }
@@ -1210,6 +1297,20 @@ mod json_render_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_escape_scan_agrees_with_each_byte_and_alignment() {
+        let mut input = [b'a'; 17];
+        assert!(!needs_log_escape(&input));
+        for position in 0..input.len() {
+            for byte in 0..=u8::MAX {
+                input[position] = byte;
+                let expected = byte == b'"' || byte == b'\\' || !(0x20..0x7f).contains(&byte);
+                assert_eq!(needs_log_escape(&input), expected, "{position}: {byte:#x}");
+            }
+            input[position] = b'a';
+        }
+    }
     use std::time::{Duration, UNIX_EPOCH};
 
     fn sample() -> AccessRecord {
@@ -1398,6 +1499,79 @@ mod tests {
         assert_eq!(state.depth.load(Ordering::Relaxed), 0);
         assert_eq!(state.dropped.load(Ordering::Relaxed), 0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ordinary_access_logger_works_without_a_time_driver() {
+        let dir = std::env::temp_dir().join(format!("hj-log-no-timer-{}", std::process::id()));
+        let path = dir.join("access.log");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let record = sample();
+        let expected = format!("{}\n", record.render(LogFormat::Combined));
+        runtime.block_on(async {
+            let logger = AccessLogger::spawn(&path, LogFormat::Combined, 0, 0, false);
+            logger.log(record);
+            logger.shutdown().await;
+        });
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sparse_access_record_flushes_while_logger_remains_open() {
+        let dir = std::env::temp_dir().join(format!("hj-log-idle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("access.log");
+        let logger = AccessLogger::spawn_coalesced(&path, LogFormat::Combined, 0, 0, false, None);
+        let record = sample();
+        let expected = format!("{}\ncontinuation\n", record.render(LogFormat::Combined));
+        logger.log_with_extra(record, Some("continuation".into()));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if tokio::fs::read_to_string(&path).await.ok().as_deref() == Some(expected.as_str())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("a sparse record must flush without another message");
+        logger.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn coalesced_records_follow_reopen_and_keep_exact_line_boundaries() {
+        let dir = std::env::temp_dir().join(format!("hj-log-reopen-{}", std::process::id()));
+        let live = dir.join("access.log");
+        let rolled = dir.join("prior.log");
+        let logger = AccessLogger::spawn_coalesced(&live, LogFormat::Combined, 0, 0, false, None);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !live.exists() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut long = sample();
+        long.uri = format!("/{}", "a".repeat(24 * 1024));
+        let expected_rolled = format!("{}\ncontinuation\n", long.render(LogFormat::Combined));
+        logger.log_with_extra(long, Some("continuation".into()));
+        std::fs::rename(&live, &rolled).unwrap();
+        logger.reopen();
+        let short = sample();
+        let expected_live = format!("{}\n", short.render(LogFormat::Combined));
+        logger.log(short);
+        logger.shutdown().await;
+
+        assert_eq!(std::fs::read_to_string(rolled).unwrap(), expected_rolled);
+        assert_eq!(std::fs::read_to_string(live).unwrap(), expected_live);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// (#349) The borrowed chunk renderer must produce BYTE-IDENTICAL lines to
@@ -1609,6 +1783,26 @@ mod tests {
         r.bytes = 7;
         assert!(r.render(LogFormat::Common).starts_with("10.0.0.9 - - ["));
         assert!(r.render(LogFormat::Common).ends_with(r#"" 200 7"#));
+    }
+
+    #[test]
+    fn dotted_decimal_covers_every_octet_in_each_position() {
+        let mut out = Vec::new();
+        for byte in 0..=u8::MAX {
+            let ip = IpAddr::from([byte, byte.wrapping_add(1), 255 - byte, byte]);
+            out.clear();
+            push_ip(&mut out, ip);
+            assert_eq!(out, ip.to_string().as_bytes());
+        }
+    }
+
+    #[test]
+    fn json_uri_preserves_utf8_and_escapes_each_ascii_control() {
+        let mut record = sample();
+        record.uri = (0..=127).map(char::from).collect();
+        record.uri.push_str("é日\u{85}\u{2028}\u{2029}");
+        let quoted = format!(r#""uri":"{}","#, json_escape(&record.uri));
+        assert!(record.render(LogFormat::Json).contains(&quoted));
     }
 
     #[test]

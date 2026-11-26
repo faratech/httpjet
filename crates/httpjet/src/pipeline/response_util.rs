@@ -1151,6 +1151,12 @@ mod tests {
             return;
         }
         let cfg = hj_config::load(root).expect("the live config must load");
+        let windowsforum_profile = cfg.vhosts.values().any(|decl| {
+            matches!(
+                decl.name.as_str(),
+                "windowsforum.com" | "mcp.windowsforum.com"
+            )
+        });
         let mut mcp_checked = false;
         for decl in cfg.vhosts.values() {
             let Some(vhost) = decl.config.as_ref() else {
@@ -1259,7 +1265,9 @@ mod tests {
                 mcp_checked = true;
             }
         }
-        assert!(mcp_checked, "live config lost the mcp static context");
+        if windowsforum_profile {
+            assert!(mcp_checked, "live config lost the mcp static context");
+        }
     }
 
     fn charset_context(

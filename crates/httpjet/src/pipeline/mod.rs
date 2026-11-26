@@ -248,6 +248,826 @@ fn bridge(state: &ServerState, why: FastBridge) -> Option<Response> {
     None
 }
 
+fn record_fast_memo_hit(
+    state: &ServerState,
+    vhost_name: &str,
+    peer_ip: IpAddr,
+    page_serve: Option<fast_memo::PageMemoServe>,
+) -> usize {
+    state.metrics.record_fast_memo_hit();
+    let vhost_idx = state.telemetry.vhost_idx(vhost_name);
+    if let Some(page) = page_serve {
+        lscache::record_response_memo_hit_codec(state, page.key_hash, page.variant_codec);
+        state
+            .telemetry
+            .record_cache_hit_idx(peer_ip.is_loopback(), vhost_idx);
+    }
+    vhost_idx
+}
+
+struct MemoRequestFacts<'a> {
+    host_hdr: Option<&'a str>,
+    seen_ae: bool,
+    ae_bytes: &'a [u8],
+    cookie_hdr: Option<&'a http::HeaderValue>,
+    has_conditional_or_auth: bool,
+    has_cc_or_pragma: bool,
+    has_disqualifying_borrowed_hdr: bool,
+}
+
+fn memo_request_facts(headers: &http::HeaderMap) -> MemoRequestFacts<'_> {
+    let mut seen_host = false;
+    let mut host_hdr: Option<&str> = None;
+    let mut seen_ae = false;
+    let mut ae_bytes: &[u8] = b"";
+    let mut cookie_hdr: Option<&http::HeaderValue> = None;
+    let mut has_conditional_or_auth = false;
+    let mut has_cc_or_pragma = false;
+    let mut has_disqualifying_borrowed_hdr = false;
+    for (name, val) in headers {
+        if name == http::header::HOST {
+            if !seen_host {
+                seen_host = true;
+                host_hdr = val.to_str().ok();
+            }
+        } else if name == http::header::ACCEPT_ENCODING {
+            if !seen_ae {
+                seen_ae = true;
+                ae_bytes = val.as_bytes();
+            }
+        } else if name == http::header::COOKIE {
+            if cookie_hdr.is_none() {
+                cookie_hdr = Some(val);
+            }
+        } else if name == http::header::IF_NONE_MATCH
+            || name == http::header::IF_MODIFIED_SINCE
+            || name == http::header::IF_MATCH
+            || name == http::header::IF_RANGE
+            || name == http::header::IF_UNMODIFIED_SINCE
+            || name == http::header::AUTHORIZATION
+        {
+            has_conditional_or_auth = true;
+        } else if name == http::header::CACHE_CONTROL || name == http::header::PRAGMA {
+            has_cc_or_pragma = true;
+        } else if name == http::header::RANGE
+            || name == http::header::CONTENT_LENGTH
+            || name == http::header::CONTENT_ENCODING
+            || name == http::header::PROXY_AUTHORIZATION
+            || name == http::header::TRANSFER_ENCODING
+        {
+            has_disqualifying_borrowed_hdr = true;
+        }
+    }
+    MemoRequestFacts {
+        host_hdr,
+        seen_ae,
+        ae_bytes,
+        cookie_hdr,
+        has_conditional_or_auth,
+        has_cc_or_pragma,
+        has_disqualifying_borrowed_hdr,
+    }
+}
+
+fn memo_request_eligible(
+    state: &ServerState,
+    method: &http::Method,
+    has_cookie: bool,
+    has_conditional_or_auth: bool,
+) -> bool {
+    fast_memo::enabled()
+        && state.extensions.is_empty()
+        && method == http::Method::GET
+        && !has_cookie
+        && !has_conditional_or_auth
+}
+
+#[cfg(test)]
+#[test]
+fn borrowed_h2_header_census_preserves_ae_presence_and_first_raw_value() {
+    let mut headers = http::HeaderMap::new();
+    let absent = memo_request_facts(&headers);
+    assert!(!absent.seen_ae);
+    assert!(absent.ae_bytes.is_empty());
+    headers.insert(
+        http::header::ACCEPT_ENCODING,
+        http::HeaderValue::from_static(""),
+    );
+    let empty = memo_request_facts(&headers);
+    assert!(empty.seen_ae);
+    assert_eq!(std::str::from_utf8(empty.ae_bytes), Ok(""));
+    headers.insert(
+        http::header::ACCEPT_ENCODING,
+        http::HeaderValue::from_bytes(b"\xffgzip").unwrap(),
+    );
+    headers.append(
+        http::header::ACCEPT_ENCODING,
+        http::HeaderValue::from_static("identity"),
+    );
+    let invalid = memo_request_facts(&headers);
+    assert!(invalid.seen_ae);
+    assert_eq!(invalid.ae_bytes, b"\xffgzip");
+    assert!(std::str::from_utf8(invalid.ae_bytes).is_err());
+}
+
+/// Pre-render the invariant CLF access-log prefix (everything up to and
+/// including `" reqid="`) for a repeated memoized request within a single
+/// `date_sec`, so subsequent hits only append 16 hex digits + `'\n'`.
+#[allow(clippy::too_many_arguments)]
+fn build_memo_log_prefix(
+    log: &hj_log::AccessLogger,
+    client_ip: IpAddr,
+    peer_unix: bool,
+    proto: Proto,
+    method: &http::Method,
+    uri: &http::Uri,
+    headers: &http::HeaderMap,
+    date_sec: u64,
+    status: u16,
+    body_bytes: u64,
+) -> Option<Box<[u8]>> {
+    let format = log.format();
+    if format == hj_log::LogFormat::Json {
+        return None;
+    }
+    let mask = format.header_mask();
+    let header = |name| headers.get(name).map(http::HeaderValue::as_bytes);
+    let referer = if (mask & 1) != 0 {
+        header(http::header::REFERER)
+    } else {
+        None
+    };
+    let user_agent = if (mask & 2) != 0 {
+        header(http::header::USER_AGENT)
+    } else {
+        None
+    };
+    let host = if (mask & 4) != 0 {
+        header(http::header::HOST)
+    } else {
+        None
+    };
+    let ts = std::time::UNIX_EPOCH + std::time::Duration::from_secs(date_sec);
+    let mut rendered = Vec::with_capacity(256);
+    hj_log::render_access_line_with_host_reqid_u64_into(
+        &mut rendered,
+        format,
+        client_ip,
+        ts,
+        method.as_str(),
+        uri.path(),
+        uri.query(),
+        proto.as_str(),
+        status,
+        body_bytes,
+        referer,
+        user_agent,
+        host,
+        None,
+        0,
+        peer_unix,
+    );
+    const SENTINEL: &[u8] = b" reqid=0000000000000000\n";
+    if rendered.ends_with(SENTINEL) {
+        rendered.truncate(rendered.len() - 17);
+        Some(rendered.into_boxed_slice())
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn record_prefixed_access_line(
+    log: &Arc<hj_log::AccessLogger>,
+    now: std::time::Instant,
+    prefix: &[u8],
+    req_id: u64,
+) {
+    chunk_access_line_at(log, now, |buf, _| {
+        buf.extend_from_slice(prefix);
+        let mut tail = [b'\n'; 17];
+        for (i, slot) in tail.iter_mut().take(16).enumerate() {
+            let nibble = ((req_id >> ((15 - i) * 4)) & 0x0f) as u8;
+            *slot = if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + (nibble - 10)
+            };
+        }
+        buf.extend_from_slice(&tail);
+    });
+}
+
+/// Thread-local 64-slot direct-mapped H2 memo hint keyed by the monotonic
+/// `RequestHeadTemplate::template_id` (unique per distinct repeated HPACK head
+/// on an H2 connection). Covers both static and page-cached H2 responses while
+/// keeping every security, purge, TTL, throttle, telemetry, and logging check
+/// live, and avoiding cross-core `Arc<AccessLogger>` refcount bouncing.
+struct H2MemoHint {
+    template_id: u64,
+    state_ptr: usize,
+    generation: u64,
+    peer_ip: IpAddr,
+    is_tls: bool,
+    client_auth_requested: bool,
+    peer_unix: bool,
+    purge_epoch: u64,
+    response_epoch: Option<Arc<str>>,
+    vhost_idx: usize,
+    client_ip: IpAddr,
+    date_sec: u64,
+    expires: std::time::Instant,
+    page: Option<fast_memo::PageMemoServe>,
+    headers: Arc<http::HeaderMap>,
+    body: bytes::Bytes,
+    log: Option<Arc<hj_log::AccessLogger>>,
+    log_prefix: Option<Box<[u8]>>,
+}
+
+const H2_MEMO_HINT_SLOTS: usize = 64;
+
+thread_local! {
+    static H2_MEMO_HINTS: std::cell::RefCell<[Option<H2MemoHint>; H2_MEMO_HINT_SLOTS]> =
+        const { std::cell::RefCell::new([const { None }; H2_MEMO_HINT_SLOTS]) };
+}
+
+/// Probe only a transport-validated, complete H2 GET head. Every application
+/// guard remains live; None grants nothing and uses the ordinary handler path.
+/// The headers must already contain the same Host that build_request inserts.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn probe_borrowed_h2_memo(
+    state: &ServerState,
+    listener: &str,
+    peer_ip: IpAddr,
+    is_tls: bool,
+    client_auth_requested: bool,
+    peer_unix: bool,
+    proto: Proto,
+    tls: Option<&hj_core::TlsParams>,
+    template_id: u64,
+    method: &http::Method,
+    uri: &http::Uri,
+    headers: &http::HeaderMap,
+) -> Option<(Arc<http::HeaderMap>, bytes::Bytes)> {
+    if proto != Proto::Http2 {
+        return None;
+    }
+    if template_id != 0
+        && !state.request_id_header
+        && state.waf.is_none()
+        && state.extensions.is_empty()
+        && (is_tls || state.mtls_required_vhosts.is_empty())
+    {
+        #[cfg(feature = "otel")]
+        let otel_on = crate::otel::enabled();
+        #[cfg(not(feature = "otel"))]
+        let otel_on = false;
+        if !otel_on {
+            let state_ptr = std::ptr::from_ref(state) as usize;
+            let purge_epoch = state
+                .page_cache
+                .as_ref()
+                .map_or(0, |store| store.purge_epoch());
+            let slot_idx = (template_id as usize) & (H2_MEMO_HINT_SLOTS - 1);
+            let fast_hit = H2_MEMO_HINTS.with(|cell| {
+                let table = cell.borrow();
+                let hint = table.get(slot_idx)?.as_ref()?;
+                if hint.template_id != template_id
+                    || hint.state_ptr != state_ptr
+                    || hint.generation != state.generation
+                    || hint.peer_ip != peer_ip
+                    || hint.is_tls != is_tls
+                    || hint.client_auth_requested != client_auth_requested
+                    || hint.peer_unix != peer_unix
+                    || hint.purge_epoch != purge_epoch
+                    || hint.response_epoch.as_deref() != state.response_cache_epoch.as_deref()
+                {
+                    return None;
+                }
+                let now = std::time::Instant::now();
+                if now >= hint.expires {
+                    return None;
+                }
+                if let Some(page) = hint.page.as_ref()
+                    && (now >= page.deadline || !page.lease.is_current())
+                {
+                    return None;
+                }
+                let (date_sec, changed) = hj_core::http_date_sec_if_changed(now, hint.date_sec);
+                if changed.is_some()
+                    || !state
+                        .client_throttle
+                        .allow_deferring_rejection_at(hint.client_ip, now)
+                {
+                    return None;
+                }
+                state
+                    .metrics
+                    .fast_memo_hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(page) = hint.page.as_ref() {
+                    state
+                        .telemetry
+                        .record_cache_hit_idx(peer_ip.is_loopback(), hint.vhost_idx);
+                    crate::lscache::record_response_memo_hit_codec(
+                        state,
+                        page.key_hash,
+                        page.variant_codec,
+                    );
+                }
+                state.telemetry.record_request(
+                    Proto::Http2,
+                    200,
+                    std::time::Duration::ZERO,
+                    hint.vhost_idx,
+                );
+                if let Some(log) = hint.log.as_ref() {
+                    let req_id = hj_core::reqid::next().as_u64();
+                    if let Some(prefix) = hint.log_prefix.as_deref() {
+                        record_prefixed_access_line(log, now, prefix, req_id);
+                    } else {
+                        record_fast_memo_log_only(
+                            log,
+                            hint.client_ip,
+                            peer_unix,
+                            Proto::Http2,
+                            method,
+                            uri,
+                            headers,
+                            now,
+                            date_sec,
+                            req_id,
+                            200,
+                            hint.body.len() as u64,
+                        );
+                    }
+                }
+                Some((Arc::clone(&hint.headers), hint.body.clone()))
+            });
+            if fast_hit.is_some() {
+                return fast_hit;
+            }
+        }
+    }
+    probe_borrowed_memo_inner(
+        state,
+        listener,
+        peer_ip,
+        is_tls,
+        client_auth_requested,
+        peer_unix,
+        proto,
+        tls,
+        template_id,
+        method,
+        uri,
+        headers,
+        None,
+    )
+}
+
+/// Per-connection H1 keep-alive memo hint: when `H1RequestHeadCache` confirms
+/// the incoming request wire bytes are byte-for-byte identical to the previous
+/// request on the same TCP connection, reuse the resolved static memo entry
+/// while still validating `generation`, `purge_epoch`, `response_epoch`,
+/// `expires`, `date_sec`, `client_throttle`, telemetry, and access logging.
+pub(crate) struct H1MemoHint {
+    generation: u64,
+    purge_epoch: u64,
+    response_epoch: Option<Arc<str>>,
+    vhost_idx: usize,
+    client_ip: IpAddr,
+    date_sec: u64,
+    expires: std::time::Instant,
+    headers: Arc<http::HeaderMap>,
+    body: bytes::Bytes,
+    log: Option<Arc<hj_log::AccessLogger>>,
+    log_prefix: Option<Box<[u8]>>,
+}
+
+/// Thread-local 1-slot route/policy cache for `probe_borrowed_memo_inner`
+/// (shared by H2 and H1 on the same monoio core). Skips 6 hash/CIDR lookups
+/// (`router`, `acl`, `mtls`, `inline_rules`, `vhost_idx`, `access_logger`) on
+/// repeated requests to the same `(generation, listener, host, peer_ip)`.
+struct BorrowedRouteEntry {
+    state_ptr: usize,
+    generation: u64,
+    listener: String,
+    host: String,
+    peer_ip: IpAddr,
+    vhost_name: Arc<str>,
+    vhost_idx: usize,
+    trusted_proxy: bool,
+    log: Option<Arc<hj_log::AccessLogger>>,
+}
+
+thread_local! {
+    static BORROWED_ROUTE_CACHE: std::cell::RefCell<Option<BorrowedRouteEntry>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn probe_borrowed_h1_memo_with_hint(
+    state: &ServerState,
+    listener: &str,
+    peer_ip: IpAddr,
+    is_tls: bool,
+    client_auth_requested: bool,
+    peer_unix: bool,
+    tls: Option<&hj_core::TlsParams>,
+    method: &http::Method,
+    uri: &http::Uri,
+    headers: &http::HeaderMap,
+    reused_head: bool,
+    hint_slot: &mut Option<H1MemoHint>,
+) -> Option<(Arc<http::HeaderMap>, bytes::Bytes)> {
+    if reused_head
+        && let Some(hint) = hint_slot.as_ref()
+        && hint.generation == state.generation
+        && hint.purge_epoch
+            == state
+                .page_cache
+                .as_ref()
+                .map_or(0, |store| store.purge_epoch())
+        && hint.response_epoch.as_deref() == state.response_cache_epoch.as_deref()
+    {
+        let now = std::time::Instant::now();
+        if now < hint.expires {
+            let (date_sec, changed) = hj_core::http_date_sec_if_changed(now, hint.date_sec);
+            if changed.is_none()
+                && state
+                    .client_throttle
+                    .allow_deferring_rejection_at(hint.client_ip, now)
+            {
+                state
+                    .metrics
+                    .fast_memo_hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                state.telemetry.record_request(
+                    Proto::Http1,
+                    200,
+                    std::time::Duration::ZERO,
+                    hint.vhost_idx,
+                );
+                if let Some(log) = hint.log.as_ref() {
+                    let req_id = hj_core::reqid::next().as_u64();
+                    if let Some(prefix) = hint.log_prefix.as_deref() {
+                        record_prefixed_access_line(log, now, prefix, req_id);
+                    } else {
+                        record_fast_memo_log_only(
+                            log,
+                            hint.client_ip,
+                            peer_unix,
+                            Proto::Http1,
+                            method,
+                            uri,
+                            headers,
+                            now,
+                            date_sec,
+                            req_id,
+                            200,
+                            hint.body.len() as u64,
+                        );
+                    }
+                }
+                return Some((Arc::clone(&hint.headers), hint.body.clone()));
+            }
+        }
+    }
+    *hint_slot = None;
+    probe_borrowed_memo_inner(
+        state,
+        listener,
+        peer_ip,
+        is_tls,
+        client_auth_requested,
+        peer_unix,
+        Proto::Http1,
+        tls,
+        0,
+        method,
+        uri,
+        headers,
+        Some(hint_slot),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_borrowed_memo_inner(
+    state: &ServerState,
+    listener: &str,
+    peer_ip: IpAddr,
+    is_tls: bool,
+    client_auth_requested: bool,
+    peer_unix: bool,
+    proto: Proto,
+    tls: Option<&hj_core::TlsParams>,
+    template_id: u64,
+    method: &http::Method,
+    uri: &http::Uri,
+    headers: &http::HeaderMap,
+    h1_hint_out: Option<&mut Option<H1MemoHint>>,
+) -> Option<(Arc<http::HeaderMap>, bytes::Bytes)> {
+    #[cfg(feature = "otel")]
+    if crate::otel::enabled() {
+        return None;
+    }
+    if state.request_id_header
+        || state.waf.is_some()
+        || !state.extensions.is_empty()
+        || uri.path().starts_with("/__hj_cache_")
+    {
+        return None;
+    }
+    #[cfg(feature = "acme")]
+    if state.acme.is_some() && uri.path().starts_with("/.well-known/acme-challenge/") {
+        return None;
+    }
+    let query = uri.query().unwrap_or("");
+    let url_len = uri.path().len() + if query.is_empty() { 0 } else { 1 + query.len() };
+    if url_len > state.serve_config.max_req_url_len {
+        return None;
+    }
+    let facts = memo_request_facts(headers);
+    if facts.has_disqualifying_borrowed_hdr
+        || !memo_request_eligible(
+            state,
+            method,
+            facts.cookie_hdr.is_some(),
+            facts.has_conditional_or_auth,
+        )
+    {
+        return None;
+    }
+    let req_start = std::time::Instant::now();
+    let host = facts.host_hdr?;
+    // Thread-local 1-slot route/ACL/logger cache: skips 6 hash/CIDR lookups on
+    // repeated streams for the same `(generation, listener, host, peer_ip)`.
+    let state_ptr = std::ptr::from_ref(state) as usize;
+    let cached_route = BORROWED_ROUTE_CACHE.with(|cell| {
+        let borrow = cell.borrow();
+        let entry = borrow.as_ref()?;
+        if entry.state_ptr == state_ptr
+            && entry.generation == state.generation
+            && entry.peer_ip == peer_ip
+            && entry.host == host
+            && entry.listener == listener
+        {
+            Some((
+                Arc::clone(&entry.vhost_name),
+                entry.vhost_idx,
+                entry.trusted_proxy,
+                entry.log.clone(),
+            ))
+        } else {
+            None
+        }
+    });
+    let (vhost_name_owned, cached_vhost_idx, trusted_proxy, cached_log) =
+        if let Some(hit) = cached_route {
+            (hit.0, Some(hit.1), hit.2, Some(hit.3))
+        } else {
+            let (vhost_name, vhost_cfg, _) =
+                state.router.resolve_ref_with_exact(listener, Some(host))?;
+            if vhost_cfg.disabled {
+                return None;
+            }
+            let (peer_acl, trusted_proxy) = state.acl.classify_peer(peer_ip);
+            if !peer_acl.is_allowed() {
+                return None;
+            }
+            if state
+                .inline_rules
+                .get(vhost_name)
+                .is_some_and(|rules| !rules.path_cacheable)
+            {
+                return None;
+            }
+            let vhost_idx = state.telemetry.vhost_idx(vhost_name);
+            let log = state.access_logger_for(vhost_name).cloned();
+            let vhost_arc: Arc<str> = Arc::from(vhost_name);
+            BORROWED_ROUTE_CACHE.with(|cell| {
+                *cell.borrow_mut() = Some(BorrowedRouteEntry {
+                    state_ptr,
+                    generation: state.generation,
+                    listener: listener.to_owned(),
+                    host: host.to_owned(),
+                    peer_ip,
+                    vhost_name: Arc::clone(&vhost_arc),
+                    vhost_idx,
+                    trusted_proxy,
+                    log: log.clone(),
+                });
+            });
+            (vhost_arc, Some(vhost_idx), trusted_proxy, Some(log))
+        };
+    let vhost_name: &str = &vhost_name_owned;
+    let https = effective_request_https(is_tls, trusted_proxy, headers);
+    if !https
+        && !state.mtls_required_vhosts.is_empty()
+        && mtls_gate_redirects(
+            https,
+            state.mtls_required_vhosts.contains(vhost_name),
+            peer_ip,
+        )
+    {
+        return None;
+    }
+    let purge_epoch = state
+        .page_cache
+        .as_ref()
+        .map_or(0, |store| store.purge_epoch());
+    let key = fast_memo::MemoKey {
+        generation: state.generation,
+        allow_page_responses: state
+            .page_cache
+            .as_ref()
+            .is_some_and(|store| store.config().response_memo)
+            && !facts.has_cc_or_pragma,
+        response_epoch: state.response_cache_epoch.as_deref(),
+        purge_epoch,
+        listener,
+        https,
+        h3: false,
+        trusted_proxy,
+        vhost: vhost_name,
+        host_src: fast_memo::HostSource::Header,
+        host: host.as_bytes(),
+        path: uri.path(),
+        query,
+        ae: facts.ae_bytes,
+    };
+    let (hit, client_ip, page, date_sec) = fast_memo::probe_shared_serve(
+        &key,
+        headers,
+        &state.ua_classify,
+        req_start,
+        || {
+            let client_ip = state.acl.resolve_client_ip_with_trust(
+                peer_ip,
+                trusted_proxy,
+                headers,
+                state.server.use_ip_in_proxy_header,
+                mtls_ok(client_auth_requested, is_tls, tls),
+            );
+            if !state
+                .acl
+                .check_client_after_peer(peer_ip, true, client_ip)
+                .is_allowed()
+                || !state.geo.allows(client_ip)
+            {
+                return Err(());
+            }
+            Ok(client_ip)
+        },
+        |epoch| {
+            state
+                .page_cache
+                .as_ref()
+                .is_none_or(|store| store.purge_epoch() == epoch)
+        },
+        (),
+    )?
+    .ok()?;
+    // Keep context-paced responses on their existing path in this first
+    // prototype; H2's connection-wide pacer remains the only egress limiter.
+    if hit.status != StatusCode::OK || hit.bandwidth.is_some() {
+        return None;
+    }
+    if !state
+        .client_throttle
+        .allow_deferring_rejection_at(client_ip, req_start)
+    {
+        return None;
+    }
+    let vhost_idx = if let Some(idx) = cached_vhost_idx {
+        state
+            .metrics
+            .fast_memo_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(page) = page.as_ref() {
+            state
+                .telemetry
+                .record_cache_hit_idx(peer_ip.is_loopback(), idx);
+            crate::lscache::record_response_memo_hit_codec(
+                state,
+                page.key_hash,
+                page.variant_codec,
+            );
+        }
+        idx
+    } else {
+        record_fast_memo_hit(state, vhost_name, peer_ip, page.clone())
+    };
+    let log_owned = cached_log.flatten();
+    let log = log_owned.as_ref();
+    let req_id = if log.is_some() {
+        hj_core::reqid::next().as_u64()
+    } else {
+        0
+    };
+    record_fast_memo_fields(
+        state,
+        vhost_idx,
+        client_ip,
+        peer_unix,
+        proto,
+        method,
+        uri,
+        headers,
+        req_start,
+        date_sec,
+        req_id,
+        log,
+        200,
+        Some(hit.body.len() as u64),
+    );
+    if let Some(slot) = h1_hint_out
+        && page.is_none()
+    {
+        let log_prefix = log_owned.as_deref().and_then(|logger| {
+            build_memo_log_prefix(
+                logger,
+                client_ip,
+                peer_unix,
+                Proto::Http1,
+                method,
+                uri,
+                headers,
+                date_sec,
+                200,
+                hit.body.len() as u64,
+            )
+        });
+        *slot = Some(H1MemoHint {
+            generation: state.generation,
+            purge_epoch,
+            response_epoch: state.response_cache_epoch.clone(),
+            vhost_idx,
+            client_ip,
+            date_sec,
+            expires: hit.expires,
+            headers: Arc::clone(&hit.headers),
+            body: hit.body.clone(),
+            log: log_owned,
+            log_prefix,
+        });
+    } else if proto == Proto::Http2 && template_id != 0 {
+        let log_prefix = log_owned.as_deref().and_then(|logger| {
+            build_memo_log_prefix(
+                logger,
+                client_ip,
+                peer_unix,
+                Proto::Http2,
+                method,
+                uri,
+                headers,
+                date_sec,
+                200,
+                hit.body.len() as u64,
+            )
+        });
+        let slot_idx = (template_id as usize) & (H2_MEMO_HINT_SLOTS - 1);
+        H2_MEMO_HINTS.with(|cell| {
+            let mut table = cell.borrow_mut();
+            if let Some(slot) = table.get_mut(slot_idx) {
+                *slot = Some(H2MemoHint {
+                    template_id,
+                    state_ptr,
+                    generation: state.generation,
+                    peer_ip,
+                    is_tls,
+                    client_auth_requested,
+                    peer_unix,
+                    purge_epoch,
+                    response_epoch: state.response_cache_epoch.clone(),
+                    vhost_idx,
+                    client_ip,
+                    date_sec,
+                    expires: hit.expires,
+                    page,
+                    headers: Arc::clone(&hit.headers),
+                    body: hit.body.clone(),
+                    log: log_owned,
+                    log_prefix,
+                });
+            }
+        });
+    }
+    Some((hit.headers, hit.body))
+}
+
+struct PreparedFastLsapi {
+    target: Arc<hj_lsapi::MonoioPoolTarget>,
+    ctx: ReqCtx,
+    proto: Proto,
+    req_start: std::time::Instant,
+    chain: Vec<Arc<Htaccess>>,
+    orig_path: String,
+    orig_rel: String,
+    script: LsapiScript,
+}
+
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fast_serve(
@@ -276,6 +1096,7 @@ pub(crate) async fn fast_serve(
         tls.as_ref(),
         req,
         false,
+        None,
     )
     .await
 }
@@ -283,6 +1104,7 @@ pub(crate) async fn fast_serve(
 /// On-core fast path for the io_uring transports: allows `fast_memo` hits to
 /// return `hj_core::SharedHeaders(Arc<HeaderMap>)` when `!state.request_id_header`,
 /// eliminating `HeaderMap::clone()` on every H1/H2/H3 fast-memo hit.
+/// Remains `Send` so H2/H3 futures that cross `serve_local_with_prefix` can await it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fast_serve_uring(
     state: &Arc<ServerState>,
@@ -310,8 +1132,64 @@ pub(crate) async fn fast_serve_uring(
         tls,
         req,
         !state.request_id_header,
+        None,
     )
     .await
+}
+
+/// Thread-local (`!Send`) on-core fast path for monoio H1 connections: extends
+/// [`fast_serve_uring`] with direct `monoio::net::UnixStream` LSAPI dispatch
+/// for eligible bodyless GET/HEAD PHP requests when the page cache is off.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fast_serve_uring_local(
+    state: &Arc<ServerState>,
+    listener: &str,
+    peer_ip: IpAddr,
+    local_addr: std::net::SocketAddr,
+    peer_port: u16,
+    is_tls: bool,
+    client_auth_requested: bool,
+    peer_unix: bool,
+    proto: Proto,
+    tls: Option<&hj_core::TlsParams>,
+    req: &Request,
+) -> Option<Response> {
+    let mut lsapi_prep: Option<Box<PreparedFastLsapi>> = None;
+    if let Some(resp) = fast_serve_inner(
+        state,
+        listener,
+        peer_ip,
+        local_addr,
+        peer_port,
+        is_tls,
+        client_auth_requested,
+        peer_unix,
+        proto,
+        tls,
+        req,
+        !state.request_id_header,
+        Some(&mut lsapi_prep),
+    )
+    .await
+    {
+        return Some(resp);
+    }
+    if let Some(prep) = lsapi_prep {
+        if let Some(resp) = crate::uring::monoio_lsapi::dispatch_bodyless(
+            &prep.target,
+            req,
+            &prep.ctx,
+            &prep.script,
+        )
+        .await
+        {
+            if let Some(done) = finish_fast_lsapi(state, *prep, req, resp).await {
+                return Some(done);
+            }
+        }
+        return bridge(state, FastBridge::Script);
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -328,6 +1206,7 @@ async fn fast_serve_inner(
     tls: Option<&hj_core::TlsParams>,
     req: &Request,
     use_shared_headers: bool,
+    lsapi_out: Option<&mut Option<Box<PreparedFastLsapi>>>,
 ) -> Option<Response> {
     let proto = effective_proto(proto, req);
     let req_start = std::time::Instant::now();
@@ -387,40 +1266,15 @@ async fn fast_serve_inner(
     if target_len > state.serve_config.max_req_url_len {
         return bridge(state, FastBridge::UrlTooLong);
     }
-    let mut seen_host = false;
-    let mut host_hdr: Option<&str> = None;
-    let mut seen_ae = false;
-    let mut ae_bytes: &[u8] = b"";
-    let mut cookie_hdr: Option<&http::HeaderValue> = None;
-    let mut has_conditional_or_auth = false;
-    let mut has_cc_or_pragma = false;
-    for (name, val) in req.headers() {
-        if name == http::header::HOST {
-            if !seen_host {
-                seen_host = true;
-                host_hdr = val.to_str().ok();
-            }
-        } else if name == http::header::ACCEPT_ENCODING {
-            if !seen_ae {
-                seen_ae = true;
-                ae_bytes = val.as_bytes();
-            }
-        } else if name == http::header::COOKIE {
-            if cookie_hdr.is_none() {
-                cookie_hdr = Some(val);
-            }
-        } else if name == http::header::IF_NONE_MATCH
-            || name == http::header::IF_MODIFIED_SINCE
-            || name == http::header::IF_MATCH
-            || name == http::header::IF_RANGE
-            || name == http::header::IF_UNMODIFIED_SINCE
-            || name == http::header::AUTHORIZATION
-        {
-            has_conditional_or_auth = true;
-        } else if name == http::header::CACHE_CONTROL || name == http::header::PRAGMA {
-            has_cc_or_pragma = true;
-        }
-    }
+    let MemoRequestFacts {
+        host_hdr,
+        seen_ae,
+        ae_bytes,
+        cookie_hdr,
+        has_conditional_or_auth,
+        has_cc_or_pragma,
+        has_disqualifying_borrowed_hdr: _,
+    } = memo_request_facts(req.headers());
     let has_cookie = cookie_hdr.is_some();
     let (route_key, host_src): (Option<&str>, fast_memo::HostSource) = match host_hdr {
         Some(h) => (Some(h), fast_memo::HostSource::Header),
@@ -470,11 +1324,8 @@ async fn fast_serve_inner(
     // common ones — a replayed 200 would silently override that verdict.
     // A compile-time response transform sees the whole request context, which the
     // memo key does not cover, so its output is never memoized.
-    let memo_eligible_req = fast_memo::enabled()
-        && state.extensions.is_empty()
-        && method == http::Method::GET
-        && !has_cookie
-        && !has_conditional_or_auth;
+    let memo_eligible_req =
+        memo_request_eligible(state, &method, has_cookie, has_conditional_or_auth);
     // A `path_cacheable: false` inline set means stores are impossible; skip
     // the probe entirely. Its keyable vars become vary items at the store site.
     let memo_inline = state.inline_rules.get(vhost_name);
@@ -536,7 +1387,7 @@ async fn fast_serve_inner(
             },
             FastBridge::MemoChanged,
         ) {
-            let (mut resp, client_ip, page_serve, date_sec) = match probed {
+            let (resp, client_ip, page_serve, date_sec) = match probed {
                 Ok(hit) => hit,
                 Err(why) => return bridge(state, why),
             };
@@ -546,30 +1397,8 @@ async fn fast_serve_inner(
             {
                 return bridge(state, FastBridge::Throttle); // over the per-IP rate: dispatch() renders the 429
             }
-            // Counted only once admitted: a refused probe is rendered (and counted) by handle().
-            state
-                .metrics
-                .fast_memo_hits
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let vhost_idx = state.telemetry.vhost_idx(vhost_name);
-            if let Some(page) = page_serve {
-                lscache::record_response_memo_hit_codec(state, page.key_hash, page.variant_codec);
-                state
-                    .telemetry
-                    .record_cache_hit_idx(peer_ip.is_loopback(), vhost_idx);
-            }
-            // Only memo metadata is restored; re-derive the context egress rate.
-            if has_bandwidth_context(vhost_cfg) {
-                let Some(path) = decode_request_path(req.uri().path()) else {
-                    return bridge(state, FastBridge::MalformedPath);
-                };
-                stamp_bandwidth_vhost(
-                    vhost_cfg,
-                    &rewrite_glue::normalized_request_path_cow(&path),
-                    state.serve_config.bandwidth_limit,
-                    &mut resp,
-                );
-            }
+            // Counted only once admitted; refusals are counted by handle().
+            let vhost_idx = record_fast_memo_hit(state, vhost_name, peer_ip, page_serve);
             return Some(record_fast_memo_serve(
                 state, vhost_name, vhost_idx, client_ip, peer_unix, proto, req, req_start,
                 date_sec, resp,
@@ -609,7 +1438,11 @@ async fn fast_serve_inner(
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     let mode = state.early_bridge.mode();
-    if mode.checks_script_suffix(proto)
+    let early_script_cache_absent = !has_cookie
+        && suffix_routing::last_segment_is_script_vhost(state, vhost_cfg, &orig_path)
+        && early_cache_decline(state, vhost_name, &orig_path, false).is_some();
+    if mode == early_bridge::Mode::Scripts
+        && lsapi_out.is_none()
         && !has_cookie
         && suffix_routing::last_segment_is_script_vhost(state, vhost_cfg, &orig_path)
         && let Some(why) = early_cache_decline(state, vhost_name, &orig_path, false)
@@ -789,19 +1622,39 @@ async fn fast_serve_inner(
     let cache_vary_env;
     let rewrite_env_empty;
     let mut rewritten_query = None;
-    let (cache_path, cache_rel, rewrite_unchanged): (Cow<'_, str>, Cow<'_, str>, bool) = match rw {
+    let proxy_rewrite = matches!(&rw, RwResult::Proxy { .. });
+    let (route_path, route_rel): (Cow<'_, str>, Cow<'_, str>) = match rw {
         RwResult::Unchanged { env } => {
             rewrite_env_empty = env.is_empty();
             cache_vary_env = merge_rewrite_env(&mut ctx, env);
-            (Cow::Borrowed(&orig_path), Cow::Borrowed(&orig_rel), true)
+            (Cow::Borrowed(&orig_path), Cow::Borrowed(&orig_rel))
         }
         RwResult::Proxy { env, .. } => {
             rewrite_env_empty = env.is_empty();
             cache_vary_env = merge_rewrite_env(&mut ctx, env);
-            (Cow::Borrowed(&orig_path), Cow::Borrowed(&orig_rel), false)
+            (Cow::Borrowed(&orig_path), Cow::Borrowed(&orig_rel))
         }
         RwResult::Rewritten { path, query, env } => {
             rewrite_env_empty = env.is_empty();
+            // The full pipeline judges the original aliases before rewrite
+            // environment changes, then judges the rewritten resources separately.
+            if !rewrite_env_empty {
+                let source = scoped_auth::target_policy(
+                    state,
+                    &ctx,
+                    ResourceRequest::new(req, orig_query),
+                    &orig_path,
+                    &chain,
+                    true,
+                );
+                if source.protected {
+                    return bridge(state, FastBridge::Auth);
+                }
+                memo_store_ok &= source.memo_ok;
+                if let Some(deadline) = source.deadline {
+                    policy_deadline = policy_deadline.min(deadline);
+                }
+            }
             cache_vary_env = merge_rewrite_env(&mut ctx, env);
             // A rewrite INTO a non-ancestor directory makes dispatch() reload the
             // destination chain (#8); the on-core path bridges instead of guessing.
@@ -810,7 +1663,7 @@ async fn fast_serve_inner(
             }
             rewritten_query = Some(query.unwrap_or_default());
             let rel = resolved_rel_path(&path);
-            (Cow::Owned(path), Cow::Owned(rel), false)
+            (Cow::Owned(path), Cow::Owned(rel))
         }
         RwResult::Failed { .. }
         | RwResult::Redirect { .. }
@@ -821,9 +1674,11 @@ async fn fast_serve_inner(
             return bridge(state, FastBridge::RewriteTerminal);
         }
     };
+    let local_rewrite = rewritten_query.is_some();
+    let route_query = rewritten_query.as_deref().unwrap_or(orig_query);
     // dispatch() renders the context's 403/503 (before any cache lookup).
-    if context_refusal(&ctx.vhost.contexts, &cache_path).is_some()
-        || context_slash_redirect(&ctx.vhost.contexts, &cache_path)
+    if context_refusal(&ctx.vhost.contexts, &route_path).is_some()
+        || context_slash_redirect(&ctx.vhost.contexts, &route_path)
     {
         return bridge(state, FastBridge::Context);
     }
@@ -837,6 +1692,7 @@ async fn fast_serve_inner(
     // whose rules ran, so it is the whole input set of this request's response.
     let page_cache_branch = state.page_cache.is_some()
         && !has_cookie
+        && !early_script_cache_absent
         && lscache::raw_path_is_cache_canonical(req.uri().path(), &orig_path)
         && lscache::raw_host_is_cache_canonical(req, ctx.is_tls)
         && !rewrite_glue::page_cache_unkeyed(state, &ctx, chain.iter().map(|h| &**h));
@@ -847,13 +1703,36 @@ async fn fast_serve_inner(
             state,
             &ctx,
             &chain,
-            &orig_path,
+            &route_path,
+            &route_rel,
             method.as_str(),
             host_foreign,
-            rewrite_unchanged,
+            proxy_rewrite,
+            local_rewrite,
             rewrite_env_empty,
         )
     {
+        if matches!(why, FastBridge::Script)
+            && let Some(slot) = lsapi_out
+            && let Some(prep) = prepare_fast_lsapi(
+                state,
+                ctx,
+                req,
+                proto,
+                req_start,
+                chain,
+                &orig_path,
+                orig_query,
+                &orig_rel,
+                host_foreign,
+                proxy_rewrite,
+                local_rewrite,
+                rewrite_env_empty,
+            )
+        {
+            *slot = Some(Box::new(prep));
+            return None;
+        }
         return bridge(state, why);
     }
 
@@ -881,10 +1760,10 @@ async fn fast_serve_inner(
             state,
             &ctx,
             &chain,
-            &cache_path,
-            &cache_rel,
-            ResourceRequest::new(req, rewritten_query.as_deref().unwrap_or(orig_query)),
-            *cache_path != *orig_path,
+            &route_path,
+            &route_rel,
+            ResourceRequest::new(req, route_query),
+            *route_path != *orig_path,
             rewrite_env_empty,
             target_policy.script.as_ref(),
         ) {
@@ -1018,8 +1897,8 @@ async fn fast_serve_inner(
     // Faithfully reproduce dispatch()'s SYNC prefix with the SAME helpers in the SAME
     // order (path canonicalization, per-dir deny, accessDenyDir, PHP-suffix source
     // protection), then serve via the static handler. CONSERVATIVE: bridge (None) on
-    // ANY non-trivial outcome — foreign host, a rewrite that changes the path,
-    // proxy/static <context>, a PHP/script suffix, an access deny, or a non-success
+    // ANY non-trivial outcome — foreign host, a rewritten backend route,
+    // proxy <context>, a PHP/script suffix, an access deny, or a non-success
     // status (so a `.htaccess` ErrorDocument, possibly a .php subrequest, renders on
     // the tokio path). dispatch() itself is untouched (this is an additive uring path).
     if page_cache_branch
@@ -1027,15 +1906,79 @@ async fn fast_serve_inner(
             state,
             &ctx,
             &chain,
-            &orig_path,
+            &route_path,
+            &route_rel,
             method.as_str(),
             host_foreign,
-            rewrite_unchanged,
+            proxy_rewrite,
+            local_rewrite,
             rewrite_env_empty,
         )
     {
+        if matches!(why, FastBridge::Script)
+            && let Some(slot) = lsapi_out
+            && let Some(prep) = prepare_fast_lsapi(
+                state,
+                ctx,
+                req,
+                proto,
+                req_start,
+                chain,
+                &orig_path,
+                orig_query,
+                &orig_rel,
+                host_foreign,
+                proxy_rewrite,
+                local_rewrite,
+                rewrite_env_empty,
+            )
+        {
+            *slot = Some(Box::new(prep));
+            return None;
+        }
         return bridge(state, why);
     }
+    let rewritten_target = if local_rewrite {
+        // Private cache hits, standards-mode stores and upgrade routing still
+        // belong to dispatch. Public LSCache hits ran above.
+        if is_websocket_upgrade(req.headers())
+            || !state.extensions.is_empty()
+            || state.page_cache.as_ref().is_some_and(|store| {
+                has_cookie || store.config().is_standards_vhost(&ctx.vhost_name)
+            })
+        {
+            return bridge(state, FastBridge::Rewritten);
+        }
+        let policy = scoped_auth::target_policy(
+            state,
+            &ctx,
+            ResourceRequest::new(req, route_query),
+            &route_path,
+            &chain,
+            false,
+        );
+        if policy.protected {
+            return bridge(state, FastBridge::Auth);
+        }
+        memo_store_ok &= policy.memo_ok;
+        if let Some(deadline) = policy.deadline {
+            policy_deadline = policy_deadline.min(deadline);
+        }
+        Some(policy)
+    } else {
+        None
+    };
+    let static_uri = if local_rewrite && *route_path != *orig_path {
+        let Some(uri) = build_rewritten_static_uri(&route_path, route_query) else {
+            return bridge(state, FastBridge::MalformedPath);
+        };
+        Some(uri)
+    } else {
+        None
+    };
+    let static_uri = static_uri.as_ref().unwrap_or_else(|| req.uri());
+    let static_policy = rewritten_target.as_ref().unwrap_or(&target_policy);
+
     // (#349) A matching static <context> no longer forces the bridge: mirror
     // dispatch's handling (DocRootOverride when the location differs from the
     // docroot, extraHeaders after the handler, default charset) so
@@ -1045,13 +1988,13 @@ async fn fast_serve_inner(
     // still fail-closes an override root against accessDenyDir, exactly as on
     // the bridged path.
     let static_extra_headers: Option<Vec<(String, String)>> =
-        matching_static_context(&ctx, &orig_path)
-            .map(|_| static_context_extra_headers(&ctx, &orig_path));
-    let static_charset = static_context_charset(&ctx, &orig_path);
-    let static_type = static_content_type_override(&chain, &orig_path);
+        matching_static_context(&ctx, &route_path)
+            .map(|_| static_context_extra_headers(&ctx, &route_path));
+    let static_charset = static_context_charset(&ctx, &route_path);
+    let static_type = static_content_type_override(&chain, &route_path);
     let static_filter = sub_filter_matches(&ctx, &orig_path);
     let static_overrides = hj_static::StaticRequestOverrides {
-        doc_root: static_location_override(&ctx, &orig_path)
+        doc_root: static_location_override(&ctx, &route_path)
             .map(|(root, uri)| (root.as_path(), uri)),
         index_files: htaccess_index_files(&chain),
         default_charset: static_charset.as_deref(),
@@ -1065,6 +2008,7 @@ async fn fast_serve_inner(
             &state.static_handler,
             &ctx,
             req,
+            static_uri,
             hj_static::StaticRequestOverrides {
                 no_precompressed_sibling: identity || static_filter,
                 ..static_overrides
@@ -1087,9 +2031,9 @@ async fn fast_serve_inner(
             scoped_auth::served_target_policy(
                 state,
                 &ctx,
-                ResourceRequest::new(req, &orig_query),
-                &orig_path,
-                &target_policy.targets,
+                ResourceRequest::new(req, route_query),
+                &route_path,
+                &static_policy.targets,
                 &resp,
             )
         };
@@ -1113,7 +2057,7 @@ async fn fast_serve_inner(
     if !matches!(resp.status().as_u16(), 200 | 206 | 304) {
         return bridge(state, FastBridge::StaticStatus); // 404/403/416 → the ErrorDocument renders on tokio
     }
-    if resolved_static_target_is_script(state, &ctx, &orig_path, &chain, &resp) {
+    if resolved_static_target_is_script(state, &ctx, &route_path, &chain, &resp) {
         // The shared static resolver selected the actual DirectoryIndex (or
         // direct/precompressed file). Bridge before buffering any bytes;
         // dispatch returns the fail-closed 503.
@@ -1122,13 +2066,21 @@ async fn fast_serve_inner(
     if let Some(extra) = &static_extra_headers {
         apply_static_context_headers(extra, &mut resp);
     }
-    let index_basename = served_index_basename(&orig_path, &resp);
-    // Promote the file body to in-memory ON-CORE (sync read; large/ranged → bridge),
-    // BEFORE the transforms — the monoio writers have no on-core file streamer yet, and
-    // CacheStaticTransform's own promotion uses tokio block_in_place (panics off a tokio
-    // runtime). Small static files become Body::Full and serve on-core.
-    let Some(mut resp) = buffer_static_file(state, lscache::vhost_id_hash(&ctx.vhost_name), resp)
-    else {
+    let index_basename = served_index_basename(&route_path, &resp);
+    // Rewritten files reuse the bytes filled by full dispatch. Keep cold
+    // reads on that pipeline so a series of new aliases cannot add blocking
+    // body reads to the connection worker.
+    let read_mode = if local_rewrite {
+        StaticReadMode::CacheOnly
+    } else {
+        StaticReadMode::Direct
+    };
+    let Some(mut resp) = buffer_static_file(
+        state,
+        lscache::vhost_id_hash(&ctx.vhost_name),
+        resp,
+        read_mode,
+    ) else {
         return bridge(state, FastBridge::StaticUnbuffered);
     };
     finalize_response(
@@ -1136,10 +2088,10 @@ async fn fast_serve_inner(
         &mut ctx,
         req.headers(),
         &chain,
-        &orig_rel,
+        &route_rel,
         index_basename.as_deref(),
         &orig_path,
-        &orig_path,
+        &route_path,
         &mut resp,
     )
     .await;
@@ -1152,6 +2104,9 @@ async fn fast_serve_inner(
         if lscache::has_purge_header(resp.headers()) {
             return bridge(state, FastBridge::PurgeHeader);
         }
+        if local_rewrite && state.page_cache.is_some() {
+            return bridge(state, FastBridge::Rewritten);
+        }
         lscache::strip_static_control_headers(resp.headers_mut());
     }
     // (Tier 2) Stamp BEFORE the transform loop so SubFilterTransform sees the plan.
@@ -1161,9 +2116,18 @@ async fn fast_serve_inner(
         &ctx,
         &mut resp,
     );
+    if local_rewrite && method == http::Method::HEAD {
+        resp.extensions_mut().insert(hj_compress::HeadResponse);
+    }
     // Header transforms (expires / Alt-Svc / compress) — they see an in-memory body now,
     // so CacheStaticTransform is a no-op (no block_in_place) and Compress negotiates per AE.
     apply_response_transforms(state, &ctx, &mut resp, false).await;
+    stamp_bandwidth(
+        &ctx,
+        &orig_path,
+        state.serve_config.bandwidth_limit,
+        &mut resp,
+    );
     if resp.status() == StatusCode::OK && !resp.headers().contains_key(http::header::SET_COOKIE) {
         if memo_store_ok {
             if let Some(vary) = memo_vary_set(state, &ctx, req, memo_inline, &chain_with_dirs)
@@ -1212,12 +2176,6 @@ async fn fast_serve_inner(
     {
         return bridge(state, FastBridge::Throttle); // over the per-IP rate: dispatch() renders the 429
     }
-    stamp_bandwidth(
-        &ctx,
-        &orig_path,
-        state.serve_config.bandwidth_limit,
-        &mut resp,
-    );
     if early_predicted {
         state.early_bridge.forfeit(early_bridge::Branch::Static);
     }
@@ -1337,9 +2295,14 @@ fn memo_vary_set(
                         let bits = state
                             .ua_classify
                             .get_or_compute(rs, &fast_memo::ua_for_classify(req));
+                        let raw_ua = req
+                            .headers()
+                            .get(http::header::USER_AGENT)
+                            .map(|v| bytes::Bytes::copy_from_slice(v.as_bytes()));
                         vary.push(fast_memo::VaryItem::UaClass {
                             rules: pin.clone(),
                             bits,
+                            raw_ua,
                         });
                         true
                     } else {
@@ -1403,37 +2366,246 @@ pub(crate) fn cookie_header_joined(headers: &http::HeaderMap) -> Option<String> 
     }
 }
 
-/// The on-core STATIC branch's own bridges, in order: a foreign host, a rewrite that
-/// changed the path (any rewrite/redirect/status/forbidden/gone/proxy outcome), a
-/// post-rewrite deny, a proxy `<context>`, or a path that resolves to a script handler
+/// The on-core STATIC branch's own bridges: a foreign host, a proxy rewrite,
+/// a post-rewrite deny, a proxy `<context>`, or a path that resolves to a script handler
 /// — the static handler must NEVER serve one (source disclosure). `&chain` lets an
 /// `.htaccess` `SetHandler`/`AddHandler`/`AddType` force a non-PHP-suffixed file to
 /// script here too, so the on-core static fast path never serves its source.
+/// Synchronously validate and prepare an eligible unrewritten, bodyless
+/// GET/HEAD PHP request for on-core `monoio::net::UnixStream` dispatch when
+/// the page cache is disabled. Fails closed (`None`) to the full Tokio pipeline
+/// on any non-default jail, auth, rewrite, proxy context, FastCGI route, or
+/// slow-log condition.
+#[allow(clippy::too_many_arguments)]
+fn prepare_fast_lsapi(
+    state: &Arc<ServerState>,
+    ctx: ReqCtx,
+    req: &Request,
+    proto: Proto,
+    req_start: std::time::Instant,
+    chain: Vec<Arc<Htaccess>>,
+    orig_path: &str,
+    orig_query: &str,
+    orig_rel: &str,
+    host_foreign: bool,
+    proxy_rewrite: bool,
+    local_rewrite: bool,
+    rewrite_env_empty: bool,
+) -> Option<PreparedFastLsapi> {
+    if state
+        .page_cache
+        .as_ref()
+        .is_some_and(|store| store.config().is_standards_vhost(&ctx.vhost_name))
+        || !state.extensions.is_empty()
+        || state.php_slow.is_some()
+        || host_foreign
+        || proxy_rewrite
+        || local_rewrite
+        || sub_filter_matches(&ctx, orig_path)
+        || !hj_core::body::is_empty_incoming(req.body())
+        || req.headers().contains_key(http::header::CONTENT_LENGTH)
+        || req.headers().contains_key(http::header::TRANSFER_ENCODING)
+    {
+        return None;
+    }
+    let registry = state.lsapi.as_ref()?;
+    let target = registry.default_monoio_target()?;
+    let jail = resolve_vhost_jail(state, &ctx).ok()?;
+    if jail.credentials.is_some() || jail.chroot.is_some() || !jail.namespaces.is_empty() {
+        return None;
+    }
+    if !suffix_routing::vhost_scripts_enabled(state, &ctx)
+        || matching_proxy_context(&ctx, orig_path).is_some()
+        || static_location_override(&ctx, orig_path).is_some()
+    {
+        return None;
+    }
+    if !state.client_throttle.would_allow(ctx.client_ip) {
+        return None;
+    }
+    let policy = scoped_auth::target_policy(
+        state,
+        &ctx,
+        ResourceRequest::new(req, orig_query),
+        orig_path,
+        &chain,
+        rewrite_env_empty,
+    );
+    if policy.protected {
+        return None;
+    }
+    let index_files = effective_index_files(state, &ctx, &chain);
+    let (script_abs, script_name, path_info) =
+        split_script_path(state, &ctx, orig_path, index_files, &chain)?;
+    let configured_handler = configured_script_handler_for_script(&ctx, &script_abs);
+    if configured_handler.is_some_and(script_handler_is_unusable) {
+        return None;
+    }
+    if state.has_cgi_script_routes
+        && configured_handler
+            .and_then(script_handler_fastcgi_name)
+            .is_some()
+    {
+        return None;
+    }
+    let pinned = allowed_script_target(&state.acl, &script_abs)?;
+    if let Ok(rel) = script_abs.strip_prefix(&ctx.vhost.doc_root) {
+        let script_rel = format!("/{}", rel.to_string_lossy());
+        if script_rel != orig_rel
+            && (access_denied(&chain, &script_rel, req.method().as_str(), &ctx)
+                || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &script_rel))
+        {
+            return None;
+        }
+    }
+    let script_basename = script_abs
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_owned();
+    let special_env: Vec<(SpecialEnvType, String, String)> =
+        hj_rewrite::php_directives(&chain, &script_name, &script_basename)
+            .into_iter()
+            .map(|d| {
+                let ty = if d.admin {
+                    SpecialEnvType::Admin
+                } else {
+                    SpecialEnvType::User
+                };
+                (ty, d.name, d.value)
+            })
+            .collect();
+    let script = LsapiScript {
+        script: pinned,
+        script_name: Some(script_name),
+        path_info: if path_info.is_empty() {
+            None
+        } else {
+            Some(path_info)
+        },
+        special_env,
+    };
+    Some(PreparedFastLsapi {
+        target,
+        ctx,
+        proto,
+        req_start,
+        chain,
+        orig_path: orig_path.to_owned(),
+        orig_rel: orig_rel.to_owned(),
+        script,
+    })
+}
+
+async fn finish_fast_lsapi(
+    state: &Arc<ServerState>,
+    mut prep: PreparedFastLsapi,
+    req: &Request,
+    mut resp: Response,
+) -> Option<Response> {
+    // Only finalize clean 200 OK responses without purge/cache-control headers
+    // on-core; any 3xx/4xx/5xx, purge header, or cacheable X-LiteSpeed-Cache-Control
+    // response (when page cache is active) falls back to dispatch() so page-cache
+    // store, ErrorDocument, self-redirect, and purge handling run identically.
+    if resp.status() != StatusCode::OK
+        || lscache::has_purge_header(resp.headers())
+        || (state.page_cache.is_some() && lscache::has_control_header(resp.headers()))
+    {
+        return None;
+    }
+    if lscache::has_control_header(resp.headers()) {
+        lscache::strip_static_control_headers(resp.headers_mut());
+    }
+    state
+        .telemetry
+        .shard()
+        .served_php
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    finalize_response(
+        state,
+        &mut prep.ctx,
+        req.headers(),
+        &prep.chain,
+        &prep.orig_rel,
+        None,
+        &prep.orig_path,
+        &prep.orig_path,
+        &mut resp,
+    )
+    .await;
+    mark_auth_sensitive(
+        req.headers().contains_key(http::header::AUTHORIZATION),
+        &prep.ctx,
+        &mut resp,
+    );
+    apply_response_transforms(state, &prep.ctx, &mut resp, false).await;
+    stamp_bandwidth(
+        &prep.ctx,
+        &prep.orig_path,
+        state.serve_config.bandwidth_limit,
+        &mut resp,
+    );
+    if !state
+        .client_throttle
+        .allow_deferring_rejection(prep.ctx.client_ip)
+    {
+        return None;
+    }
+    Some(record_fast_serve(
+        state,
+        &prep.ctx,
+        prep.proto,
+        req,
+        prep.req_start,
+        resp,
+    ))
+}
+
 fn static_branch_bridge(
     state: &ServerState,
     ctx: &ReqCtx,
     chain: &[Arc<Htaccess>],
     path: &str,
+    relative_path: &str,
     method: &str,
     host_foreign: bool,
-    rewrite_unchanged: bool,
+    proxy_rewrite: bool,
+    local_rewrite: bool,
     rewrite_env_empty: bool,
 ) -> Option<FastBridge> {
     if host_foreign {
         return Some(FastBridge::HostForeign);
     }
-    if !rewrite_unchanged {
+    if proxy_rewrite {
         return Some(FastBridge::Rewritten);
     }
-    if !rewrite_env_empty && access_denied(chain, path, method, ctx) {
+    if ((local_rewrite || !rewrite_env_empty) && access_denied(chain, path, method, ctx))
+        || (local_rewrite && access_deny_dir(&state.acl, &ctx.vhost.doc_root, relative_path))
+    {
         return Some(FastBridge::AccessDenied);
     }
     if matching_proxy_context(ctx, path).is_some() {
         return Some(FastBridge::ProxyContext);
     }
+    if local_rewrite && suffix_routing::last_segment_is_script(state, ctx, path) {
+        return Some(FastBridge::Script);
+    }
     let index_files = effective_index_files(state, ctx, chain);
-    if !suffix_routing::vhost_scripts_enabled(state, ctx)
+    let scripts_enabled = suffix_routing::vhost_scripts_enabled(state, ctx);
+    let alternate_root = local_rewrite && static_location_override(ctx, path).is_some();
+    if (!scripts_enabled || alternate_root)
         && suffix_routing::path_may_resolve_to_script(state, ctx, path, index_files, chain)
+    {
+        return Some(FastBridge::Script);
+    }
+    if local_rewrite
+        && suffix_routing::path_may_resolve_to_precompressed_script(
+            state,
+            ctx,
+            path,
+            index_files,
+            chain,
+        )
     {
         return Some(FastBridge::Script);
     }
@@ -1559,62 +2731,109 @@ fn record_fast_memo_serve(
     } else {
         0
     };
-    state
-        .metrics
-        .requests_total
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let status = resp.status().as_u16();
-    let end = std::time::Instant::now();
-    state.telemetry.record_request(
-        proto,
-        status,
-        end.saturating_duration_since(req_start),
+    record_fast_memo_fields(
+        state,
         vhost_idx,
+        client_ip,
+        peer_unix,
+        proto,
+        req.method(),
+        req.uri(),
+        req.headers(),
+        req_start,
+        date_sec,
+        req_id,
+        log,
+        resp.status().as_u16(),
+        resp.body().content_length(),
     );
-    let Some(log) = log else {
-        return resp;
-    };
-    if let Some(body_bytes) = resp.body().content_length() {
-        let mask = log.format().header_mask();
-        let header = |name| req.headers().get(name).map(http::HeaderValue::as_bytes);
-        let referer = if (mask & 1) != 0 {
-            header(http::header::REFERER)
-        } else {
-            None
-        };
-        let user_agent = if (mask & 2) != 0 {
-            header(http::header::USER_AGENT)
-        } else {
-            None
-        };
-        let host = if (mask & 4) != 0 {
-            header(http::header::HOST)
-        } else {
-            None
-        };
-        let ts = std::time::UNIX_EPOCH + std::time::Duration::from_secs(date_sec);
-        chunk_access_line_at(log, end, |buf, format| {
-            hj_log::render_access_line_with_host_reqid_u64_into(
-                buf,
-                format,
-                client_ip,
-                ts,
-                req.method().as_str(),
-                req.uri().path(),
-                req.uri().query(),
-                proto.as_str(),
-                status,
-                body_bytes,
-                referer,
-                user_agent,
-                host,
-                None,
-                req_id,
-                peer_unix,
-            );
-        });
-    }
     resp
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_fast_memo_fields(
+    state: &ServerState,
+    vhost_idx: usize,
+    client_ip: IpAddr,
+    peer_unix: bool,
+    proto: Proto,
+    method: &http::Method,
+    uri: &http::Uri,
+    headers: &http::HeaderMap,
+    req_start: std::time::Instant,
+    date_sec: u64,
+    req_id: u64,
+    log: Option<&Arc<hj_log::AccessLogger>>,
+    status: u16,
+    body_bytes: Option<u64>,
+) {
+    state
+        .telemetry
+        .record_request(proto, status, std::time::Duration::ZERO, vhost_idx);
+    let Some(log) = log else {
+        return;
+    };
+    if let Some(body_bytes) = body_bytes {
+        record_fast_memo_log_only(
+            log, client_ip, peer_unix, proto, method, uri, headers, req_start, date_sec, req_id,
+            status, body_bytes,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_fast_memo_log_only(
+    log: &Arc<hj_log::AccessLogger>,
+    client_ip: IpAddr,
+    peer_unix: bool,
+    proto: Proto,
+    method: &http::Method,
+    uri: &http::Uri,
+    headers: &http::HeaderMap,
+    now: std::time::Instant,
+    date_sec: u64,
+    req_id: u64,
+    status: u16,
+    body_bytes: u64,
+) {
+    let mask = log.format().header_mask();
+    let header = |name| headers.get(name).map(http::HeaderValue::as_bytes);
+    let referer = if (mask & 1) != 0 {
+        header(http::header::REFERER)
+    } else {
+        None
+    };
+    let user_agent = if (mask & 2) != 0 {
+        header(http::header::USER_AGENT)
+    } else {
+        None
+    };
+    let host = if (mask & 4) != 0 {
+        header(http::header::HOST)
+    } else {
+        None
+    };
+    let ts = std::time::UNIX_EPOCH + std::time::Duration::from_secs(date_sec);
+    chunk_access_line_at(log, now, |buf, format| {
+        hj_log::render_access_line_with_host_reqid_u64_into(
+            buf,
+            format,
+            client_ip,
+            ts,
+            method.as_str(),
+            uri.path(),
+            uri.query(),
+            proto.as_str(),
+            status,
+            body_bytes,
+            referer,
+            user_agent,
+            host,
+            None,
+            req_id,
+            peer_unix,
+        );
+    });
 }
 
 fn record_fast_serve(
@@ -1637,10 +2856,6 @@ fn record_served_response(
     req_start: std::time::Instant,
     resp: Response,
 ) -> Response {
-    state
-        .metrics
-        .requests_total
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let status = resp.status().as_u16();
     state.telemetry.record_request(
         proto,
@@ -1740,10 +2955,6 @@ fn record_unrouted(
     req_start: std::time::Instant,
     mut resp: Response,
 ) -> Response {
-    state
-        .metrics
-        .requests_total
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     state.telemetry.record_request(
         proto,
         resp.status().as_u16(),
@@ -1783,6 +2994,7 @@ fn buffer_static_file(
     state: &Arc<ServerState>,
     vhost_id: u32,
     mut resp: Response,
+    read_mode: StaticReadMode,
 ) -> Option<Response> {
     let (len, cached) = match resp.body() {
         Body::Full(_) | Body::Empty => return Some(resp),
@@ -1808,7 +3020,7 @@ fn buffer_static_file(
         vhost_id,
         selected,
         resp.headers(),
-        StaticReadMode::Direct,
+        read_mode,
     ) {
         Some(bytes) => {
             *resp.body_mut() = Body::Full(bytes);
@@ -2045,10 +3257,6 @@ async fn handle_inner(
         .as_ref()
         .and_then(|acme| acme.response(listener, &req, is_tls))
     {
-        state
-            .metrics
-            .requests_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         state.telemetry.record_request(
             proto,
             response.status().as_u16(),
@@ -2377,14 +3585,7 @@ async fn handle_inner(
     }
     apply_request_id_header(&state, &ctx, &mut resp);
 
-    // (OPS1) Count every served request here — the single response funnel — so the
-    // counter is independent of whether access logging is enabled.
-    state
-        .metrics
-        .requests_total
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-    // (telemetry) Total wall time + protocol + status class, on the single funnel.
+    // Count and record every served request here, even without an access log.
     state.telemetry.record_request(
         proto,
         resp.status().as_u16(),
@@ -5445,8 +6646,7 @@ async fn dispatch(
     // handlers percent-DECODE `req.uri()`, so it is always re-encoded: one handler
     // decode then recovers exactly the path every access check above judged.
     if rewritten && cur_path.as_ref() != orig_path.as_str() {
-        let target = percent_encode_path(cur_path.as_ref());
-        match build_uri(&target, &cur_query) {
+        match build_rewritten_static_uri(&cur_path, &cur_query) {
             Some(uri) => *req.uri_mut() = uri,
             // Fail closed: an unparsable rewritten target must not silently
             // keep the PRE-rewrite URI in `req` — the static handler would
@@ -6139,14 +7339,18 @@ pub(super) async fn run_handler<H: TelemetryHandler>(
     finish_handler_result(ctx, &method, &path, result)
 }
 
+fn build_rewritten_static_uri(path: &str, query: &str) -> Option<http::Uri> {
+    build_uri(&percent_encode_path(path), query)
+}
+
 async fn run_static_head(
     handler: &hj_static::StaticFiles,
     ctx: &ReqCtx,
     request: &Request,
+    uri: &http::Uri,
     overrides: hj_static::StaticRequestOverrides<'_>,
 ) -> Response {
-    let head =
-        hj_static::StaticRequestHead::new(request.method(), request.uri(), request.headers());
+    let head = hj_static::StaticRequestHead::new(request.method(), uri, request.headers());
     let result = {
         #[cfg(feature = "otel")]
         {
@@ -6165,7 +7369,7 @@ async fn run_static_head(
             handler.handle_head(ctx, head, overrides).await
         }
     };
-    finish_handler_result(ctx, request.method(), request.uri().path(), result)
+    finish_handler_result(ctx, request.method(), uri.path(), result)
 }
 
 /// Borrowing counterpart to [`run_handler`] for terminal paths that need the
@@ -6375,10 +7579,6 @@ fn mtls_gate(
                 http::HeaderValue::from_static("0"),
             );
         }
-        state
-            .metrics
-            .requests_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(log) = &state.access_log {
             let log_uri = match req.uri().query() {
                 Some(q) => format!("{}?{}", req.uri().path(), q),
@@ -6987,6 +8187,7 @@ pub(super) fn maybe_cache_static(
 
 #[derive(Clone, Copy)]
 enum StaticReadMode {
+    CacheOnly,
     Direct,
     TokioBlocking,
 }
@@ -7049,6 +8250,7 @@ fn static_cached_bytes(
         Some(bytes)
     };
     let bytes = match read_mode {
+        StaticReadMode::CacheOnly => return None,
         StaticReadMode::Direct => read()?,
         StaticReadMode::TokioBlocking => tokio::task::block_in_place(read)?,
     };

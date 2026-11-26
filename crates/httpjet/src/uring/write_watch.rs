@@ -22,6 +22,7 @@ struct Entry {
     deadline: Instant,
     waker: Waker,
     expired: bool,
+    active: bool,
 }
 
 #[derive(Default)]
@@ -30,10 +31,131 @@ struct Table {
     free: Vec<usize>,
     live: usize,
     sweeping: bool,
+    coarse_now: Option<Instant>,
 }
 
 thread_local! {
     static TABLE: RefCell<Table> = RefCell::new(Table::default());
+}
+
+/// Coarse monotonic timestamp refreshed every `SWEEP_EVERY` (100 ms) while the
+/// core's sweeper is active; falls back to `Instant::now()` when idle. Suitable
+/// for multi-second idle/send-progress deadlines without a per-request vDSO call.
+#[inline]
+pub(crate) fn coarse_now() -> Instant {
+    TABLE.with(|t| t.borrow().coarse_now.unwrap_or_else(Instant::now))
+}
+
+/// Reusable per-connection deadline slot: allocated once on first pending poll
+/// and updated in-place across keep-alive reads/writes without `TABLE` free-list
+/// churn or `Waker::clone`/`drop` when the same connection task re-arms it.
+#[derive(Default)]
+pub(crate) struct Slot {
+    index: Option<usize>,
+}
+
+impl Slot {
+    #[inline]
+    pub(crate) fn expired(&self) -> bool {
+        self.index.is_some_and(|slot| {
+            TABLE.with(|t| {
+                t.borrow()
+                    .entries
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|e| e.active && e.expired)
+            })
+        })
+    }
+
+    #[inline]
+    pub(crate) fn arm(&mut self, deadline: Instant, waker: &Waker) {
+        TABLE.with(|t| {
+            let mut t = t.borrow_mut();
+            if let Some(entry) = self
+                .index
+                .and_then(|slot| t.entries.get_mut(slot))
+                .and_then(Option::as_mut)
+            {
+                entry.deadline = deadline;
+                entry.expired = false;
+                if !entry.waker.will_wake(waker) {
+                    entry.waker = waker.clone();
+                }
+                let activated = !entry.active;
+                entry.active = true;
+                if activated {
+                    t.live += 1;
+                }
+                if !t.sweeping {
+                    t.sweeping = true;
+                    t.coarse_now = Some(Instant::now());
+                    monoio::spawn(sweep());
+                }
+                return;
+            }
+            let entry = Some(Entry {
+                deadline,
+                waker: waker.clone(),
+                expired: false,
+                active: true,
+            });
+            let free = t.free.pop();
+            let slot = match free.and_then(|slot| Some((slot, t.entries.get_mut(slot)?))) {
+                Some((slot, free)) => {
+                    *free = entry;
+                    slot
+                }
+                None => {
+                    t.entries.push(entry);
+                    t.entries.len() - 1
+                }
+            };
+            self.index = Some(slot);
+            t.live += 1;
+            if !t.sweeping {
+                t.sweeping = true;
+                t.coarse_now = Some(Instant::now());
+                monoio::spawn(sweep());
+            }
+        });
+    }
+
+    #[inline]
+    pub(crate) fn disarm(&mut self) {
+        let Some(slot) = self.index else {
+            return;
+        };
+        let _ = TABLE.try_with(|t| {
+            let mut t = t.borrow_mut();
+            if let Some(entry) = t.entries.get_mut(slot).and_then(Option::as_mut)
+                && entry.active
+            {
+                entry.active = false;
+                entry.expired = false;
+                t.live -= 1;
+            }
+        });
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let Some(slot) = self.index else {
+            return;
+        };
+        let _ = TABLE.try_with(|t| {
+            let mut t = t.borrow_mut();
+            if let Some(entry) = t.entries.get_mut(slot)
+                && let Some(old) = entry.take()
+            {
+                if old.active {
+                    t.live -= 1;
+                }
+                t.free.push(slot);
+            }
+        });
+    }
 }
 
 /// One write's deadline. Registered on the write's first pending poll and removed on
@@ -79,6 +201,7 @@ impl Deadline {
                 deadline: self.at,
                 waker: waker.clone(),
                 expired: false,
+                active: true,
             });
             let free = t.free.pop();
             let slot = match free.and_then(|slot| Some((slot, t.entries.get_mut(slot)?))) {
@@ -95,6 +218,7 @@ impl Deadline {
             t.live += 1;
             if !t.sweeping {
                 t.sweeping = true;
+                t.coarse_now = Some(Instant::now());
                 monoio::spawn(sweep());
             }
         });
@@ -126,14 +250,16 @@ async fn sweep() {
         let mut due = Vec::new();
         let more = TABLE.with(|t| {
             let mut t = t.borrow_mut();
+            t.coarse_now = Some(now);
             for entry in t.entries.iter_mut().flatten() {
-                if !entry.expired && entry.deadline <= now {
+                if entry.active && !entry.expired && entry.deadline <= now {
                     entry.expired = true;
                     due.push(entry.waker.clone());
                 }
             }
             if t.live == 0 {
                 t.sweeping = false;
+                t.coarse_now = None;
             }
             t.live > 0
         });

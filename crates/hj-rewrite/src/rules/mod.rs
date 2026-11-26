@@ -39,6 +39,7 @@ pub struct RuleSet {
     /// so a request that matches none of the ~N redirect rules skips N individual
     /// regex evaluations. See [`Rule::prefilter_idx`].
     pub(crate) prefilter: PrefilterSlot,
+    prefilter_jumps: Option<PrefilterJumps>,
     /// Precomputed at parse time: this ruleset's outcome is a pure function of the
     /// base cache key (vhost, scheme, method, host, path, query) PLUS the values of
     /// [`Self::cache_key_vars`]. True iff every `%{VAR}` read is either cache-safe
@@ -937,6 +938,49 @@ impl PrefilterSet {
     }
 }
 
+/// Maps the DFA's pattern IDs back to source-order rule indexes. Chained
+/// rules must still run on a miss because a failed [C] has control effects.
+#[derive(Debug)]
+struct PrefilterJumps {
+    pattern_rules: Box<[usize]>,
+    always: Box<[usize]>,
+}
+
+impl PrefilterJumps {
+    fn new(rules: &[Rule]) -> Self {
+        let mut pattern_rules = Vec::new();
+        let mut always = Vec::new();
+        for (idx, rule) in rules.iter().enumerate() {
+            if rule.prefilter_idx.is_some() {
+                pattern_rules.push(idx);
+            }
+            if rule.prefilter_idx.is_none() || rule.flags.chain || rule.match_total.is_some() {
+                always.push(idx);
+            }
+        }
+        Self {
+            pattern_rules: pattern_rules.into(),
+            always: always.into(),
+        }
+    }
+
+    fn candidates<'a>(&self, hits: &PatternSet, buf: &'a mut [usize]) -> Option<&'a [usize]> {
+        let count = self.always.len().checked_add(hits.len())?;
+        let candidates = buf.get_mut(..count)?;
+        candidates[..self.always.len()].copy_from_slice(&self.always);
+        // PatternSet's iterator scans by capacity. Stop after the last hit,
+        // including the common case where no patterns matched.
+        for (out, id) in candidates[self.always.len()..]
+            .iter_mut()
+            .zip(hits.iter().take(hits.len()))
+        {
+            *out = *self.pattern_rules.get(id.as_usize())?;
+        }
+        candidates.sort_unstable();
+        Some(candidates)
+    }
+}
+
 struct PooledPatternSet(Option<PatternSet>);
 
 impl PooledPatternSet {
@@ -1267,6 +1311,12 @@ pub fn evaluate_with_engine(rs: &RuleSet, input: &RewriteInput, engine_on: bool)
         .get()
         .map(|pf| pf.matches(prefilter_target.as_ref()));
     let hits = hits.as_ref().and_then(PooledPatternSet::as_ref_set);
+    let mut candidate_buffer = [0usize; 64];
+    let candidates = rs
+        .prefilter_jumps
+        .as_ref()
+        .zip(hits)
+        .and_then(|(plan, hits)| plan.candidates(hits, &mut candidate_buffer));
 
     // One pass, as OLS `processRuleSet`: a changed URI is final for this ruleset
     // (a target in another directory is handed to that directory's chain by the
@@ -1277,7 +1327,7 @@ pub fn evaluate_with_engine(rs: &RuleSet, input: &RewriteInput, engine_on: bool)
     // `ended`: an `[END]` fired, so the outcome tells the pipeline to stop
     // subsequent rulesets / `.htaccess` processing.
     let ended = loop {
-        match run_pass(rs, input, &mut state, hits) {
+        match run_pass(rs, input, &mut state, hits, candidates) {
             PassResult::Terminal(outcome) => return outcome,
             PassResult::Restart => {}
             PassResult::Continue { end } => break end,

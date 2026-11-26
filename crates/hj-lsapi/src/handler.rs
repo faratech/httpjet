@@ -618,7 +618,128 @@ fn collapse_rel(rel: &str) -> PathBuf {
     out
 }
 
+/// Largest inline body collected by the on-core monoio LSAPI fast path.
+pub const MONOIO_INLINE_BODY_CAP: usize = INLINE_BODY_CAP;
+
+/// Log an LSAPI STDERR_STREAM payload identically to the Tokio handler.
+pub fn log_lsapi_stderr(body: &[u8]) {
+    log_stderr(body);
+}
+
+/// Assemble an inline body from collected RESP_STREAM chunks identically to the
+/// Tokio handler.
+pub fn finalize_inline_body(chunks: Vec<Bytes>, len: usize) -> Bytes {
+    inline_body(chunks, len)
+}
+
+/// Parse a `RESP_HEADER` packet into an `http::Response` head plus
+/// `(enforced_content_length, unbuffered_flag)` identically to the Tokio handler.
+pub fn parse_inline_response_head(
+    resp_header: RespHeader,
+    is_head: bool,
+    acquire: Duration,
+    ttfb: Duration,
+) -> Result<(Response, Option<u64>, bool), HandlerError> {
+    let declared_len = parse_response_content_length(&resp_header.headers).map_err(|reason| {
+        HandlerError::BadGateway(format!("invalid lsapi Content-Length: {reason}"))
+    })?;
+    let status = http::StatusCode::from_u16(resp_header.status).unwrap_or(http::StatusCode::OK);
+    let mut head = http::HeaderMap::with_capacity(
+        resp_header.headers.len() + usize::from(declared_len.is_some()) + RESPONSE_HEADER_SLACK,
+    );
+    let mut has_status_header = None;
+    for (name, value) in resp_header.headers {
+        if name.as_str().eq_ignore_ascii_case("status") {
+            if let Some(code) = value
+                .to_str()
+                .ok()
+                .and_then(|v| v.split_whitespace().next())
+                .and_then(|c| c.parse::<u16>().ok())
+                .and_then(|c| http::StatusCode::from_u16(c).ok())
+            {
+                has_status_header = Some(code);
+            }
+            continue;
+        }
+        if name == http::header::CONTENT_LENGTH {
+            continue;
+        }
+        head.try_append(name, value)
+            .map_err(|e| HandlerError::Other(format!("build response: {e}")))?;
+    }
+    if let Some(len) = declared_len {
+        head.try_append(http::header::CONTENT_LENGTH, len.into())
+            .map_err(|e| HandlerError::Other(format!("build response: {e}")))?;
+    }
+    let status = has_status_header.unwrap_or(status);
+    if status.is_informational() {
+        return Err(HandlerError::BadGateway(format!(
+            "lsapi final status {} is informational",
+            status.as_u16()
+        )));
+    }
+    let enforced_len = if hj_core::response_body_forbidden(is_head, status) {
+        None
+    } else {
+        declared_len
+    };
+    let unbuffered = accel_buffering_off(&head);
+    let mut response = Response::new(Body::Empty);
+    *response.status_mut() = status;
+    *response.headers_mut() = head;
+    response
+        .extensions_mut()
+        .insert(LsapiTiming { acquire, ttfb });
+    Ok((response, enforced_len, unbuffered))
+}
+
 impl Lsapi {
+    /// Fast non-blocking health check for the on-core monoio LSAPI path.
+    pub fn is_admitted_fast(&self) -> bool {
+        !self.supervisor_is_bad()
+    }
+
+    /// Idle read timeout configured for this LSAPI handler.
+    pub fn read_timeout_duration(&self) -> Duration {
+        self.read_timeout
+    }
+
+    /// Optional total processing-time deadline configured for this LSAPI handler.
+    pub fn max_process_time_duration(&self) -> Option<Duration> {
+        self.max_process_time
+    }
+
+    /// Encode a framed `BEGIN_REQUEST` packet for a bodyless GET/HEAD request
+    /// directly into `out`, using the exact same CGI env and wire-header logic
+    /// as [`Self::handle_retaining_head`].
+    pub fn encode_bodyless_begin_request(
+        &self,
+        req: &Request,
+        ctx: &ReqCtx,
+        ls: &LsapiScript,
+        out: &mut bytes::BytesMut,
+    ) -> Result<(), HandlerError> {
+        let mut builder = CgiEnvBuilder::new(&ls.script)
+            .extra_ref(&self.base_env)
+            .header_block(!self.full_header_env);
+        if let Some(sn) = &ls.script_name {
+            builder = builder.script_name(sn.clone());
+        }
+        if let Some(pi) = &ls.path_info {
+            builder = builder.path_info(pi.clone());
+        }
+        let env = builder.build_with_content_length(req, ctx, None);
+        let headers = collect_wire_headers(req, None, ctx.forwarding_trusted);
+        if lsapi_fields_overflow_u16(&env)
+            || lsapi_fields_overflow_u16(&headers)
+            || lsapi_special_env_overflow_u16(&ls.special_env)
+        {
+            return Err(HandlerError::RequestHeaderFieldsTooLarge);
+        }
+        build_begin_request_framed_into(out, &env, &ls.special_env, &headers, 0);
+        Ok(())
+    }
+
     /// Dispatch while returning the consumed request's head to the caller. The
     /// server pipeline needs the original headers only if post-dispatch target
     /// auth or ErrorDocument policy runs. Consuming the request lets the
@@ -677,6 +798,10 @@ impl Lsapi {
             Some(len) if !php_prereads_post(&req, len, &special_env) => {
                 body_lease = None;
                 None
+            }
+            None if hj_core::body::is_empty_incoming(req.body()) => {
+                body_lease = None;
+                Some(Bytes::new())
             }
             _ => {
                 let (b, lease) = match collect_to_cap(
@@ -1505,35 +1630,26 @@ impl Lsapi {
             }
         }
 
-        // Split so the response pump owns a read half + a ReturnGuard like the
-        // streaming path. The write half is already done; deposit it immediately
-        // so a clean read can re-pool the socket.
-        let (read_half, write_half, guard) = conn.into_split();
-        if !body.is_empty() {
+        let sent_at = Instant::now();
+        let read_result = if body.is_empty() {
+            self.read_response_unsplit(conn, body_preread, false, acquire, sent_at, is_head)
+                .await
+        } else {
+            let (read_half, write_half, guard) = conn.into_split();
             if body_preread {
                 guard.mark_preread_body();
             } else {
                 guard.mark_carried_body();
             }
-        }
-        guard.deposit_write(write_half);
-        // No concurrent body pump here, so the cancel notify has no listener; pass
-        // a fresh one to keep one read_response signature.
-        let cancel = Arc::new(tokio::sync::Notify::new());
-        let sent_at = Instant::now();
-        match self
-            .read_response(
-                read_half,
-                Arc::new(guard),
-                cancel,
-                None,
-                inflight,
-                acquire,
-                sent_at,
-                is_head,
+            guard.deposit_write(write_half);
+            let guard = Arc::new(guard);
+            let cancel = Arc::new(tokio::sync::Notify::new());
+            self.read_response(
+                read_half, guard, cancel, None, inflight, acquire, sent_at, is_head,
             )
             .await
-        {
+        };
+        match read_result {
             Ok(resp) => Attempt::Done(Ok(resp)),
             Err(fail) => {
                 // RESET RETRY: a connection reset/closed before any response byte, for
@@ -1551,6 +1667,345 @@ impl Lsapi {
                 }
             }
         }
+    }
+
+    /// Fast-path response reader for buffered requests (`dispatch_buffered`): reads
+    /// directly off the unsplit [`PooledConn`] without `into_split()`, `ReturnGuard`,
+    /// `Arc<Notify>`, `Mutex` locks, or `reunite()`. Only splits the socket if the
+    /// response requires async streaming or a post-body `RESP_END` drain task.
+    #[allow(clippy::too_many_arguments)]
+    async fn read_response_unsplit(
+        &self,
+        mut conn: crate::pool::PooledConn,
+        body_preread: bool,
+        carried_body: bool,
+        acquire: Duration,
+        sent_at: Instant,
+        is_head: bool,
+    ) -> Result<Response, ReadFail> {
+        let deadline = self.max_process_time.map(|d| Instant::now() + d);
+        let mut reader = PacketReader::with_deadline(self.read_timeout, deadline);
+        let mut accept_worker_pid = true;
+        let mut saw_packet = false;
+        let resp_header = loop {
+            let next = reader.next(conn.stream_mut()).await;
+            if matches!(next, Ok(Some(_))) {
+                saw_packet = true;
+            }
+            match next {
+                Ok(Some(frame)) => match frame.ptype {
+                    PacketType::RespHeader => {
+                        match RespHeader::parse_flagged(&frame.body, frame.flag) {
+                            Ok(h) => break h,
+                            Err(e) => {
+                                conn.poison();
+                                return Err(ReadFail::terminal(HandlerError::BadGateway(format!(
+                                    "lsapi resp header: {e}"
+                                ))));
+                            }
+                        }
+                    }
+                    PacketType::StderrStream => {
+                        if accept_worker_pid {
+                            if let Some(pid) = lsapi_worker_pid(&frame.body) {
+                                conn.record_worker_pid(pid);
+                            } else {
+                                log_stderr(&frame.body);
+                            }
+                            accept_worker_pid = false;
+                        } else {
+                            log_stderr(&frame.body);
+                        }
+                    }
+                    PacketType::ReqReceived => {
+                        accept_worker_pid = false;
+                    }
+                    PacketType::RespEnd | PacketType::ConnClose => {
+                        conn.poison();
+                        return Err(ReadFail::terminal(HandlerError::BadGateway(
+                            "lsapi response ended before headers".into(),
+                        )));
+                    }
+                    PacketType::InternalError => {
+                        conn.poison();
+                        return Err(ReadFail::terminal(HandlerError::BadGateway(
+                            "lsapi internal error".into(),
+                        )));
+                    }
+                    PacketType::RespStream
+                    | PacketType::BeginRequest
+                    | PacketType::AbortRequest => {
+                        conn.poison();
+                        return Err(ReadFail::terminal(HandlerError::BadGateway(
+                            "lsapi response packet before headers".into(),
+                        )));
+                    }
+                },
+                Ok(None) => {
+                    conn.poison();
+                    return Err(ReadFail::retryable(HandlerError::BadGateway(
+                        "lsapi closed before headers".into(),
+                    )));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    conn.poison();
+                    return Err(ReadFail::terminal(HandlerError::GatewayTimeout));
+                }
+                Err(e) => {
+                    conn.poison();
+                    let transport_drop = matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionAborted
+                    );
+                    if !saw_packet && reader.unparsed().is_empty() && transport_drop {
+                        let mut fail = ReadFail::retryable(HandlerError::BadGateway(format!(
+                            "lsapi read: {e}"
+                        )));
+                        fail.unread = e.kind() == std::io::ErrorKind::ConnectionReset;
+                        return Err(fail);
+                    }
+                    return Err(ReadFail::terminal(HandlerError::BadGateway(format!(
+                        "lsapi read: {e}"
+                    ))));
+                }
+            }
+        };
+        let ttfb = sent_at.elapsed();
+
+        let declared_len = match parse_response_content_length(&resp_header.headers) {
+            Ok(len) => len,
+            Err(reason) => {
+                conn.poison();
+                return Err(ReadFail::terminal(HandlerError::BadGateway(format!(
+                    "invalid lsapi Content-Length: {reason}"
+                ))));
+            }
+        };
+        let status = http::StatusCode::from_u16(resp_header.status).unwrap_or(http::StatusCode::OK);
+        let mut head = http::HeaderMap::with_capacity(
+            resp_header.headers.len() + usize::from(declared_len.is_some()) + RESPONSE_HEADER_SLACK,
+        );
+        let mut has_status_header = None;
+        for (name, value) in resp_header.headers {
+            if name.as_str().eq_ignore_ascii_case("status") {
+                if let Some(code) = value
+                    .to_str()
+                    .ok()
+                    .and_then(|v| v.split_whitespace().next())
+                    .and_then(|c| c.parse::<u16>().ok())
+                    .and_then(|c| http::StatusCode::from_u16(c).ok())
+                {
+                    has_status_header = Some(code);
+                }
+                continue;
+            }
+            if name == http::header::CONTENT_LENGTH {
+                continue;
+            }
+            if let Err(e) = head.try_append(name, value) {
+                conn.poison();
+                return Err(ReadFail::terminal(HandlerError::Other(format!(
+                    "build response: {e}"
+                ))));
+            }
+        }
+        if let Some(len) = declared_len
+            && let Err(e) = head.try_append(http::header::CONTENT_LENGTH, len.into())
+        {
+            conn.poison();
+            return Err(ReadFail::terminal(HandlerError::Other(format!(
+                "build response: {e}"
+            ))));
+        }
+        let status = has_status_header.unwrap_or(status);
+        if status.is_informational() {
+            conn.poison();
+            return Err(ReadFail::terminal(HandlerError::BadGateway(format!(
+                "lsapi final status {} is informational",
+                status.as_u16()
+            ))));
+        }
+        let enforced_len = if hj_core::response_body_forbidden(is_head, status) {
+            None
+        } else {
+            declared_len
+        };
+        let unbuffered = accel_buffering_off(&head);
+        let mut response = Response::new(Body::Empty);
+        *response.status_mut() = status;
+        *response.headers_mut() = head;
+        response
+            .extensions_mut()
+            .insert(LsapiTiming { acquire, ttfb });
+
+        let complete_at = enforced_len.filter(|&len| len <= INLINE_BODY_CAP as u64 && !unbuffered);
+        let mut prelude: Vec<Bytes> = Vec::new();
+        let mut prelude_len: usize = 0;
+        let mut fills = 0;
+        enum InlineEnd {
+            Repool,
+            Poison,
+            Tail(u64),
+        }
+        let inline_end: Option<InlineEnd> = loop {
+            match reader.try_parse() {
+                Ok(Some(frame)) => match frame.ptype {
+                    PacketType::RespStream => {
+                        prelude_len += frame.body.len();
+                        if !frame.body.is_empty() {
+                            prelude.push(frame.body);
+                        }
+                        if prelude_len > INLINE_BODY_CAP {
+                            break None;
+                        }
+                    }
+                    PacketType::StderrStream => log_stderr(&frame.body),
+                    PacketType::ReqReceived => {}
+                    PacketType::RespEnd => break Some(InlineEnd::Repool),
+                    PacketType::ConnClose => break Some(InlineEnd::Poison),
+                    PacketType::InternalError => {
+                        conn.poison();
+                        return Err(ReadFail::terminal(HandlerError::BadGateway(
+                            "lsapi internal error".into(),
+                        )));
+                    }
+                    _ => {}
+                },
+                Ok(None) => {
+                    if let Some(len) = complete_at {
+                        if prelude_len as u64 >= len {
+                            break Some(InlineEnd::Tail(len));
+                        }
+                        if fills < INLINE_FILL_READS && reader.try_fill_stream(conn.stream_mut()) {
+                            fills += 1;
+                            continue;
+                        }
+                    }
+                    break None;
+                }
+                Err(e) => {
+                    conn.poison();
+                    return Err(ReadFail::terminal(HandlerError::BadGateway(format!(
+                        "lsapi resp parse: {e}"
+                    ))));
+                }
+            }
+        };
+
+        if let Some(end) = inline_end {
+            if matches!(end, InlineEnd::Poison) && enforced_len.is_none() {
+                conn.poison();
+                return Err(ReadFail::terminal(HandlerError::BadGateway(
+                    "lsapi connection closed before RESP_END".into(),
+                )));
+            }
+            if let Some(len) = enforced_len
+                && (prelude_len as u64) < len
+            {
+                conn.poison();
+                return Err(ReadFail::terminal(HandlerError::BadGateway(format!(
+                    "lsapi response body truncated: declared {len} bytes, received {prelude_len}"
+                ))));
+            }
+            let over_delivered = enforced_len.is_some_and(|len| prelude_len as u64 > len);
+            let body = inline_body(
+                prelude,
+                enforced_len.map_or(prelude_len, |len| len as usize),
+            );
+            let path = match end {
+                InlineEnd::Repool
+                    if !over_delivered
+                        && !reader.has_buffered()
+                        && (!carried_body || body_preread) =>
+                {
+                    // Clean inline completion: dropping `conn` returns the unsplit
+                    // UnixStream straight to the idle pool — zero split/Arc/Mutex.
+                    drop(conn);
+                    ResponseBodyPath::Inline
+                }
+                InlineEnd::Repool | InlineEnd::Poison => {
+                    if carried_body
+                        && !body_preread
+                        && !over_delivered
+                        && !reader.has_buffered()
+                        && matches!(end, InlineEnd::Repool)
+                    {
+                        self.pool.note_body_conn_close();
+                    }
+                    conn.poison();
+                    drop(conn);
+                    ResponseBodyPath::Inline
+                }
+                InlineEnd::Tail(len) => {
+                    let (read_half, write_half, guard) = conn.into_split();
+                    if carried_body {
+                        if body_preread {
+                            guard.mark_preread_body();
+                        } else {
+                            guard.mark_carried_body();
+                        }
+                    }
+                    guard.deposit_write(write_half);
+                    let cancel = Arc::new(tokio::sync::Notify::new());
+                    tokio::spawn(pump_body(
+                        ResponseTail {
+                            read_half,
+                            reader,
+                            guard: Arc::new(guard),
+                            cancel,
+                            declared_len: enforced_len,
+                        },
+                        None,
+                        Vec::new(),
+                        len,
+                        over_delivered,
+                    ));
+                    ResponseBodyPath::InlineTail
+                }
+            };
+            self.pool.note_response_body(path);
+            response
+                .extensions_mut()
+                .insert(hj_core::FreshBody::of(&body));
+            *response.body_mut() = Body::Full(body);
+            return Ok(response);
+        }
+
+        // Slow path: response needs async streaming — split `conn` now and hand off
+        // to the existing streaming body pump.
+        let (read_half, write_half, guard) = conn.into_split();
+        if carried_body {
+            if body_preread {
+                guard.mark_preread_body();
+            } else {
+                guard.mark_carried_body();
+            }
+        }
+        guard.deposit_write(write_half);
+        let guard = Arc::new(guard);
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        let (tx, body) = Channel::<Bytes, BoxError>::new(8);
+        tokio::spawn(pump_body(
+            ResponseTail {
+                read_half,
+                reader,
+                guard,
+                cancel,
+                declared_len: enforced_len,
+            },
+            Some(tx),
+            prelude,
+            0,
+            false,
+        ));
+        self.pool.note_response_body(ResponseBodyPath::Streamed);
+        if unbuffered {
+            response.extensions_mut().insert(hj_core::ProxiedBody);
+        }
+        *response.body_mut() = Body::Stream(BoxBody::new(body));
+        Ok(response)
     }
 
     /// Read RESP_HEADER off `read_half`, build the response head, and spawn the
@@ -2696,6 +3151,28 @@ impl PacketReader {
         }
     }
 
+    fn try_fill_stream(&mut self, r: &tokio::net::UnixStream) -> bool {
+        if self.parked.is_some() {
+            return false;
+        }
+        self.ensure_read_room();
+        match r.try_read_buf(&mut self.buf) {
+            Ok(n) => n > 0,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                false
+            }
+            Err(e) => {
+                self.parked = Some(e);
+                false
+            }
+        }
+    }
+
     /// Read the next complete LSAPI packet. Returns `Ok(None)` on clean EOF.
     async fn next<R>(&mut self, r: &mut R) -> std::io::Result<Option<LsapiFrame>>
     where
@@ -2717,6 +3194,12 @@ impl PacketReader {
     where
         R: AsyncReadExt + Unpin,
     {
+        // Fast path: if a complete LSAPI frame is already buffered in `self.buf`
+        // (common when StderrStream + RespHeader + RespStream + RespEnd arrive in
+        // one socket read), return it without constructing a Tokio `Sleep` timer.
+        if let Some(frame) = self.try_parse()? {
+            return Ok(Some(frame));
+        }
         // (LST1) Reuse ONE pinned timer across every read in this call instead of
         // allocating a fresh `tokio::time::timeout` (hence a new `Sleep`) per loop
         // iteration — a PHP response arriving in N TCP segments otherwise churns N

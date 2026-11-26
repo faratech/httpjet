@@ -606,6 +606,9 @@ impl RuleSet {
             }
         }
         if !prefilter_pats.is_empty() {
+            if set.rules.len() >= 32 {
+                set.prefilter_jumps = Some(super::PrefilterJumps::new(&set.rules));
+            }
             // A build over the DFA size limit leaves the slot empty for good: the
             // rules are then evaluated one by one, unfiltered.
             set.prefilter = if defer_prefilter {

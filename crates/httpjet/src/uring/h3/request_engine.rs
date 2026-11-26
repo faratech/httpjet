@@ -13,13 +13,13 @@ use crate::uring::bridge::{Bridge, BridgeCtx, BridgeResp};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 #[repr(u8)]
 pub(crate) enum H3EngineMode {
-    #[default]
     Legacy = 0,
     Accelerated = 1,
+    #[default]
     Auto = 2,
 }
 
-static ENGINE_MODE: AtomicU8 = AtomicU8::new(H3EngineMode::Legacy as u8);
+static ENGINE_MODE: AtomicU8 = AtomicU8::new(H3EngineMode::Auto as u8);
 static ON_CORE_RESPONSES: AtomicU64 = AtomicU64::new(0);
 static BRIDGED_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static TELEMETRY_FALLBACKS: AtomicU64 = AtomicU64::new(0);
