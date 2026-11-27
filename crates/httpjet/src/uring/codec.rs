@@ -186,21 +186,24 @@ fn trailer_line_valid(line: &[u8]) -> bool {
 }
 
 /// Parse a chunk-size line (hex size, optional `;ext`). Returns None on garbage.
+/// RFC 9112 §7.1: `chunk = chunk-size [ chunk-ext ] CRLF`, `chunk-size = 1*HEXDIG`.
+/// Leading OWS is forbidden; trailing OWS (BWS) is permitted only immediately before `;` (#1316).
 pub fn parse_chunk_size(line: &[u8]) -> Option<usize> {
     if !framing_line_clean(line) {
         return None;
     }
-    let hex = line.split(|&b| b == b';').next().unwrap_or(line);
-    // (#232 class) Validate 1*HEXDIG ourselves after trimming ASCII OWS:
-    // `usize::from_str_radix` accepts a leading '+' ("+2" → 2), which RFC 9112
-    // §7.1 forbids and conformant stacks reject.
-    let start = hex.iter().position(|b| *b != b' ' && *b != b'\t')?;
-    let end = hex.iter().rposition(|b| *b != b' ' && *b != b'\t')?;
-    let trimmed = &hex[start..=end];
-    if trimmed.is_empty() || !trimmed.iter().all(u8::is_ascii_hexdigit) {
+    let hex = match line.iter().position(|&b| b == b';') {
+        Some(semi) => {
+            let before = line.get(..semi)?;
+            let end = before.iter().rposition(|b| *b != b' ' && *b != b'\t')?;
+            before.get(..=end)?
+        }
+        None => line,
+    };
+    if hex.is_empty() || !hex.iter().all(u8::is_ascii_hexdigit) {
         return None;
     }
-    usize::from_str_radix(std::str::from_utf8(trimmed).ok()?, 16).ok()
+    usize::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()
 }
 
 /// Heap a chunked upload has committed: the decoded payload plus the raw chunk

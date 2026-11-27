@@ -817,6 +817,52 @@ impl<Data> ConnectionCommon<Data> {
         res
     }
 
+    /// Borrow-by-move the internal TLS deframer buffer so an async completion
+    /// runtime (such as monoio/io_uring) can read ciphertext directly into it
+    /// without an intermediate read buffer or `memcpy`.
+    ///
+    /// Returns:
+    /// - `Ok(None)` if `close_notify` has already been received (equivalent to
+    ///   `read_tls` returning `Ok(0)`).
+    /// - `Ok(Some((buf, max_len)))` where `buf` contains any unread prefix bytes
+    ///   and the caller must append at most `max_len - buf.len()` bytes before
+    ///   calling [`Self::commit_read_tls_buf`] (on `Ok(n)`) or
+    ///   [`Self::restore_read_tls_buf`] (on error).
+    /// - `Err(e)` if backpressure applies (`received_plaintext` or deframer buffer
+    ///   is full).
+    pub fn take_read_tls_buf(&mut self) -> Result<Option<(alloc::vec::Vec<u8>, usize)>, io::Error> {
+        if self.received_plaintext.is_full() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "received plaintext buffer full",
+            ));
+        }
+
+        if self.has_received_close_notify {
+            return Ok(None);
+        }
+
+        self.deframer_buffer
+            .take_for_read(self.core.hs_deframer.is_active())
+            .map(Some)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    }
+
+    /// Return a buffer obtained from [`Self::take_read_tls_buf`] after reading
+    /// `bytes_read` new ciphertext bytes into it.
+    pub fn commit_read_tls_buf(&mut self, buf: alloc::vec::Vec<u8>, bytes_read: usize) {
+        self.deframer_buffer.restore_after_read(buf);
+        if bytes_read == 0 {
+            self.has_seen_eof = true;
+        }
+    }
+
+    /// Return a buffer obtained from [`Self::take_read_tls_buf`] unchanged after
+    /// an I/O error.
+    pub fn restore_read_tls_buf(&mut self, buf: alloc::vec::Vec<u8>) {
+        self.deframer_buffer.restore_after_read(buf);
+    }
+
     /// Writes TLS messages to `wr`.
     ///
     /// On success, this function returns `Ok(n)` where `n` is a number of bytes written to `wr`
@@ -838,17 +884,37 @@ impl<Data> ConnectionCommon<Data> {
     /// Move a bounded batch of queued TLS records to a transport that can hold
     /// their allocations until asynchronous completion. Send in order or close.
     pub fn take_tls_write_batch(&mut self) -> Option<alloc::vec::Vec<alloc::vec::Vec<u8>>> {
-        if self.sendable_tls.len() < 16 * 1024 {
-            return None;
+        let mut batch = alloc::vec::Vec::with_capacity(16);
+        if self.take_tls_write_batch_into(&mut batch) {
+            Some(batch)
+        } else {
+            None
         }
-        let mut batch = alloc::vec::Vec::with_capacity(8);
-        while batch.len() < 16 {
+    }
+
+    /// Returns true when enough TLS ciphertext is queued to take a multi-record batch.
+    #[inline]
+    pub fn has_tls_write_batch(&self) -> bool {
+        self.sendable_tls.len() >= 16 * 1024
+    }
+
+    /// Reuse caller-owned storage to move a bounded batch of queued TLS records
+    /// without allocating a new `Vec` per flush.
+    pub fn take_tls_write_batch_into(
+        &mut self,
+        out: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    ) -> bool {
+        if self.sendable_tls.len() < 16 * 1024 {
+            return false;
+        }
+        out.clear();
+        while out.len() < 32 {
             let Some(record) = self.sendable_tls.pop() else {
                 break;
             };
-            batch.push(record);
+            out.push(record);
         }
-        Some(batch)
+        !out.is_empty()
     }
 }
 

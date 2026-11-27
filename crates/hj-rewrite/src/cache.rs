@@ -116,6 +116,38 @@ struct Entry {
     dir_missing: bool,
 }
 
+static NEXT_CACHE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Per-worker thread-local micro-cache for [`HtaccessCache`] directory lookups.
+/// Bounded by `valid_until` (`checked_at + revalidate_ttl`) and keyed by
+/// `(cache_id, epoch, path)`, avoiding `DashMap` shard locks and SipHash on
+/// cold-path directory walks while preventing pointer ABA and invalidating
+/// immediately on `HtaccessCache::clear()` (#1289). Bypassed when
+/// `revalidate_ttl.is_zero()`.
+struct TlsHtaccessEntry {
+    cache_id: u64,
+    epoch: u64,
+    path: PathBuf,
+    parsed: Option<Arc<Htaccess>>,
+    dir_missing: bool,
+    valid_until: Instant,
+}
+
+const TLS_HTACCESS_SLOTS: usize = 256;
+
+thread_local! {
+    static HTACCESS_TLS_CACHE: std::cell::RefCell<[Option<TlsHtaccessEntry>; TLS_HTACCESS_SLOTS]> =
+        const { std::cell::RefCell::new([const { None }; TLS_HTACCESS_SLOTS]) };
+}
+
+fn tls_htaccess_slot(cache_id: u64, path: &Path) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    cache_id.hash(&mut h);
+    path.hash(&mut h);
+    (h.finish() as usize) & (TLS_HTACCESS_SLOTS - 1)
+}
+
 /// Thread-safe cache of parsed `.htaccess` files, keyed by absolute directory.
 ///
 /// On each [`load_chain`](HtaccessCache::load_chain), every directory from the
@@ -124,8 +156,8 @@ struct Entry {
 pub struct HtaccessCache {
     /// Sharded concurrent map: every request reads this on the hot path, so a
     /// single `Mutex` here was the dominant lock-contention (futex) source under
-    /// load. `DashMap` shards the locking across many sub-maps.
-    inner: DashMap<PathBuf, Entry>,
+    /// load. `DashMap` shards the locking across many sub-maps with `FxBuildHasher`.
+    inner: DashMap<PathBuf, Entry, rustc_hash::FxBuildHasher>,
     /// How long a validated entry is trusted before re-`stat`-ing. Production
     /// uses [`REVALIDATE_TTL`]; tests can set `0` to force per-call revalidation.
     revalidate_ttl: Duration,
@@ -145,6 +177,10 @@ pub struct HtaccessCache {
     parse_locks: Box<[Mutex<()>]>,
     /// Access files parsed since this cache was created.
     parses: AtomicU64,
+    /// Monotonic cache instance ID (prevents pointer ABA in `HTACCESS_TLS_CACHE`).
+    id: u64,
+    /// Invalidated on `clear()` so worker TLS micro-caches never serve cleared entries.
+    epoch: AtomicU64,
 }
 
 /// Stripes of [`HtaccessCache::parse_locks`].
@@ -210,7 +246,7 @@ impl HtaccessCache {
     /// Create a cache with an explicit revalidation TTL (`0` = stat every call).
     pub fn with_revalidate_ttl(revalidate_ttl: Duration) -> Self {
         HtaccessCache {
-            inner: DashMap::new(),
+            inner: DashMap::with_hasher(rustc_hash::FxBuildHasher),
             revalidate_ttl,
             count: AtomicUsize::new(0),
             negative_count: AtomicUsize::new(0),
@@ -218,6 +254,8 @@ impl HtaccessCache {
             last_sweep_ms: std::sync::atomic::AtomicU64::new(0),
             parse_locks: (0..PARSE_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
             parses: AtomicU64::new(0),
+            id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
+            epoch: AtomicU64::new(0),
         }
     }
 
@@ -328,7 +366,22 @@ impl HtaccessCache {
         request_path: &str,
         access_file_name: &str,
     ) -> (Vec<(PathBuf, Arc<Htaccess>)>, Instant) {
-        let now = Instant::now();
+        self.load_chain_with_dirs_and_deadline_at(
+            docroot,
+            request_path,
+            access_file_name,
+            Instant::now(),
+        )
+    }
+
+    /// Same as [`Self::load_chain_with_dirs_and_deadline`] reusing a caller-captured `now`.
+    pub fn load_chain_with_dirs_and_deadline_at(
+        &self,
+        docroot: &Path,
+        request_path: &str,
+        access_file_name: &str,
+        now: Instant,
+    ) -> (Vec<(PathBuf, Arc<Htaccess>)>, Instant) {
         let mut deadline = now + self.revalidate_ttl;
         let mut chain = Vec::new();
 
@@ -417,18 +470,51 @@ impl HtaccessCache {
         now: Instant,
     ) -> (Option<Arc<Htaccess>>, bool, Instant) {
         cur.push(access_file_name);
+        let cur_epoch = self.epoch.load(Ordering::Acquire);
+        if !self.revalidate_ttl.is_zero() {
+            let slot = tls_htaccess_slot(self.id, cur.as_path());
+            let tls_hit = HTACCESS_TLS_CACHE.with(|cell| {
+                let table = cell.borrow();
+                let entry = table.get(slot)?.as_ref()?;
+                if entry.cache_id == self.id
+                    && entry.epoch == cur_epoch
+                    && now < entry.valid_until
+                    && entry.path.as_path() == cur.as_path()
+                {
+                    Some((entry.parsed.clone(), entry.dir_missing, entry.valid_until))
+                } else {
+                    None
+                }
+            });
+            if let Some(res) = tls_hit {
+                cur.pop();
+                return res;
+            }
+        }
         if let Some(entry) = self.inner.get(cur.as_path()) {
             if !self.revalidate_ttl.is_zero()
                 && now.saturating_duration_since(entry.checked_at) < self.revalidate_ttl
             {
-                let res = (
-                    entry.parsed.clone(),
-                    entry.dir_missing,
-                    entry.checked_at + self.revalidate_ttl,
-                );
+                let valid_until = entry.checked_at + self.revalidate_ttl;
+                let parsed = entry.parsed.clone();
+                let dir_missing = entry.dir_missing;
                 drop(entry);
+                let slot = tls_htaccess_slot(self.id, cur.as_path());
+                HTACCESS_TLS_CACHE.with(|cell| {
+                    let mut table = cell.borrow_mut();
+                    if let Some(dst) = table.get_mut(slot) {
+                        *dst = Some(TlsHtaccessEntry {
+                            cache_id: self.id,
+                            epoch: cur_epoch,
+                            path: cur.clone(),
+                            parsed: parsed.clone(),
+                            dir_missing,
+                            valid_until,
+                        });
+                    }
+                });
                 cur.pop();
-                return res;
+                return (parsed, dir_missing, valid_until);
             }
         }
         cur.pop();
@@ -610,6 +696,7 @@ impl HtaccessCache {
         self.inner.clear();
         self.count.store(0, Ordering::Relaxed);
         self.negative_count.store(0, Ordering::Relaxed);
+        self.epoch.fetch_add(1, Ordering::Release);
     }
 
     /// (test) Entries counted against the soft cap. Diverges from [`len`](Self::len)
@@ -673,6 +760,11 @@ mod deadline_tests {
             .get_mut(&root.join(".htaccess"))
             .unwrap()
             .checked_at -= REVALIDATE_TTL;
+        HTACCESS_TLS_CACHE.with(|cell| {
+            for slot in cell.borrow_mut().iter_mut() {
+                *slot = None;
+            }
+        });
         let (chain, _) = cache.load_chain_with_dirs_and_deadline(&root, "/child/file", ".htaccess");
         assert!(
             chain[0].1.access_decision("/child/file", "GET")
@@ -693,6 +785,32 @@ mod deadline_tests {
         assert_eq!(
             read_htaccess_capped(&root.join(".htaccess")).unwrap(),
             b"Require all denied"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn clear_invalidates_tls_micro_cache_immediately() {
+        // #1289: `HtaccessCache::clear()` must bump the epoch so worker TLS
+        // micro-caches immediately observe updated `.htaccess` files without
+        // waiting for `REVALIDATE_TTL`.
+        let root = std::env::temp_dir().join(format!("hj-tls-clear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let cache = HtaccessCache::new();
+        let (chain, _) = cache.load_chain_with_dirs_and_deadline(&root, "/a.txt", ".htaccess");
+        assert!(chain.is_empty());
+        // Warm TLS micro-cache with a second call.
+        let (chain, _) = cache.load_chain_with_dirs_and_deadline(&root, "/a.txt", ".htaccess");
+        assert!(chain.is_empty());
+        // Write deny rule and clear the cache.
+        std::fs::write(root.join(".htaccess"), "Require all denied").unwrap();
+        cache.clear();
+        let (chain, _) = cache.load_chain_with_dirs_and_deadline(&root, "/a.txt", ".htaccess");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(
+            chain[0].1.access_decision("/a.txt", "GET"),
+            crate::directives::AccessDecision::Denied
         );
         std::fs::remove_dir_all(&root).unwrap();
     }

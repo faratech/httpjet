@@ -37,7 +37,7 @@ const RAPID_RESET_REFILL: std::time::Duration = std::time::Duration::from_millis
 /// this to 0 on any progress (a dispatched request, a non-empty DATA byte, or a window grant),
 /// so a legitimate client never approaches it; pure empty-DATA / PING / SETTINGS / PRIORITY
 /// churn hits it in a fraction of a second.
-const NO_PROGRESS_BUDGET: u32 = 10_000;
+pub(super) const NO_PROGRESS_BUDGET: u32 = 10_000;
 /// Heap a decoded request field holds beyond its name and value bytes: its `HeaderMap`
 /// bucket, index slot and growth slack (measured 131-176 B for distinct short names).
 const DECODED_FIELD_OVERHEAD: usize = 192;
@@ -155,7 +155,10 @@ pub(super) enum FrameOutcome {
     ResetStream(u32),
     /// Peer changed SETTINGS_INITIAL_WINDOW_SIZE (§6.9.2): every active stream's send
     /// window must shift by this (signed) delta. Applied to `outstreams` in `serve`.
-    InitialWindowDelta(i64),
+    /// Peer SETTINGS changed INITIAL_WINDOW_SIZE: `(net_delta, max_intermediate_delta)`.
+    /// Tracking the high-water mark catches intermediate `> 2^31 - 1` overflows
+    /// when a single SETTINGS frame carries multiple INITIAL_WINDOW_SIZE entries (#1317).
+    InitialWindowDelta(i64, i64),
 }
 
 /// Handle one decoded frame: control frames queue responses into `wbuf`; a completed
@@ -200,6 +203,7 @@ where
         inflight_sids,
         None,
         None,
+        None,
         |fut| {
             if super::spare_cores() {
                 super::TaggedInner::Spawned(super::AbortOnDrop(tokio::spawn(fut)))
@@ -214,6 +218,25 @@ where
 /// polls each completed request's future once inline before allocating `AbortHandle` +
 /// `FuturesUnordered` + `inflight_sids`. Immediate on-core hits (fast-memo, page-cache,
 /// cached static) resolve directly into `ready_out` with zero cancellation-handle allocations.
+pub(super) struct BatchSeed {
+    pub(super) template_id: u64,
+    pub(super) resp_start: usize,
+    pub(super) resp_end: usize,
+    pub(super) data_hdr_off: usize,
+    pub(super) body_len: usize,
+    pub(super) shared_body: Option<Bytes>,
+    pub(super) shared_backing: Option<usize>,
+}
+
+pub(super) struct InlineSendCtx<'a> {
+    pub(super) send_conn: &'a mut i64,
+    pub(super) pending_window: &'a mut FxHashMap<u32, i64>,
+    pub(super) outstreams: &'a mut FxHashMap<u32, super::state::OutStream>,
+    pub(super) send_schedule: &'a mut super::send::SendSchedule,
+    pub(super) batch_now: &'a mut Option<std::time::Instant>,
+    pub(super) batch_seed: Option<&'a mut Option<BatchSeed>>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn process_frame_with_ready<S, F, Sp>(
     hdr: FrameHeader,
@@ -232,6 +255,7 @@ pub(super) fn process_frame_with_ready<S, F, Sp>(
     inflight_sids: &mut FxHashMap<u32, AbortHandle>,
     mut ready_out: Option<&mut Vec<(u32, bool, super::ReadyResponse)>>,
     borrowed_probe: Option<&super::BorrowedMemoProbe>,
+    mut inline_send: Option<InlineSendCtx<'_>>,
     wrap_inflight: Sp,
 ) -> FrameOutcome
 where
@@ -495,6 +519,8 @@ where
                 match frame::parse_settings(payload) {
                     Some(params) => {
                         let mut iw_delta: i64 = 0;
+                        let mut iw_max_delta: i64 = 0;
+                        let mut saw_iw = false;
                         let mut header_table_size = None;
                         for (id, value) in params {
                             match id {
@@ -522,8 +548,14 @@ where
                                         // §6.5.2
                                     }
                                     // §6.9.2: shift every active stream's send window by the
-                                    // change in the initial window size.
+                                    // change in the initial window size. Track the high-water
+                                    // delta so a multi-entry SETTINGS frame cannot mask an
+                                    // intermediate overflow (#1317).
                                     iw_delta += value as i64 - peer.initial_window;
+                                    if !saw_iw || iw_delta > iw_max_delta {
+                                        iw_max_delta = iw_delta;
+                                    }
+                                    saw_iw = true;
                                     peer.initial_window = value as i64;
                                 }
                                 _ => {}
@@ -538,8 +570,8 @@ where
                             );
                         }
                         out.frames(frame::write_settings_ack);
-                        if iw_delta != 0 {
-                            return FrameOutcome::InitialWindowDelta(iw_delta);
+                        if iw_delta != 0 || (saw_iw && iw_max_delta > 0) {
+                            return FrameOutcome::InitialWindowDelta(iw_delta, iw_max_delta);
                         }
                     }
                     None => goaway!(error_code::FRAME_SIZE_ERROR),
@@ -700,15 +732,213 @@ where
                         .sampled_request
                         .as_ref()
                         .and_then(|sample| sample.borrowed(dec, block, sid));
-                    if let Some((head, hint)) = borrowed
+                    if let Some((mut head, hint)) = borrowed
                         && let Some(probe) = borrowed_probe
                         && let Some(ready) = ready_out.as_deref_mut()
-                        && let Some(response) = (probe.0)(&head)
                     {
-                        recv.header_count_hint = hint;
-                        recv.no_progress_frames = 0;
-                        ready.push((sid, false, super::ReadyResponse::SharedFull(response)));
-                        return FrameOutcome::Continue;
+                        if let Some(ctx) = inline_send.as_mut() {
+                            head.now =
+                                Some(*ctx.batch_now.get_or_insert_with(std::time::Instant::now));
+                        }
+                        let tid = head.template_id;
+                        let hit = (probe.0)(&head, &mut |headers, body, batch_eligible| {
+                            if let Some(ctx) = inline_send.as_mut()
+                                && let Some(wire) = enc.replay_shared_response(headers)
+                            {
+                                let mf = (peer.max_frame_size as usize).max(1);
+                                let total = body.len();
+                                #[cfg(feature = "monoio")]
+                                if let Some(timing) = out.timing.as_mut()
+                                    && total <= 2048
+                                {
+                                    timing.short_ready();
+                                }
+                                if total == 0 {
+                                    let mut resp_start = 0usize;
+                                    let mut resp_end = 0usize;
+                                    out.frames(|b| {
+                                        b.reserve(9 + wire.len());
+                                        resp_start = b.len();
+                                        super::send::write_field_block(
+                                            b,
+                                            sid,
+                                            flags::END_STREAM,
+                                            wire,
+                                            mf,
+                                        );
+                                        resp_end = b.len();
+                                    });
+                                    if batch_eligible
+                                        && tid != 0
+                                        && wire.len() <= mf
+                                        && let Some(seed_slot) = ctx.batch_seed.as_deref_mut()
+                                    {
+                                        *seed_slot = Some(BatchSeed {
+                                            template_id: tid,
+                                            resp_start,
+                                            resp_end,
+                                            data_hdr_off: 0,
+                                            body_len: 0,
+                                            shared_body: None,
+                                            shared_backing: None,
+                                        });
+                                        return true;
+                                    }
+                                    return false;
+                                }
+                                let credit = if ctx.pending_window.is_empty() {
+                                    0
+                                } else {
+                                    ctx.pending_window.remove(&sid).unwrap_or(0)
+                                };
+                                let window = (peer.initial_window + credit).min(i32::MAX as i64);
+                                if ctx.outstreams.is_empty()
+                                    && total <= mf
+                                    && total <= out.remaining_data_for(total)
+                                    && (total as i64) <= (*ctx.send_conn).min(window)
+                                {
+                                    if total <= 2048 {
+                                        let mut resp_start = 0usize;
+                                        let mut data_hdr_off = 0usize;
+                                        let mut resp_end = 0usize;
+                                        out.frames(|b| {
+                                            b.reserve(18 + wire.len() + total);
+                                            resp_start = b.len();
+                                            super::send::write_field_block(b, sid, 0, wire, mf);
+                                            data_hdr_off = b.len();
+                                            FrameHeader {
+                                                length: total as u32,
+                                                kind: kind::DATA,
+                                                flags: flags::END_STREAM,
+                                                stream_id: sid,
+                                            }
+                                            .write(b);
+                                            b.extend_from_slice(body.as_ref());
+                                            resp_end = b.len();
+                                        });
+                                        out.consume_data(total);
+                                        *ctx.send_conn -= total as i64;
+                                        if batch_eligible
+                                            && tid != 0
+                                            && wire.len() <= mf
+                                            && let Some(seed_slot) = ctx.batch_seed.as_deref_mut()
+                                        {
+                                            *seed_slot = Some(BatchSeed {
+                                                template_id: tid,
+                                                resp_start,
+                                                resp_end,
+                                                data_hdr_off,
+                                                body_len: total,
+                                                shared_body: None,
+                                                shared_backing: None,
+                                            });
+                                            return true;
+                                        }
+                                        return false;
+                                    }
+                                    out.reserve_bulk_headroom(total);
+                                    let mut resp_start = 0usize;
+                                    let mut data_hdr_off = 0usize;
+                                    let mut resp_end = 0usize;
+                                    out.frames(|b| {
+                                        b.reserve(18 + wire.len());
+                                        resp_start = b.len();
+                                        super::send::write_field_block(b, sid, 0, wire, mf);
+                                        data_hdr_off = b.len();
+                                        FrameHeader {
+                                            length: total as u32,
+                                            kind: kind::DATA,
+                                            flags: flags::END_STREAM,
+                                            stream_id: sid,
+                                        }
+                                        .write(b);
+                                        resp_end = b.len();
+                                    });
+                                    let backing = out.push_body_backing_dedup(body);
+                                    out.body_slice(backing, 0, total);
+                                    *ctx.send_conn -= total as i64;
+                                    if batch_eligible
+                                        && tid != 0
+                                        && wire.len() <= mf
+                                        && let Some(seed_slot) = ctx.batch_seed.as_deref_mut()
+                                    {
+                                        *seed_slot = Some(BatchSeed {
+                                            template_id: tid,
+                                            resp_start,
+                                            resp_end,
+                                            data_hdr_off,
+                                            body_len: total,
+                                            shared_body: None,
+                                            shared_backing: Some(backing),
+                                        });
+                                        return true;
+                                    }
+                                    return false;
+                                }
+                                // Multi-frame or queued body (e.g. 64 KiB `big-h2`): emit
+                                // HEADERS directly and register the OutStream in place,
+                                // avoiding `Arc::clone(headers)`, `ready_responses`, and a
+                                // duplicate `replay_shared_response` lookup.
+                                let mut resp_start = 0usize;
+                                let mut resp_end = 0usize;
+                                out.frames(|b| {
+                                    b.reserve(9 + wire.len());
+                                    resp_start = b.len();
+                                    super::send::write_field_block(b, sid, 0, wire, mf);
+                                    resp_end = b.len();
+                                });
+                                ctx.outstreams.insert(
+                                    sid,
+                                    super::state::OutStream {
+                                        completion: None,
+                                        pending: body.clone(),
+                                        pending_off: 0,
+                                        out_backing: None,
+                                        body: None,
+                                        pulling: false,
+                                        eof: true,
+                                        done: false,
+                                        window,
+                                        cancel: None,
+                                        stall: None,
+                                        send_blocked: false,
+                                        send_queued: true,
+                                    },
+                                );
+                                ctx.send_schedule.ready.push_back(sid);
+                                if batch_eligible
+                                    && tid != 0
+                                    && wire.len() <= mf
+                                    && let Some(seed_slot) = ctx.batch_seed.as_deref_mut()
+                                {
+                                    *seed_slot = Some(BatchSeed {
+                                        template_id: tid,
+                                        resp_start,
+                                        resp_end,
+                                        data_hdr_off: 0,
+                                        body_len: total,
+                                        shared_body: Some(body.clone()),
+                                        shared_backing: None,
+                                    });
+                                    return true;
+                                }
+                                return false;
+                            }
+                            ready.push((
+                                sid,
+                                false,
+                                super::ReadyResponse::SharedFull(super::SharedFullResponse {
+                                    headers: std::sync::Arc::clone(headers),
+                                    body: body.clone(),
+                                }),
+                            ));
+                            false
+                        });
+                        if hit {
+                            recv.header_count_hint = hint;
+                            recv.no_progress_frames = 0;
+                            return FrameOutcome::Continue;
+                        }
                     }
                 }
                 let mut st = StreamState {
@@ -1136,7 +1366,16 @@ impl Default for StableRequestHead {
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
-static NEXT_TEMPLATE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+fn next_template_id() -> u64 {
+    thread_local! {
+        static LOCAL_TEMPLATE_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+    }
+    LOCAL_TEMPLATE_ID.with(|c| {
+        let id = c.get();
+        c.set(id.wrapping_add(1).max(1));
+        id
+    })
+}
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
 struct RequestHeadTemplate {
@@ -1246,6 +1485,7 @@ impl RequestHeadTemplate {
                 method: &self.method,
                 uri: &self.path,
                 headers: self.borrowed_headers.as_ref()?,
+                now: None,
             },
             (self.headers.len() + usize::from(self.authority.is_some())).min(HEADER_COUNT_HINT_MAX),
         ))
@@ -1318,7 +1558,7 @@ impl StableRequestHead {
         if repeated
             && st.content_length.is_none()
             && pending_header_charge(st) <= 2048
-            && !st.headers.contains_key(http::header::COOKIE)
+            && st.headers.get_all(http::header::COOKIE).iter().count() <= 1
             && !st.headers.contains_key(http::header::AUTHORIZATION)
             && !st.headers.contains_key(http::header::PROXY_AUTHORIZATION)
             && let (Some(method), Some(path)) = (st.method.as_ref(), st.path.as_ref())
@@ -1328,7 +1568,7 @@ impl StableRequestHead {
             wire.copy_from_slice(block);
             self.len = block.len();
             self.template = Some(Box::new(RequestHeadTemplate {
-                template_id: NEXT_TEMPLATE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                template_id: next_template_id(),
                 method: method.clone(),
                 path: path.clone(),
                 authority: st.authority.clone(),
@@ -1452,8 +1692,7 @@ impl SampledRequestHead {
             {
                 self.len = wire.len();
                 self.head = Some(Box::new(RequestHeadTemplate {
-                    template_id: NEXT_TEMPLATE_ID
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    template_id: next_template_id(),
                     method: method.clone(),
                     path: path.clone(),
                     authority: stream.authority.clone(),

@@ -190,7 +190,7 @@ enum FastCookieClass {
 
 /// True when the Cookie header's NAMES include a membership marker (the configured
 /// private user/session cookies). Names only — cookie values are never read here.
-fn has_member_session_cookie(cookie: &str, session: &str, user: &str) -> bool {
+pub(crate) fn has_member_session_cookie(cookie: &str, session: &str, user: &str) -> bool {
     cookie.split(';').any(|kv| {
         let raw = kv.split('=').next().unwrap_or("").trim();
         // #616/#656: compare PHP's `$_COOKIE` key (`xf.user`, `xf[user` → `xf_user`);
@@ -270,6 +270,7 @@ struct MemoRequestFacts<'a> {
     seen_ae: bool,
     ae_bytes: &'a [u8],
     cookie_hdr: Option<&'a http::HeaderValue>,
+    multi_cookie: bool,
     has_conditional_or_auth: bool,
     has_cc_or_pragma: bool,
     has_disqualifying_borrowed_hdr: bool,
@@ -281,6 +282,7 @@ fn memo_request_facts(headers: &http::HeaderMap) -> MemoRequestFacts<'_> {
     let mut seen_ae = false;
     let mut ae_bytes: &[u8] = b"";
     let mut cookie_hdr: Option<&http::HeaderValue> = None;
+    let mut multi_cookie = false;
     let mut has_conditional_or_auth = false;
     let mut has_cc_or_pragma = false;
     let mut has_disqualifying_borrowed_hdr = false;
@@ -298,6 +300,8 @@ fn memo_request_facts(headers: &http::HeaderMap) -> MemoRequestFacts<'_> {
         } else if name == http::header::COOKIE {
             if cookie_hdr.is_none() {
                 cookie_hdr = Some(val);
+            } else {
+                multi_cookie = true;
             }
         } else if name == http::header::IF_NONE_MATCH
             || name == http::header::IF_MODIFIED_SINCE
@@ -323,6 +327,7 @@ fn memo_request_facts(headers: &http::HeaderMap) -> MemoRequestFacts<'_> {
         seen_ae,
         ae_bytes,
         cookie_hdr,
+        multi_cookie,
         has_conditional_or_auth,
         has_cc_or_pragma,
         has_disqualifying_borrowed_hdr,
@@ -437,24 +442,108 @@ fn build_memo_log_prefix(
 }
 
 #[inline]
+fn hex_nibble(n: u8) -> u8 {
+    n + b'0' + u8::from(n > 9) * (b'a' - b'0' - 10)
+}
+
+#[inline]
+fn write_hex_u64_nl(dst: &mut [u8; 17], req_id: u64) {
+    let b = req_id.to_be_bytes();
+    *dst = [
+        hex_nibble(b[0] >> 4),
+        hex_nibble(b[0] & 0x0f),
+        hex_nibble(b[1] >> 4),
+        hex_nibble(b[1] & 0x0f),
+        hex_nibble(b[2] >> 4),
+        hex_nibble(b[2] & 0x0f),
+        hex_nibble(b[3] >> 4),
+        hex_nibble(b[3] & 0x0f),
+        hex_nibble(b[4] >> 4),
+        hex_nibble(b[4] & 0x0f),
+        hex_nibble(b[5] >> 4),
+        hex_nibble(b[5] & 0x0f),
+        hex_nibble(b[6] >> 4),
+        hex_nibble(b[6] & 0x0f),
+        hex_nibble(b[7] >> 4),
+        hex_nibble(b[7] & 0x0f),
+        b'\n',
+    ];
+}
+
+#[inline]
 fn record_prefixed_access_line(
     log: &Arc<hj_log::AccessLogger>,
+    log_chunk_slot: usize,
     now: std::time::Instant,
     prefix: &[u8],
     req_id: u64,
 ) {
-    chunk_access_line_at(log, now, |buf, _| {
+    chunk_access_line_slotted(log, log_chunk_slot, now, |buf| {
         buf.extend_from_slice(prefix);
         let mut tail = [b'\n'; 17];
-        for (i, slot) in tail.iter_mut().take(16).enumerate() {
-            let nibble = ((req_id >> ((15 - i) * 4)) & 0x0f) as u8;
-            *slot = if nibble < 10 {
-                b'0' + nibble
-            } else {
-                b'a' + (nibble - 10)
-            };
-        }
+        write_hex_u64_nl(&mut tail, req_id);
         buf.extend_from_slice(&tail);
+    });
+}
+
+/// Append `count` prefixed access-log lines in a single TLS `ACCESS_CHUNKS`
+/// borrow, single `reserve`, and single flush/age check.
+fn record_prefixed_access_lines_batch(
+    log: &Arc<hj_log::AccessLogger>,
+    log_chunk_slot: usize,
+    now: std::time::Instant,
+    prefix: &[u8],
+    count: u64,
+) {
+    let key = Arc::as_ptr(log) as usize;
+    let count_usize = count as usize;
+    ACCESS_CHUNKS.with(|chunks| {
+        let mut chunks = chunks.borrow_mut();
+        let entry = match chunks.get_mut(log_chunk_slot) {
+            Some((k, e)) if *k == key => e,
+            _ => {
+                if let Some((_, e)) = chunks.iter_mut().find(|(k, _)| *k == key) {
+                    e
+                } else {
+                    chunks.push((
+                        key,
+                        PendingChunk {
+                            logger: log.clone(),
+                            buf: Vec::with_capacity(ACCESS_CHUNK_CAPACITY),
+                            lines: 0,
+                            first: now,
+                        },
+                    ));
+                    let Some((_, e)) = chunks.last_mut() else {
+                        return;
+                    };
+                    e
+                }
+            }
+        };
+        let started = entry.lines == 0;
+        if started {
+            entry.first = now;
+        }
+        entry
+            .buf
+            .reserve(count_usize.saturating_mul(prefix.len() + 17));
+        let mut req_ids = hj_core::reqid::next_batch(count);
+        let mut tail = [b'\n'; 17];
+        for _ in 0..count_usize {
+            let req_id = req_ids.next_u64();
+            entry.buf.extend_from_slice(prefix);
+            write_hex_u64_nl(&mut tail, req_id);
+            entry.buf.extend_from_slice(&tail);
+        }
+        entry.lines = entry.lines.saturating_add(count as u32);
+        if entry.buf.len() >= ACCESS_CHUNK_FLUSH_BYTES
+            || now.saturating_duration_since(entry.first) >= ACCESS_CHUNK_MAX_AGE
+        {
+            entry.ship();
+        } else if started {
+            access_chunk_started();
+        }
     });
 }
 
@@ -481,10 +570,11 @@ struct H2MemoHint {
     headers: Arc<http::HeaderMap>,
     body: bytes::Bytes,
     log: Option<Arc<hj_log::AccessLogger>>,
+    log_chunk_slot: usize,
     log_prefix: Option<Box<[u8]>>,
 }
 
-const H2_MEMO_HINT_SLOTS: usize = 64;
+const H2_MEMO_HINT_SLOTS: usize = 512;
 
 thread_local! {
     static H2_MEMO_HINTS: std::cell::RefCell<[Option<H2MemoHint>; H2_MEMO_HINT_SLOTS]> =
@@ -492,8 +582,10 @@ thread_local! {
 }
 
 /// Probe only a transport-validated, complete H2 GET head. Every application
-/// guard remains live; None grants nothing and uses the ordinary handler path.
-/// The headers must already contain the same Host that build_request inserts.
+/// guard remains live; returning `false` grants nothing and uses the ordinary
+/// handler path. On a warm `H2_MEMO_HINTS` hit, invokes `visit` with borrowed
+/// `&Arc<HeaderMap>` and `&Bytes` directly inside the TLS borrow — zero
+/// `Arc`/`Bytes` atomic RMWs when the caller emits inline.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn probe_borrowed_h2_memo(
     state: &ServerState,
@@ -508,9 +600,11 @@ pub(crate) fn probe_borrowed_h2_memo(
     method: &http::Method,
     uri: &http::Uri,
     headers: &http::HeaderMap,
-) -> Option<(Arc<http::HeaderMap>, bytes::Bytes)> {
+    batch_now: Option<std::time::Instant>,
+    visit: &mut dyn FnMut(&Arc<http::HeaderMap>, &bytes::Bytes, bool) -> bool,
+) -> bool {
     if proto != Proto::Http2 {
-        return None;
+        return false;
     }
     if template_id != 0
         && !state.request_id_header
@@ -531,7 +625,9 @@ pub(crate) fn probe_borrowed_h2_memo(
             let slot_idx = (template_id as usize) & (H2_MEMO_HINT_SLOTS - 1);
             let fast_hit = H2_MEMO_HINTS.with(|cell| {
                 let table = cell.borrow();
-                let hint = table.get(slot_idx)?.as_ref()?;
+                let Some(hint) = table.get(slot_idx).and_then(Option::as_ref) else {
+                    return false;
+                };
                 if hint.template_id != template_id
                     || hint.state_ptr != state_ptr
                     || hint.generation != state.generation
@@ -542,16 +638,16 @@ pub(crate) fn probe_borrowed_h2_memo(
                     || hint.purge_epoch != purge_epoch
                     || hint.response_epoch.as_deref() != state.response_cache_epoch.as_deref()
                 {
-                    return None;
+                    return false;
                 }
-                let now = std::time::Instant::now();
+                let now = batch_now.unwrap_or_else(std::time::Instant::now);
                 if now >= hint.expires {
-                    return None;
+                    return false;
                 }
                 if let Some(page) = hint.page.as_ref()
                     && (now >= page.deadline || !page.lease.is_current())
                 {
-                    return None;
+                    return false;
                 }
                 let (date_sec, changed) = hj_core::http_date_sec_if_changed(now, hint.date_sec);
                 if changed.is_some()
@@ -559,57 +655,68 @@ pub(crate) fn probe_borrowed_h2_memo(
                         .client_throttle
                         .allow_deferring_rejection_at(hint.client_ip, now)
                 {
-                    return None;
+                    return false;
                 }
-                state
-                    .metrics
-                    .fast_memo_hits
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if let Some(page) = hint.page.as_ref() {
+                let batch_eligible = state.client_throttle.is_disabled()
+                    && (hint.log.is_none() || hint.log_prefix.is_some());
+                let batch_seeded = visit(&hint.headers, &hint.body, batch_eligible);
+                if !(batch_eligible && batch_seeded) {
                     state
-                        .telemetry
-                        .record_cache_hit_idx(peer_ip.is_loopback(), hint.vhost_idx);
-                    crate::lscache::record_response_memo_hit_codec(
-                        state,
-                        page.key_hash,
-                        page.variant_codec,
-                    );
-                }
-                state.telemetry.record_request(
-                    Proto::Http2,
-                    200,
-                    std::time::Duration::ZERO,
-                    hint.vhost_idx,
-                );
-                if let Some(log) = hint.log.as_ref() {
-                    let req_id = hj_core::reqid::next().as_u64();
-                    if let Some(prefix) = hint.log_prefix.as_deref() {
-                        record_prefixed_access_line(log, now, prefix, req_id);
-                    } else {
-                        record_fast_memo_log_only(
-                            log,
-                            hint.client_ip,
-                            peer_unix,
-                            Proto::Http2,
-                            method,
-                            uri,
-                            headers,
-                            now,
-                            date_sec,
-                            req_id,
-                            200,
-                            hint.body.len() as u64,
+                        .metrics
+                        .fast_memo_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(page) = hint.page.as_ref() {
+                        state
+                            .telemetry
+                            .record_cache_hit_idx(peer_ip.is_loopback(), hint.vhost_idx);
+                        crate::lscache::record_response_memo_hit_codec(
+                            state,
+                            page.key_hash,
+                            page.variant_codec,
                         );
                     }
+                    state.telemetry.record_request(
+                        Proto::Http2,
+                        200,
+                        std::time::Duration::ZERO,
+                        hint.vhost_idx,
+                    );
+                    if let Some(log) = hint.log.as_ref() {
+                        let req_id = hj_core::reqid::next().as_u64();
+                        if let Some(prefix) = hint.log_prefix.as_deref() {
+                            record_prefixed_access_line(
+                                log,
+                                hint.log_chunk_slot,
+                                now,
+                                prefix,
+                                req_id,
+                            );
+                        } else {
+                            record_fast_memo_log_only(
+                                log,
+                                hint.client_ip,
+                                peer_unix,
+                                Proto::Http2,
+                                method,
+                                uri,
+                                headers,
+                                now,
+                                date_sec,
+                                req_id,
+                                200,
+                                hint.body.len() as u64,
+                            );
+                        }
+                    }
                 }
-                Some((Arc::clone(&hint.headers), hint.body.clone()))
+                true
             });
-            if fast_hit.is_some() {
-                return fast_hit;
+            if fast_hit {
+                return true;
             }
         }
     }
-    probe_borrowed_memo_inner(
+    if let Some((hdrs, body)) = probe_borrowed_memo_inner(
         state,
         listener,
         peer_ip,
@@ -623,7 +730,80 @@ pub(crate) fn probe_borrowed_h2_memo(
         uri,
         headers,
         None,
-    )
+        None,
+    ) {
+        visit(&hdrs, &body, false);
+        true
+    } else {
+        false
+    }
+}
+
+/// Commit `count` additional byte-identical H2 borrowed-memo frames served
+/// inside the same TCP read batch in one shot (1x metrics, 1x telemetry,
+/// 1x pagecache counters, 1x `ACCESS_CHUNKS` append).
+pub(crate) fn commit_borrowed_h2_memo_batch(
+    state: &ServerState,
+    peer_ip: IpAddr,
+    template_id: u64,
+    now: std::time::Instant,
+    count: u64,
+) {
+    if count == 0 || template_id == 0 {
+        return;
+    }
+    let slot_idx = (template_id as usize) & (H2_MEMO_HINT_SLOTS - 1);
+    H2_MEMO_HINTS.with(|cell| {
+        let table = cell.borrow();
+        let Some(hint) = table.get(slot_idx).and_then(Option::as_ref) else {
+            return;
+        };
+        if hint.template_id != template_id {
+            return;
+        }
+        state
+            .metrics
+            .fast_memo_hits
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+        if let Some(page) = hint.page.as_ref() {
+            state.telemetry.record_cache_hits_batch_idx(
+                peer_ip.is_loopback(),
+                hint.vhost_idx,
+                count,
+            );
+            crate::lscache::record_response_memo_hits_batch(
+                state,
+                page.key_hash,
+                page.variant_codec,
+                count,
+            );
+        }
+        state
+            .telemetry
+            .record_requests_batch_200(Proto::Http2, hint.vhost_idx, count);
+        if let Some(log) = hint.log.as_ref()
+            && let Some(prefix) = hint.log_prefix.as_deref()
+        {
+            record_prefixed_access_lines_batch(log, hint.log_chunk_slot, now, prefix, count);
+        }
+    });
+}
+
+/// True when the `H2_MEMO_HINTS` slot for `template_id` is safe for intra-batch
+/// replay (per-IP throttling disabled, and either access logging is off or uses
+/// a precomputed `log_prefix`).
+pub(crate) fn h2_memo_batch_eligible(state: &ServerState, template_id: u64) -> bool {
+    if template_id == 0 || !state.client_throttle.is_disabled() {
+        return false;
+    }
+    let slot_idx = (template_id as usize) & (H2_MEMO_HINT_SLOTS - 1);
+    H2_MEMO_HINTS.with(|cell| {
+        let table = cell.borrow();
+        let Some(hint) = table.get(slot_idx).and_then(Option::as_ref) else {
+            return false;
+        };
+        hint.template_id == template_id && (hint.log.is_none() || hint.log_prefix.is_some())
+    })
 }
 
 /// Per-connection H1 keep-alive memo hint: when `H1RequestHeadCache` confirms
@@ -642,7 +822,41 @@ pub(crate) struct H1MemoHint {
     headers: Arc<http::HeaderMap>,
     body: bytes::Bytes,
     log: Option<Arc<hj_log::AccessLogger>>,
+    log_chunk_slot: usize,
     log_prefix: Option<Box<[u8]>>,
+    pending_hits: u64,
+    batch_started: Option<std::time::Instant>,
+    last_now: Option<std::time::Instant>,
+}
+
+const H1_MEMO_BATCH_FLUSH: u64 = 64;
+const H1_MEMO_BATCH_MAX_AGE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Flush any buffered H1 memo hits on `hint_slot` into metrics, telemetry, and
+/// access logs in one batched shot. Called on hint invalidation, 250ms batch
+/// age (#1291), and connection exit.
+pub(crate) fn flush_h1_memo_hint(state: &ServerState, hint_slot: &mut Option<H1MemoHint>) {
+    let Some(hint) = hint_slot.as_mut() else {
+        return;
+    };
+    let count = std::mem::take(&mut hint.pending_hits);
+    hint.batch_started = None;
+    if count == 0 {
+        return;
+    }
+    state
+        .metrics
+        .fast_memo_hits
+        .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    state
+        .telemetry
+        .record_requests_batch_200(Proto::Http1, hint.vhost_idx, count);
+    if let Some(log) = hint.log.as_ref()
+        && let Some(prefix) = hint.log_prefix.as_deref()
+    {
+        let now = hint.last_now.unwrap_or_else(std::time::Instant::now);
+        record_prefixed_access_lines_batch(log, hint.log_chunk_slot, now, prefix, count);
+    }
 }
 
 /// Thread-local 1-slot route/policy cache for `probe_borrowed_memo_inner`
@@ -666,6 +880,13 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BorrowedMemoOutcome {
+    Hit,
+    Missed,
+    Bypassed,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn probe_borrowed_h1_memo_with_hint(
     state: &ServerState,
@@ -679,10 +900,12 @@ pub(crate) fn probe_borrowed_h1_memo_with_hint(
     uri: &http::Uri,
     headers: &http::HeaderMap,
     reused_head: bool,
+    now: std::time::Instant,
     hint_slot: &mut Option<H1MemoHint>,
-) -> Option<(Arc<http::HeaderMap>, bytes::Bytes)> {
+    visit: &mut dyn FnMut(&Arc<http::HeaderMap>, &bytes::Bytes),
+) -> BorrowedMemoOutcome {
     if reused_head
-        && let Some(hint) = hint_slot.as_ref()
+        && let Some(hint) = hint_slot.as_mut()
         && hint.generation == state.generation
         && hint.purge_epoch
             == state
@@ -690,15 +913,49 @@ pub(crate) fn probe_borrowed_h1_memo_with_hint(
                 .as_ref()
                 .map_or(0, |store| store.purge_epoch())
         && hint.response_epoch.as_deref() == state.response_cache_epoch.as_deref()
+        && now < hint.expires
     {
-        let now = std::time::Instant::now();
-        if now < hint.expires {
-            let (date_sec, changed) = hj_core::http_date_sec_if_changed(now, hint.date_sec);
-            if changed.is_none()
-                && state
+        let (date_sec, changed) = hj_core::http_date_sec_if_changed(now, hint.date_sec);
+        let throttle_disabled = state.client_throttle.is_disabled();
+        if changed.is_none()
+            && (throttle_disabled
+                || state
                     .client_throttle
-                    .allow_deferring_rejection_at(hint.client_ip, now)
-            {
+                    .allow_deferring_rejection_at(hint.client_ip, now))
+        {
+            if throttle_disabled && (hint.log.is_none() || hint.log_prefix.is_some()) {
+                if hint.pending_hits == 0 {
+                    hint.batch_started = Some(now);
+                }
+                hint.pending_hits += 1;
+                hint.last_now = Some(now);
+                if hint.pending_hits >= H1_MEMO_BATCH_FLUSH
+                    || hint
+                        .batch_started
+                        .is_some_and(|t| now.saturating_duration_since(t) >= H1_MEMO_BATCH_MAX_AGE)
+                {
+                    let count = std::mem::take(&mut hint.pending_hits);
+                    hint.batch_started = None;
+                    state
+                        .metrics
+                        .fast_memo_hits
+                        .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+                    state
+                        .telemetry
+                        .record_requests_batch_200(Proto::Http1, hint.vhost_idx, count);
+                    if let Some(log) = hint.log.as_ref()
+                        && let Some(prefix) = hint.log_prefix.as_deref()
+                    {
+                        record_prefixed_access_lines_batch(
+                            log,
+                            hint.log_chunk_slot,
+                            now,
+                            prefix,
+                            count,
+                        );
+                    }
+                }
+            } else {
                 state
                     .metrics
                     .fast_memo_hits
@@ -712,7 +969,7 @@ pub(crate) fn probe_borrowed_h1_memo_with_hint(
                 if let Some(log) = hint.log.as_ref() {
                     let req_id = hj_core::reqid::next().as_u64();
                     if let Some(prefix) = hint.log_prefix.as_deref() {
-                        record_prefixed_access_line(log, now, prefix, req_id);
+                        record_prefixed_access_line(log, hint.log_chunk_slot, now, prefix, req_id);
                     } else {
                         record_fast_memo_log_only(
                             log,
@@ -730,12 +987,17 @@ pub(crate) fn probe_borrowed_h1_memo_with_hint(
                         );
                     }
                 }
-                return Some((Arc::clone(&hint.headers), hint.body.clone()));
             }
+            visit(&hint.headers, &hint.body);
+            return BorrowedMemoOutcome::Hit;
         }
     }
-    *hint_slot = None;
-    probe_borrowed_memo_inner(
+    if hint_slot.is_some() {
+        flush_h1_memo_hint(state, hint_slot);
+        *hint_slot = None;
+    }
+    let mut probed_miss = false;
+    if let Some((hdrs, body)) = probe_borrowed_memo_inner(
         state,
         listener,
         peer_ip,
@@ -749,7 +1011,51 @@ pub(crate) fn probe_borrowed_h1_memo_with_hint(
         uri,
         headers,
         Some(hint_slot),
-    )
+        Some(&mut probed_miss),
+    ) {
+        visit(&hdrs, &body);
+        BorrowedMemoOutcome::Hit
+    } else if probed_miss {
+        BorrowedMemoOutcome::Missed
+    } else {
+        BorrowedMemoOutcome::Bypassed
+    }
+}
+
+/// Synchronous borrowed fast-memo probe for HTTP/3 requests on-core.
+/// Returns `(hit, probed_miss)` so the caller can skip a redundant second
+/// memo probe inside `fast_serve_uring_local` when the table was already probed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn probe_borrowed_h3_memo(
+    state: &ServerState,
+    listener: &str,
+    peer_ip: IpAddr,
+    is_tls: bool,
+    client_auth_requested: bool,
+    peer_unix: bool,
+    tls: Option<&hj_core::TlsParams>,
+    method: &http::Method,
+    uri: &http::Uri,
+    headers: &http::HeaderMap,
+) -> (Option<(Arc<http::HeaderMap>, bytes::Bytes)>, bool) {
+    let mut probed_miss = false;
+    let hit = probe_borrowed_memo_inner(
+        state,
+        listener,
+        peer_ip,
+        is_tls,
+        client_auth_requested,
+        peer_unix,
+        Proto::Http3,
+        tls,
+        0,
+        method,
+        uri,
+        headers,
+        None,
+        Some(&mut probed_miss),
+    );
+    (hit, probed_miss)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -767,6 +1073,7 @@ fn probe_borrowed_memo_inner(
     uri: &http::Uri,
     headers: &http::HeaderMap,
     h1_hint_out: Option<&mut Option<H1MemoHint>>,
+    probed_miss: Option<&mut bool>,
 ) -> Option<(Arc<http::HeaderMap>, bytes::Bytes)> {
     #[cfg(feature = "otel")]
     if crate::otel::enabled() {
@@ -789,11 +1096,19 @@ fn probe_borrowed_memo_inner(
         return None;
     }
     let facts = memo_request_facts(headers);
+    let guest_cookie_vary = if facts.multi_cookie {
+        None
+    } else {
+        facts
+            .cookie_hdr
+            .and_then(|c| lscache::guest_cookie_vary_for_memo(state, c))
+    };
+    let has_cookie = facts.cookie_hdr.is_some();
     if facts.has_disqualifying_borrowed_hdr
         || !memo_request_eligible(
             state,
             method,
-            facts.cookie_hdr.is_some(),
+            has_cookie && guest_cookie_vary.is_none(),
             facts.has_conditional_or_auth,
         )
     {
@@ -888,7 +1203,7 @@ fn probe_borrowed_memo_inner(
         purge_epoch,
         listener,
         https,
-        h3: false,
+        h3: proto == Proto::Http3,
         trusted_proxy,
         vhost: vhost_name,
         host_src: fast_memo::HostSource::Header,
@@ -896,8 +1211,10 @@ fn probe_borrowed_memo_inner(
         path: uri.path(),
         query,
         ae: facts.ae_bytes,
+        has_cookie,
+        cookie_vary: guest_cookie_vary.as_deref().unwrap_or(""),
     };
-    let (hit, client_ip, page, date_sec) = fast_memo::probe_shared_serve(
+    let Some(probed) = fast_memo::probe_shared_serve(
         &key,
         headers,
         &state.ua_classify,
@@ -927,8 +1244,13 @@ fn probe_borrowed_memo_inner(
                 .is_none_or(|store| store.purge_epoch() == epoch)
         },
         (),
-    )?
-    .ok()?;
+    ) else {
+        if let Some(flag) = probed_miss {
+            *flag = true;
+        }
+        return None;
+    };
+    let (hit, client_ip, page, date_sec) = probed.ok()?;
     // Keep context-paced responses on their existing path in this first
     // prototype; H2's connection-wide pacer remains the only egress limiter.
     if hit.status != StatusCode::OK || hit.bandwidth.is_some() {
@@ -999,6 +1321,9 @@ fn probe_borrowed_memo_inner(
                 hit.body.len() as u64,
             )
         });
+        let log_chunk_slot = log_owned.as_ref().map_or(usize::MAX, |logger| {
+            access_chunk_slot_for(logger, req_start)
+        });
         *slot = Some(H1MemoHint {
             generation: state.generation,
             purge_epoch,
@@ -1010,7 +1335,11 @@ fn probe_borrowed_memo_inner(
             headers: Arc::clone(&hit.headers),
             body: hit.body.clone(),
             log: log_owned,
+            log_chunk_slot,
             log_prefix,
+            pending_hits: 0,
+            batch_started: None,
+            last_now: None,
         });
     } else if proto == Proto::Http2 && template_id != 0 {
         let log_prefix = log_owned.as_deref().and_then(|logger| {
@@ -1026,6 +1355,9 @@ fn probe_borrowed_memo_inner(
                 200,
                 hit.body.len() as u64,
             )
+        });
+        let log_chunk_slot = log_owned.as_ref().map_or(usize::MAX, |logger| {
+            access_chunk_slot_for(logger, req_start)
         });
         let slot_idx = (template_id as usize) & (H2_MEMO_HINT_SLOTS - 1);
         H2_MEMO_HINTS.with(|cell| {
@@ -1049,6 +1381,7 @@ fn probe_borrowed_memo_inner(
                     headers: Arc::clone(&hit.headers),
                     body: hit.body.clone(),
                     log: log_owned,
+                    log_chunk_slot,
                     log_prefix,
                 });
             }
@@ -1063,9 +1396,9 @@ struct PreparedFastLsapi {
     proto: Proto,
     req_start: std::time::Instant,
     chain: Vec<Arc<Htaccess>>,
-    orig_path: String,
-    orig_rel: String,
-    script: LsapiScript,
+    orig_path_override: Option<String>,
+    vhost_idx: usize,
+    script: Arc<LsapiScript>,
 }
 
 #[cfg(test)]
@@ -1096,15 +1429,15 @@ pub(crate) async fn fast_serve(
         tls.as_ref(),
         req,
         false,
+        false,
         None,
     )
     .await
 }
 
-/// On-core fast path for the io_uring transports: allows `fast_memo` hits to
-/// return `hj_core::SharedHeaders(Arc<HeaderMap>)` when `!state.request_id_header`,
-/// eliminating `HeaderMap::clone()` on every H1/H2/H3 fast-memo hit.
-/// Remains `Send` so H2/H3 futures that cross `serve_local_with_prefix` can await it.
+/// On-core fast path for HTTP/3 (`Send`, `lsapi_out = None`): keeps dynamic
+/// PHP/LSAPI scripts off the QUIC UDP driver loop via `early_bridge`, while
+/// serving static/page-cache/memo hits on-core with `hj_core::SharedHeaders`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fast_serve_uring(
     state: &Arc<ServerState>,
@@ -1118,6 +1451,7 @@ pub(crate) async fn fast_serve_uring(
     proto: Proto,
     tls: Option<&hj_core::TlsParams>,
     req: &Request,
+    skip_memo_probe: bool,
 ) -> Option<Response> {
     fast_serve_inner(
         state,
@@ -1132,14 +1466,16 @@ pub(crate) async fn fast_serve_uring(
         tls,
         req,
         !state.request_id_header,
+        skip_memo_probe,
         None,
     )
     .await
 }
 
-/// Thread-local (`!Send`) on-core fast path for monoio H1 connections: extends
-/// [`fast_serve_uring`] with direct `monoio::net::UnixStream` LSAPI dispatch
-/// for eligible bodyless GET/HEAD PHP requests when the page cache is off.
+/// Thread-local (`!Send`) on-core fast path for monoio H1/H2 connections:
+/// extends [`fast_serve_uring`] with direct `monoio::net::UnixStream` LSAPI
+/// dispatch for eligible bodyless GET/HEAD PHP requests when the page cache
+/// is off.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fast_serve_uring_local(
     state: &Arc<ServerState>,
@@ -1153,6 +1489,7 @@ pub(crate) async fn fast_serve_uring_local(
     proto: Proto,
     tls: Option<&hj_core::TlsParams>,
     req: &Request,
+    skip_memo_probe: bool,
 ) -> Option<Response> {
     let mut lsapi_prep: Option<Box<PreparedFastLsapi>> = None;
     if let Some(resp) = fast_serve_inner(
@@ -1168,6 +1505,7 @@ pub(crate) async fn fast_serve_uring_local(
         tls,
         req,
         !state.request_id_header,
+        skip_memo_probe,
         Some(&mut lsapi_prep),
     )
     .await
@@ -1183,7 +1521,7 @@ pub(crate) async fn fast_serve_uring_local(
         )
         .await
         {
-            if let Some(done) = finish_fast_lsapi(state, *prep, req, resp).await {
+            if let Some(done) = finish_fast_lsapi(state, *prep, req, resp) {
                 return Some(done);
             }
         }
@@ -1206,7 +1544,8 @@ async fn fast_serve_inner(
     tls: Option<&hj_core::TlsParams>,
     req: &Request,
     use_shared_headers: bool,
-    lsapi_out: Option<&mut Option<Box<PreparedFastLsapi>>>,
+    skip_memo_probe: bool,
+    mut lsapi_out: Option<&mut Option<Box<PreparedFastLsapi>>>,
 ) -> Option<Response> {
     let proto = effective_proto(proto, req);
     let req_start = std::time::Instant::now();
@@ -1271,6 +1610,7 @@ async fn fast_serve_inner(
         seen_ae,
         ae_bytes,
         cookie_hdr,
+        multi_cookie,
         has_conditional_or_auth,
         has_cc_or_pragma,
         has_disqualifying_borrowed_hdr: _,
@@ -1324,8 +1664,17 @@ async fn fast_serve_inner(
     // common ones — a replayed 200 would silently override that verdict.
     // A compile-time response transform sees the whole request context, which the
     // memo key does not cover, so its output is never memoized.
-    let memo_eligible_req =
-        memo_request_eligible(state, &method, has_cookie, has_conditional_or_auth);
+    let guest_cookie_vary = if multi_cookie {
+        None
+    } else {
+        cookie_hdr.and_then(|c| lscache::guest_cookie_vary_for_memo(state, c))
+    };
+    let memo_eligible_req = memo_request_eligible(
+        state,
+        &method,
+        has_cookie && guest_cookie_vary.is_none(),
+        has_conditional_or_auth,
+    );
     // A `path_cacheable: false` inline set means stores are impossible; skip
     // the probe entirely. Its keyable vars become vary items at the store site.
     let memo_inline = state.inline_rules.get(vhost_name);
@@ -1335,7 +1684,12 @@ async fn fast_serve_inner(
         .as_ref()
         .is_some_and(|store| store.config().response_memo)
         && !has_cc_or_pragma;
-    if memo_eligible_req && memo_inline_ok {
+    if !skip_memo_probe
+        && memo_eligible_req
+        && memo_inline_ok
+        && (state.page_cache.is_some()
+            || !suffix_routing::last_segment_is_script_vhost(state, vhost_cfg, req.uri().path()))
+    {
         let mk = fast_memo::MemoKey {
             generation: state.generation,
             allow_page_responses,
@@ -1351,6 +1705,8 @@ async fn fast_serve_inner(
             path: req.uri().path(),
             query: req.uri().query().unwrap_or(""),
             ae: ae_bytes,
+            has_cookie,
+            cookie_vary: guest_cookie_vary.as_deref().unwrap_or(""),
         };
         if let Some(probed) = fast_memo::probe_serve(
             &mk,
@@ -1459,10 +1815,18 @@ async fn fast_serve_inner(
     // A script never serves from the static branch either, so a cookied request whose
     // last segment carries a script suffix (`/index.php`, `/css.php`) bridges the same way:
     // its SetEnvIf, access, rewrite and target-policy work is all repeated by dispatch().
-    if has_cookie && suffix_routing::last_segment_is_script_vhost(state, vhost_cfg, &orig_path) {
+    let cookied_page_cache_active = state
+        .page_cache
+        .as_ref()
+        .is_some_and(|store| store.config().private_enabled);
+    if has_cookie
+        && !cookied_page_cache_active
+        && suffix_routing::last_segment_is_script_vhost(state, vhost_cfg, &orig_path)
+    {
         return bridge(state, FastBridge::CookiedScript);
     }
     if has_cookie
+        && !cookied_page_cache_active
         && looks_like_route(&orig_path)
         && matching_static_context_vhost(vhost_cfg, &orig_path).is_none()
         && !docroot_target_may_exist(state, &vhost_cfg.doc_root, &orig_path)
@@ -1513,10 +1877,11 @@ async fn fast_serve_inner(
         .vhost
         .overrides_enabled(ctx.vhost.rewrite.auto_load_htaccess);
     let (chain_with_dirs, mut policy_deadline) = if htaccess_enabled {
-        state.rewrite_cache.load_chain_with_dirs_and_deadline(
+        state.rewrite_cache.load_chain_with_dirs_and_deadline_at(
             &ctx.vhost.doc_root,
             &orig_path,
             ctx.vhost.access_file_name_or_default(),
+            req_start,
         )
     } else {
         (Vec::new(), req_start + std::time::Duration::from_secs(1))
@@ -1570,29 +1935,38 @@ async fn fast_serve_inner(
         // pipeline would (fast_serve cannot produce an error page itself).
         return bridge(state, FastBridge::Acl);
     }
-    ctx.env.reserve(8);
+    let env_cap = if !chain.is_empty() {
+        8
+    } else {
+        usize::from(seen_ae) + usize::from(ctx.is_tls)
+    };
+    if env_cap > 0 {
+        ctx.env.reserve(env_cap);
+    }
     if seen_ae && let Ok(ae) = std::str::from_utf8(ae_bytes) {
         ctx.set_env("HTTP_ACCEPT_ENCODING", ae.to_string());
     }
-    set_redirect_guard(&mut ctx, req.uri(), &req_host);
     seed_server_env(&mut ctx);
-    let set_env_basename = set_env_scope_basename(state, &ctx, &orig_path, &chain);
-    if apply_set_env_scoped(
-        &mut ctx,
-        &chain,
-        req,
-        &orig_path,
-        orig_query,
-        set_env_basename.as_deref(),
-    )
-    .is_err()
-    {
-        return bridge(state, FastBridge::SetEnv);
-    }
     let orig_rel = rewrite_glue::rel_from_normalized(&orig_path);
-    if access_denied(&chain, &orig_path, method.as_str(), &ctx)
-        || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &orig_rel)
-    {
+    if !chain.is_empty() {
+        let set_env_basename = set_env_scope_basename(state, &ctx, &orig_path, &chain);
+        if apply_set_env_scoped(
+            &mut ctx,
+            &chain,
+            req,
+            &orig_path,
+            orig_query,
+            set_env_basename.as_deref(),
+        )
+        .is_err()
+        {
+            return bridge(state, FastBridge::SetEnv);
+        }
+        if access_denied(&chain, &orig_path, method.as_str(), &ctx) {
+            return bridge(state, FastBridge::AccessDenied);
+        }
+    }
+    if access_deny_dir(&state.acl, &ctx.vhost.doc_root, &orig_rel) {
         return bridge(state, FastBridge::AccessDenied);
     }
     // ---- REWRITE (shared by both branches): dispatch() runs the engine BEFORE its
@@ -1603,22 +1977,27 @@ async fn fast_serve_inner(
     // status/forbidden/gone outcomes bridge so dispatch() renders them; `[P]` merges
     // its env and keeps the original path exactly as dispatch() defers it; a
     // rewritten target carries dispatch()'s post-rewrite gates below.
-    let mut rewrite_trace = RewriteTrace::default();
-    let rw = rewrite_glue::run_rewrite_traced(
-        state,
-        &ctx,
-        req,
-        &chain_with_dirs,
-        &orig_path,
-        &orig_query,
-        &mut rewrite_trace,
-    );
-    // Rules outside the loaded chain ran (a cross-directory rewrite, #826): the memo
-    // vary-set and page-cache key below see only this chain; or a hop's access phase
-    // is not implied by the rewritten-target gates below (#836). Bridge to dispatch().
-    if rewrite_trace.needs_dispatch(&chain_with_dirs, &rw) {
-        return bridge(state, FastBridge::RewriteCrossDir);
-    }
+    let rw = if chain_with_dirs.is_empty() && memo_inline.is_none() {
+        RwResult::Unchanged { env: Vec::new() }
+    } else {
+        let mut rewrite_trace = RewriteTrace::default();
+        let rw = rewrite_glue::run_rewrite_traced(
+            state,
+            &ctx,
+            req,
+            &chain_with_dirs,
+            &orig_path,
+            orig_query,
+            &mut rewrite_trace,
+        );
+        // Rules outside the loaded chain ran (a cross-directory rewrite, #826): the memo
+        // vary-set and page-cache key below see only this chain; or a hop's access phase
+        // is not implied by the rewritten-target gates below (#836). Bridge to dispatch().
+        if rewrite_trace.needs_dispatch(&chain_with_dirs, &rw) {
+            return bridge(state, FastBridge::RewriteCrossDir);
+        }
+        rw
+    };
     let cache_vary_env;
     let rewrite_env_empty;
     let mut rewritten_query = None;
@@ -1683,21 +2062,62 @@ async fn fast_serve_inner(
         return bridge(state, FastBridge::Context);
     }
 
-    // ---- Branch 1 gate: GUEST cookieless page-cache HIT (B1) ----
-    // Any Cookie may carry membership (`xf_user`) or a vary dimension; bridge cookied
-    // requests so the full pipeline decides (the cache_private gate catches a leak
-    // without this). The lookup sees the SAME loaded chain `dispatch()` uses, so
-    // request-side cache policy cannot diverge from the store/slow-path decisions.
+    // ---- Branch 1 gate: On-core page-cache HIT (public + cookied/private) ----
+    // `lscache::lookup` runs the exact same `private_route` + cookie-vary + shared-paths
+    // isolation as `dispatch()`, so cookied guests and logged-in members (private tier)
+    // can hit on-core without bridging to Tokio. `fast_memo` stays cookieless-only.
     // (#857) `needs_dispatch` above guarantees `chain_with_dirs` is every chain
     // whose rules ran, so it is the whole input set of this request's response.
-    let page_cache_branch = state.page_cache.is_some()
-        && !has_cookie
+    let page_cache_branch = state
+        .page_cache
+        .as_ref()
+        .is_some_and(|store| !has_cookie || store.config().private_enabled)
         && !early_script_cache_absent
         && lscache::raw_path_is_cache_canonical(req.uri().path(), &orig_path)
         && lscache::raw_host_is_cache_canonical(req, ctx.is_tls)
         && !rewrite_glue::page_cache_unkeyed(state, &ctx, chain.iter().map(|h| &**h));
     // Without that branch only the static branch can serve, and its own bridges do not
     // depend on the target policy: decide them before paying for it.
+    if !page_cache_branch
+        && let Some(slot) = lsapi_out.as_deref_mut()
+        && !host_foreign
+        && !proxy_rewrite
+        && !local_rewrite
+        && orig_query.is_empty()
+        && rewrite_env_empty
+        && !has_conditional_or_auth
+        && let Some(cached_script) = probe_script_target_cache(
+            state,
+            &ctx.vhost_name,
+            &method,
+            &orig_path,
+            &chain,
+            req_start,
+        )
+    {
+        if let Some(prep) = prepare_fast_lsapi(
+            state,
+            ctx,
+            req,
+            proto,
+            req_start,
+            chain,
+            &orig_path,
+            orig_query,
+            &orig_rel,
+            host_foreign,
+            proxy_rewrite,
+            local_rewrite,
+            rewrite_env_empty,
+            None,
+            Some(cached_script),
+        ) {
+            *slot = Some(Box::new(prep));
+            return None;
+        }
+        return bridge(state, FastBridge::Script);
+    }
+    let mut pre_split: Option<(PathBuf, String, String)> = None;
     if !page_cache_branch
         && let Some(why) = static_branch_bridge(
             state,
@@ -1710,6 +2130,7 @@ async fn fast_serve_inner(
             proxy_rewrite,
             local_rewrite,
             rewrite_env_empty,
+            Some(&mut pre_split),
         )
     {
         if matches!(why, FastBridge::Script)
@@ -1728,6 +2149,8 @@ async fn fast_serve_inner(
                 proxy_rewrite,
                 local_rewrite,
                 rewrite_env_empty,
+                pre_split,
+                None,
             )
         {
             *slot = Some(Box::new(prep));
@@ -1756,6 +2179,7 @@ async fn fast_serve_inner(
 
     // ---- Branch 1: GUEST cookieless page-cache HIT (B1) ----
     if page_cache_branch {
+        set_redirect_guard(&mut ctx, req.uri(), &req_host);
         if fast_post_rewrite_bridges(
             state,
             &ctx,
@@ -1783,11 +2207,16 @@ async fn fast_serve_inner(
             rewrite_glue::page_cache_ua_class(state, &ctx, &chain_with_dirs, req.headers());
         let header_vary =
             rewrite_glue::page_cache_header_vary(state, &ctx, &chain_with_dirs, req.headers());
+        let cookie_hdr = if has_cookie {
+            cookie_header_joined(req.headers())
+        } else {
+            None
+        };
         let cc = lscache::CacheCtx {
             enabled: true,
             method: &method,
             host: &req_host,
-            cookie: None,
+            cookie: cookie_hdr.as_deref(),
             identity: &identity,
             req_path: &orig_path,
             req_query: &orig_query,
@@ -1797,8 +2226,9 @@ async fn fast_serve_inner(
             // Range requests already returned early at the top of `fast_serve`.
             has_range: false,
             host_foreign,
-            // Cookieless by branch precondition ⇒ the public vary value is "".
-            vary_value: Some(""),
+            // Cookieless requests know the public vary value is ""; cookied requests
+            // let `lscache::lookup` compute vary / private-tier routing identically to `dispatch()`.
+            vary_value: if has_cookie { None } else { Some("") },
             origin: origin_vary.as_deref(),
             ua_class: ua_class.as_deref(),
             header_vary: header_vary.as_deref(),
@@ -1821,7 +2251,7 @@ async fn fast_serve_inner(
             &ctx,
             &cc,
             inm,
-            allow_page_responses && memo_store_ok,
+            allow_page_responses && memo_store_ok && (!has_cookie || guest_cookie_vary.is_some()),
         ) {
             stamp_bandwidth(
                 &ctx,
@@ -1848,10 +2278,10 @@ async fn fast_serve_inner(
             if early_predicted {
                 state.early_bridge.forfeit(early_bridge::Branch::PageCache);
             }
-            // A public page-cache hit may be memoized while its memo lease holds;
-            // its Age header is exact only until the next Age tick.
+            // A public cookieless or guest-cookied page-cache hit may be memoized while its memo lease holds.
             if allow_page_responses
                 && memo_store_ok
+                && (!has_cookie || guest_cookie_vary.is_some())
                 && resp.status() == StatusCode::OK
                 && !resp.headers().contains_key(http::header::SET_COOKIE)
                 && !lscache::has_purge_header(resp.headers())
@@ -1877,6 +2307,8 @@ async fn fast_serve_inner(
                         path: req.uri().path(),
                         query: req.uri().query().unwrap_or(""),
                         ae: ae_bytes,
+                        has_cookie,
+                        cookie_vary: guest_cookie_vary.as_deref().unwrap_or(""),
                     },
                     vary,
                     &resp,
@@ -1901,6 +2333,7 @@ async fn fast_serve_inner(
     // proxy <context>, a PHP/script suffix, an access deny, or a non-success
     // status (so a `.htaccess` ErrorDocument, possibly a .php subrequest, renders on
     // the tokio path). dispatch() itself is untouched (this is an additive uring path).
+    let mut pre_split: Option<(PathBuf, String, String)> = None;
     if page_cache_branch
         && let Some(why) = static_branch_bridge(
             state,
@@ -1913,6 +2346,7 @@ async fn fast_serve_inner(
             proxy_rewrite,
             local_rewrite,
             rewrite_env_empty,
+            Some(&mut pre_split),
         )
     {
         if matches!(why, FastBridge::Script)
@@ -1931,6 +2365,8 @@ async fn fast_serve_inner(
                 proxy_rewrite,
                 local_rewrite,
                 rewrite_env_empty,
+                pre_split,
+                None,
             )
         {
             *slot = Some(Box::new(prep));
@@ -2129,7 +2565,7 @@ async fn fast_serve_inner(
         &mut resp,
     );
     if resp.status() == StatusCode::OK && !resp.headers().contains_key(http::header::SET_COOKIE) {
-        if memo_store_ok {
+        if memo_store_ok && !has_cookie {
             if let Some(vary) = memo_vary_set(state, &ctx, req, memo_inline, &chain_with_dirs)
                 && fast_memo::store_until(
                     &fast_memo::MemoKey {
@@ -2151,6 +2587,8 @@ async fn fast_serve_inner(
                             .get(http::header::ACCEPT_ENCODING)
                             .map(|v| v.as_bytes())
                             .unwrap_or(b""),
+                        has_cookie: false,
+                        cookie_vary: "",
                     },
                     vary,
                     &resp,
@@ -2376,6 +2814,59 @@ pub(crate) fn cookie_header_joined(headers: &http::HeaderMap) -> Option<String> 
 /// the page cache is disabled. Fails closed (`None`) to the full Tokio pipeline
 /// on any non-default jail, auth, rewrite, proxy context, FastCGI route, or
 /// slow-log condition.
+struct ScriptTargetCacheEntry {
+    state_ptr: usize,
+    generation: u64,
+    vhost_name: String,
+    vhost_idx: usize,
+    method: http::Method,
+    orig_path: String,
+    chain_weaks: Vec<std::sync::Weak<Htaccess>>,
+    expires: std::time::Instant,
+    script: Arc<LsapiScript>,
+}
+
+thread_local! {
+    static SCRIPT_TARGET_CACHE: std::cell::RefCell<Vec<ScriptTargetCacheEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+const SCRIPT_TARGET_CACHE_SLOTS: usize = 8;
+const SCRIPT_TARGET_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn probe_script_target_cache(
+    state: &Arc<ServerState>,
+    vhost_name: &str,
+    method: &http::Method,
+    orig_path: &str,
+    chain: &[Arc<Htaccess>],
+    req_start: std::time::Instant,
+) -> Option<(Arc<LsapiScript>, usize)> {
+    let state_ptr = std::ptr::from_ref(&**state) as usize;
+    SCRIPT_TARGET_CACHE.with(|cell| {
+        let cache = cell.borrow();
+        cache.iter().find_map(|entry| {
+            if entry.state_ptr == state_ptr
+                && entry.generation == state.generation
+                && req_start < entry.expires
+                && entry.method == *method
+                && entry.orig_path == orig_path
+                && entry.vhost_name == vhost_name
+                && entry.chain_weaks.len() == chain.len()
+                && entry
+                    .chain_weaks
+                    .iter()
+                    .zip(chain.iter())
+                    .all(|(w, h)| w.as_ptr() == Arc::as_ptr(h) && w.strong_count() > 0)
+            {
+                Some((Arc::clone(&entry.script), entry.vhost_idx))
+            } else {
+                None
+            }
+        })
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_fast_lsapi(
     state: &Arc<ServerState>,
@@ -2391,12 +2882,17 @@ fn prepare_fast_lsapi(
     proxy_rewrite: bool,
     local_rewrite: bool,
     rewrite_env_empty: bool,
+    pre_split: Option<(PathBuf, String, String)>,
+    pre_cached_script: Option<(Arc<LsapiScript>, usize)>,
 ) -> Option<PreparedFastLsapi> {
-    if state
-        .page_cache
-        .as_ref()
-        .is_some_and(|store| store.config().is_standards_vhost(&ctx.vhost_name))
-        || !state.extensions.is_empty()
+    if state.page_cache.as_ref().is_some_and(|store| {
+        store.config().is_standards_vhost(&ctx.vhost_name)
+            || ctx
+                .vhost
+                .cache_policy
+                .as_ref()
+                .is_some_and(|p| p.enable_cache || p.enable_private)
+    }) || !state.extensions.is_empty()
         || state.php_slow.is_some()
         || host_foreign
         || proxy_rewrite
@@ -2410,9 +2906,11 @@ fn prepare_fast_lsapi(
     }
     let registry = state.lsapi.as_ref()?;
     let target = registry.default_monoio_target()?;
-    let jail = resolve_vhost_jail(state, &ctx).ok()?;
-    if jail.credentials.is_some() || jail.chroot.is_some() || !jail.namespaces.is_empty() {
-        return None;
+    if ctx.vhost.isolation.is_some() || state.server.suexec.enable {
+        let jail = resolve_vhost_jail(state, &ctx).ok()?;
+        if jail.credentials.is_some() || jail.chroot.is_some() || !jail.namespaces.is_empty() {
+            return None;
+        }
     }
     if !suffix_routing::vhost_scripts_enabled(state, &ctx)
         || matching_proxy_context(&ctx, orig_path).is_some()
@@ -2423,6 +2921,42 @@ fn prepare_fast_lsapi(
     if !state.client_throttle.would_allow(ctx.client_ip) {
         return None;
     }
+
+    // 1-second thread-local cache of verified non-symlink script targets:
+    // eliminates `scoped_auth::target_policy` (openat2+fstat+close), duplicate
+    // `split_script_path`, `allowed_script_target`, and `php_directives` on
+    // repeated hits to the same PHP endpoint within the same `.htaccess` chain.
+    let cacheable = orig_query.is_empty()
+        && rewrite_env_empty
+        && !req.headers().contains_key(http::header::AUTHORIZATION);
+    let state_ptr = std::ptr::from_ref(&**state) as usize;
+    if let Some((script, vhost_idx)) = pre_cached_script.or_else(|| {
+        cacheable
+            .then(|| {
+                probe_script_target_cache(
+                    state,
+                    &ctx.vhost_name,
+                    req.method(),
+                    orig_path,
+                    &chain,
+                    req_start,
+                )
+            })
+            .flatten()
+    }) {
+        let orig_path_override = (orig_path != req.uri().path()).then(|| orig_path.to_owned());
+        return Some(PreparedFastLsapi {
+            target,
+            ctx,
+            proto,
+            req_start,
+            chain,
+            orig_path_override,
+            vhost_idx,
+            script,
+        });
+    }
+
     let policy = scoped_auth::target_policy(
         state,
         &ctx,
@@ -2434,9 +2968,13 @@ fn prepare_fast_lsapi(
     if policy.protected {
         return None;
     }
-    let index_files = effective_index_files(state, &ctx, &chain);
-    let (script_abs, script_name, path_info) =
-        split_script_path(state, &ctx, orig_path, index_files, &chain)?;
+    let (script_abs, script_name, path_info) = match pre_split {
+        Some(split) => split,
+        None => {
+            let index_files = effective_index_files(state, &ctx, &chain);
+            split_script_path(state, &ctx, orig_path, index_files, &chain)?
+        }
+    };
     let configured_handler = configured_script_handler_for_script(&ctx, &script_abs);
     if configured_handler.is_some_and(script_handler_is_unusable) {
         return None;
@@ -2448,23 +2986,37 @@ fn prepare_fast_lsapi(
     {
         return None;
     }
-    let pinned = allowed_script_target(&state.acl, &script_abs)?;
+    let pinned = if let Some(opened) = policy.script.as_ref()
+        && opened.lexical == script_abs
+        && let Some(target) = opened.target.as_ref()
+        && !state.acl.deny_dir_match(target)
+    {
+        target.clone()
+    } else {
+        allowed_script_target(&state.acl, &script_abs)?
+    };
+    let mut script_rel_matches_orig = false;
     if let Ok(rel) = script_abs.strip_prefix(&ctx.vhost.doc_root) {
-        let script_rel = format!("/{}", rel.to_string_lossy());
-        if script_rel != orig_rel
-            && (access_denied(&chain, &script_rel, req.method().as_str(), &ctx)
-                || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &script_rel))
-        {
-            return None;
+        let orig_rel_trimmed = orig_rel.trim_start_matches('/');
+        if rel.as_os_str() == orig_rel_trimmed {
+            script_rel_matches_orig = true;
+        } else {
+            let script_rel = format!("/{}", rel.to_string_lossy());
+            if script_rel == orig_rel {
+                script_rel_matches_orig = true;
+            } else if access_denied(&chain, &script_rel, req.method().as_str(), &ctx)
+                || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &script_rel)
+            {
+                return None;
+            }
         }
     }
     let script_basename = script_abs
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_owned();
+        .unwrap_or("");
     let special_env: Vec<(SpecialEnvType, String, String)> =
-        hj_rewrite::php_directives(&chain, &script_name, &script_basename)
+        hj_rewrite::php_directives(&chain, &script_name, script_basename)
             .into_iter()
             .map(|d| {
                 let ty = if d.admin {
@@ -2475,7 +3027,15 @@ fn prepare_fast_lsapi(
                 (ty, d.name, d.value)
             })
             .collect();
-    let script = LsapiScript {
+    // Only cache when `script_rel == orig_rel` (so per-request `access_denied` in
+    // `fast_serve_inner` already evaluated the exact resolved script) or when the
+    // chain is `memo.eligible` with no request-varying headers, preventing <Files>/
+    // <Limit>/IP access bypasses (#1287).
+    let access_cache_safe = script_rel_matches_orig
+        || chain
+            .iter()
+            .all(|h| h.memo.eligible && h.memo.vary_headers.is_empty());
+    let script = Arc::new(LsapiScript {
         script: pinned,
         script_name: Some(script_name),
         path_info: if path_info.is_empty() {
@@ -2484,20 +3044,48 @@ fn prepare_fast_lsapi(
             Some(path_info)
         },
         special_env,
-    };
+    });
+    let vhost_idx = state.telemetry.vhost_idx(&ctx.vhost_name);
+    if cacheable && policy.memo_ok && access_cache_safe {
+        let expires = policy
+            .deadline
+            .map_or(req_start + SCRIPT_TARGET_CACHE_TTL, |d| {
+                d.min(req_start + SCRIPT_TARGET_CACHE_TTL)
+            });
+        let chain_weaks: Vec<std::sync::Weak<Htaccess>> =
+            chain.iter().map(Arc::downgrade).collect();
+        SCRIPT_TARGET_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            if cache.len() >= SCRIPT_TARGET_CACHE_SLOTS {
+                cache.remove(0);
+            }
+            cache.push(ScriptTargetCacheEntry {
+                state_ptr,
+                generation: state.generation,
+                vhost_name: ctx.vhost_name.clone(),
+                vhost_idx,
+                method: req.method().clone(),
+                orig_path: orig_path.to_owned(),
+                chain_weaks,
+                expires,
+                script: Arc::clone(&script),
+            });
+        });
+    }
+    let orig_path_override = (orig_path != req.uri().path()).then(|| orig_path.to_owned());
     Some(PreparedFastLsapi {
         target,
         ctx,
         proto,
         req_start,
         chain,
-        orig_path: orig_path.to_owned(),
-        orig_rel: orig_rel.to_owned(),
+        orig_path_override,
+        vhost_idx,
         script,
     })
 }
 
-async fn finish_fast_lsapi(
+fn finish_fast_lsapi(
     state: &Arc<ServerState>,
     mut prep: PreparedFastLsapi,
     req: &Request,
@@ -2521,46 +3109,88 @@ async fn finish_fast_lsapi(
         .shard()
         .served_php
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    finalize_response(
-        state,
-        &mut prep.ctx,
-        req.headers(),
-        &prep.chain,
-        &prep.orig_rel,
-        None,
-        &prep.orig_path,
-        &prep.orig_path,
-        &mut resp,
-    )
-    .await;
+    let orig_path = prep
+        .orig_path_override
+        .as_deref()
+        .unwrap_or_else(|| req.uri().path());
+    // Status is 200 OK, so ErrorDocument is a no-op; run header steps
+    // synchronously without constructing an async `finalize_response` future.
+    // Skip entirely when the directory chain has no `.htaccess` files.
+    if !prep.chain.is_empty() {
+        let orig_rel = rewrite_glue::rel_from_normalized(orig_path);
+        let script_basename = prep.script.script.file_name().and_then(|s| s.to_str());
+        response_util::apply_error_response_headers(
+            &mut prep.ctx,
+            &prep.chain,
+            orig_rel,
+            script_basename,
+            orig_path,
+            StatusCode::OK,
+            &mut resp,
+        );
+        // (#1311) `.htaccess` `Header set X-LiteSpeed-*` / `X-WF-Capsule*` directives
+        // run inside `apply_error_response_headers` above: bridge any purge to `dispatch()`
+        // and strip non-purge control headers so they never leak to clients.
+        if lscache::has_control_header(resp.headers()) {
+            if lscache::has_purge_header(resp.headers()) {
+                return None;
+            }
+            lscache::strip_static_control_headers(resp.headers_mut());
+        }
+    }
     mark_auth_sensitive(
         req.headers().contains_key(http::header::AUTHORIZATION),
         &prep.ctx,
         &mut resp,
     );
-    apply_response_transforms(state, &prep.ctx, &mut resp, false).await;
-    stamp_bandwidth(
-        &prep.ctx,
-        &prep.orig_path,
-        state.serve_config.bandwidth_limit,
-        &mut resp,
-    );
+    if req.method() == http::Method::HEAD {
+        resp.extensions_mut().insert(hj_compress::HeadResponse);
+    }
+    // `prepare_fast_lsapi` already gated `extensions.is_empty()` and
+    // `!sub_filter_matches`, and on-core `bridged == false` sets compression
+    // slicing threshold to 0: run expires, sync compression, CDN label strip,
+    // and Alt-Svc advertisement directly (#1288).
+    state.expires_transform.apply(&prep.ctx, &mut resp);
+    state.compress.transform_sync(&prep.ctx, &mut resp);
+    DenyRedirectCdnTransform::apply(&prep.ctx, &mut resp);
+    if prep.ctx.tls.is_some() && prep.ctx.protocol != Proto::Http3 {
+        if let Some(alt) = &state.alt_svc {
+            if !resp.headers().contains_key(http::header::ALT_SVC) {
+                resp.headers_mut()
+                    .insert(http::header::ALT_SVC, alt.clone());
+            }
+        }
+    }
+    if state.serve_config.bandwidth_limit > 0 || !prep.ctx.vhost.contexts.is_empty() {
+        stamp_bandwidth(
+            &prep.ctx,
+            orig_path,
+            state.serve_config.bandwidth_limit,
+            &mut resp,
+        );
+    }
+    // Stamp Date from `ctx.request_time` so `fast_local`'s `stamp_date` skips
+    // an extra `SystemTime::now()` vDSO call on every PHP response.
+    resp = hj_core::stamp_date_at(resp, prep.ctx.request_time);
     if !state
         .client_throttle
         .allow_deferring_rejection(prep.ctx.client_ip)
     {
         return None;
     }
-    Some(record_fast_serve(
+    apply_request_id_header(state, &prep.ctx, &mut resp);
+    Some(record_served_response_with_vhost_idx(
         state,
         &prep.ctx,
         prep.proto,
         req,
         prep.req_start,
+        prep.vhost_idx,
         resp,
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn static_branch_bridge(
     state: &ServerState,
     ctx: &ReqCtx,
@@ -2572,6 +3202,7 @@ fn static_branch_bridge(
     proxy_rewrite: bool,
     local_rewrite: bool,
     rewrite_env_empty: bool,
+    split_out: Option<&mut Option<(PathBuf, String, String)>>,
 ) -> Option<FastBridge> {
     if host_foreign {
         return Some(FastBridge::HostForeign);
@@ -2609,7 +3240,10 @@ fn static_branch_bridge(
     {
         return Some(FastBridge::Script);
     }
-    if split_script_path(state, ctx, path, index_files, chain).is_some() {
+    if let Some(split) = split_script_path(state, ctx, path, index_files, chain) {
+        if let Some(out) = split_out {
+            *out = Some(split);
+        }
         return Some(FastBridge::Script);
     }
     None
@@ -2856,12 +3490,26 @@ fn record_served_response(
     req_start: std::time::Instant,
     resp: Response,
 ) -> Response {
+    let vhost_idx = state.telemetry.vhost_idx(&ctx.vhost_name);
+    record_served_response_with_vhost_idx(state, ctx, proto, req, req_start, vhost_idx, resp)
+}
+
+fn record_served_response_with_vhost_idx(
+    state: &Arc<ServerState>,
+    ctx: &ReqCtx,
+    proto: Proto,
+    req: &Request,
+    req_start: std::time::Instant,
+    vhost_idx: usize,
+    resp: Response,
+) -> Response {
     let status = resp.status().as_u16();
+    let now = std::time::Instant::now();
     state.telemetry.record_request(
         proto,
         status,
-        req_start.elapsed(),
-        state.telemetry.vhost_idx(&ctx.vhost_name),
+        now.saturating_duration_since(req_start),
+        vhost_idx,
     );
     let Some(log) = state.access_logger_for(&ctx.vhost_name) else {
         return resp;
@@ -2889,7 +3537,7 @@ fn record_served_response(
             } else {
                 None
             };
-            chunk_access_line(log, |buf, format| {
+            chunk_access_line_at(log, now, |buf, format| {
                 hj_log::render_access_line_with_host_reqid_u64_into(
                     buf,
                     format,
@@ -3593,30 +4241,24 @@ async fn handle_inner(
         state.telemetry.vhost_idx(&ctx.vhost_name),
     );
 
+    // (#248) Mirror 5xx responses into the vhost's own error file when it
+    // declares one — even if access logging is disabled (--no-access-log).
+    if resp.status().is_server_error() {
+        if let Some(errlog) = state.vhost_error_logger(&ctx.vhost_name) {
+            errlog.log_line(format!(
+                "[{}] error status={} uri={} request_id={}",
+                hj_log::clf_time(ctx.request_time),
+                resp.status().as_u16(),
+                log_uri,
+                ctx.request_id
+            ));
+        }
+    }
+
     // ---- Access log ------------------------------------------------------
     // (#248) A vhost declaring its own `<logging><accessLog>` records there;
     // everyone else rides the unified log.
     if let Some(log) = access_log {
-        // (#248) Mirror 5xx responses into the vhost's own error file when it
-        // declares one — the closest per-vhost analogue of LSWS's error log
-        // (httpjet has no per-vhost stderr stream to route). Built before the
-        // record consumes `log_uri`.
-        let err_line = match (
-            resp.status().is_server_error(),
-            state.vhost_error_logger(&ctx.vhost_name),
-        ) {
-            (true, Some(errlog)) => Some((
-                errlog,
-                format!(
-                    "[{}] error status={} uri={} request_id={}",
-                    hj_log::clf_time(ctx.request_time),
-                    resp.status().as_u16(),
-                    log_uri,
-                    ctx.request_id
-                ),
-            )),
-            _ => None,
-        };
         let record = hj_log::AccessRecord {
             client_ip,
             // CLF `%t` is the time the request was RECEIVED — reuse the arrival stamp
@@ -3634,11 +4276,6 @@ async fn handle_inner(
             request_id: Some(ctx.request_id.to_string()),
             peer_unix: ctx.peer_unix,
         };
-        // (#248) Mirror 5xx responses into the vhost's own error file when it
-        // declares one.
-        if let Some((errlog, line)) = err_line {
-            errlog.log_line(line);
-        }
         resp = log_access(log, resp, record, None);
     }
 
@@ -3657,7 +4294,7 @@ async fn handle_inner(
 /// trade-off is that a streamed response is logged at completion rather than at
 /// header time — which is how Apache/LiteSpeed already behave. Returns the response
 /// (body rewrapped in the streaming case).
-const ACCESS_CHUNK_FLUSH_BYTES: usize = 16 * 1024;
+const ACCESS_CHUNK_FLUSH_BYTES: usize = 64 * 1024;
 /// Each thread's chunk buffer is reserved once and reused: regrowing it from empty was
 /// ~a dozen reallocs per chunk, and under `MIMALLOC_PURGE_DELAY=0` its larger steps
 /// re-faulted fresh pages on every chunk (~0.4 minor faults/request on a busy vhost).
@@ -3672,16 +4309,24 @@ struct PendingChunk {
 }
 
 impl PendingChunk {
-    /// The chunk as an exact-size copy; the reservation stays on this thread. Most chunks
-    /// age out holding a line or two, and the writer's byte budget charges a chunk by its
-    /// capacity: handing over the whole reservation charged ~16.9 KiB per line.
+    /// Full chunks (`>= ACCESS_CHUNK_FLUSH_BYTES`) transfer their buffer with
+    /// zero copy (`mem::replace`), avoiding a 16 KiB `memcpy` every ~120–150
+    /// requests; small aged-out chunks still ship an exact-size copy so the
+    /// writer's capacity budget isn't charged ~16.9 KiB for 1–2 lines.
     fn take(&mut self) -> (Vec<u8>, u32) {
-        let buf = self.buf.as_slice().to_vec();
-        if self.buf.capacity() > 2 * ACCESS_CHUNK_CAPACITY {
-            self.buf = Vec::with_capacity(ACCESS_CHUNK_CAPACITY);
+        let buf = if self.buf.len() >= ACCESS_CHUNK_FLUSH_BYTES
+            && self.buf.capacity() <= 2 * ACCESS_CHUNK_CAPACITY
+        {
+            std::mem::replace(&mut self.buf, Vec::with_capacity(ACCESS_CHUNK_CAPACITY))
         } else {
-            self.buf.clear();
-        }
+            let copied = self.buf.as_slice().to_vec();
+            if self.buf.capacity() > 2 * ACCESS_CHUNK_CAPACITY {
+                self.buf = Vec::with_capacity(ACCESS_CHUNK_CAPACITY);
+            } else {
+                self.buf.clear();
+            }
+            copied
+        };
         (buf, std::mem::replace(&mut self.lines, 0))
     }
 
@@ -3693,11 +4338,11 @@ impl PendingChunk {
 
 thread_local! {
     /// (#349) Per-serving-thread access-line chunks, keyed by logger identity.
-    /// Fast-path serves render their line on-core (borrowed data, no Strings)
-    /// and ship one channel message per chunk instead of one per line. Flushed
-    /// by size/age here and by the per-worker ticker in `uring`.
-    static ACCESS_CHUNKS: std::cell::RefCell<rustc_hash::FxHashMap<usize, PendingChunk>> =
-        std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+    /// Stored as a tiny `Vec` (each worker has only a handful of loggers) so
+    /// memo hits can index directly via their cached `log_chunk_slot` with
+    /// zero hashing or `FxHashMap` probing.
+    static ACCESS_CHUNKS: std::cell::RefCell<Vec<(usize, PendingChunk)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Flush tickers of this thread parked until a chunk starts (see [`access_chunk_started`]).
     static ACCESS_CHUNK_TICKERS: std::cell::RefCell<Vec<std::task::Waker>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -3708,7 +4353,7 @@ thread_local! {
 /// no timer wake-ups at all.
 pub(crate) fn access_chunk_pending() -> impl std::future::Future<Output = ()> {
     std::future::poll_fn(|cx| {
-        if ACCESS_CHUNKS.with(|c| c.borrow().values().any(|e| e.lines > 0)) {
+        if ACCESS_CHUNKS.with(|c| c.borrow().iter().any(|(_, e)| e.lines > 0)) {
             return std::task::Poll::Ready(());
         }
         ACCESS_CHUNK_TICKERS.with(|t| {
@@ -3729,6 +4374,28 @@ fn access_chunk_started() {
     });
 }
 
+fn access_chunk_slot_for(log: &Arc<hj_log::AccessLogger>, now: std::time::Instant) -> usize {
+    let key = Arc::as_ptr(log) as usize;
+    ACCESS_CHUNKS.with(|chunks| {
+        let mut chunks = chunks.borrow_mut();
+        if let Some(idx) = chunks.iter().position(|(k, _)| *k == key) {
+            return idx;
+        }
+        let idx = chunks.len();
+        chunks.push((
+            key,
+            PendingChunk {
+                logger: log.clone(),
+                buf: Vec::with_capacity(ACCESS_CHUNK_CAPACITY),
+                lines: 0,
+                first: now,
+            },
+        ));
+        idx
+    })
+}
+
+#[cfg(test)]
 fn chunk_access_line(
     log: &Arc<hj_log::AccessLogger>,
     render: impl FnOnce(&mut Vec<u8>, hj_log::LogFormat),
@@ -3744,12 +4411,23 @@ fn chunk_access_line_at(
     let key = Arc::as_ptr(log) as usize;
     ACCESS_CHUNKS.with(|chunks| {
         let mut chunks = chunks.borrow_mut();
-        let entry = chunks.entry(key).or_insert_with(|| PendingChunk {
-            logger: log.clone(),
-            buf: Vec::with_capacity(ACCESS_CHUNK_CAPACITY),
-            lines: 0,
-            first: now,
-        });
+        let entry = if let Some((_, e)) = chunks.iter_mut().find(|(k, _)| *k == key) {
+            e
+        } else {
+            chunks.push((
+                key,
+                PendingChunk {
+                    logger: log.clone(),
+                    buf: Vec::with_capacity(ACCESS_CHUNK_CAPACITY),
+                    lines: 0,
+                    first: now,
+                },
+            ));
+            let Some((_, e)) = chunks.last_mut() else {
+                return;
+            };
+            e
+        };
         let started = entry.lines == 0;
         if started {
             entry.first = now;
@@ -3766,12 +4444,60 @@ fn chunk_access_line_at(
     });
 }
 
+#[inline]
+fn chunk_access_line_slotted(
+    log: &Arc<hj_log::AccessLogger>,
+    slot: usize,
+    now: std::time::Instant,
+    render: impl FnOnce(&mut Vec<u8>),
+) {
+    let key = Arc::as_ptr(log) as usize;
+    ACCESS_CHUNKS.with(|chunks| {
+        let mut chunks = chunks.borrow_mut();
+        let entry = match chunks.get_mut(slot) {
+            Some((k, e)) if *k == key => e,
+            _ => {
+                if let Some((_, e)) = chunks.iter_mut().find(|(k, _)| *k == key) {
+                    e
+                } else {
+                    chunks.push((
+                        key,
+                        PendingChunk {
+                            logger: log.clone(),
+                            buf: Vec::with_capacity(ACCESS_CHUNK_CAPACITY),
+                            lines: 0,
+                            first: now,
+                        },
+                    ));
+                    let Some((_, e)) = chunks.last_mut() else {
+                        return;
+                    };
+                    e
+                }
+            }
+        };
+        let started = entry.lines == 0;
+        if started {
+            entry.first = now;
+        }
+        render(&mut entry.buf);
+        entry.lines += 1;
+        if entry.buf.len() >= ACCESS_CHUNK_FLUSH_BYTES
+            || now.saturating_duration_since(entry.first) >= ACCESS_CHUNK_MAX_AGE
+        {
+            entry.ship();
+        } else if started {
+            access_chunk_started();
+        }
+    });
+}
+
 /// (#349) Flush this thread's pending access-line chunks (per-worker ticker +
 /// worker drain call this; size/age flushes happen inline on append).
 pub(crate) fn flush_access_chunks() {
     ACCESS_CHUNKS.with(|chunks| {
         let mut chunks = chunks.borrow_mut();
-        for entry in chunks.values_mut() {
+        for (_, entry) in chunks.iter_mut() {
             if entry.lines > 0 {
                 entry.ship();
             }
@@ -7177,12 +7903,12 @@ fn compute_php_suffixes<'a>(
 /// / non-root / no per-vhost isolation this yields the all-None jail (the default
 /// `"php"` pool, today's behavior).
 pub(super) fn resolve_vhost_jail(state: &ServerState, ctx: &ReqCtx) -> std::io::Result<JailConfig> {
-    let vh_root: PathBuf = state
+    let vh_root: &std::path::Path = state
         .server
         .vhosts
         .get(&ctx.vhost_name)
-        .map(|d| d.vh_root.clone())
-        .unwrap_or_else(|| ctx.vhost.doc_root.clone());
+        .map(|d| d.vh_root.as_path())
+        .unwrap_or(ctx.vhost.doc_root.as_path());
     // The process's uid does not change after start; asking the kernel per PHP request
     // was one syscall each, behind the unit's seccomp filters.
     static IS_ROOT: std::sync::LazyLock<bool> =
@@ -7191,7 +7917,7 @@ pub(super) fn resolve_vhost_jail(state: &ServerState, ctx: &ReqCtx) -> std::io::
     JailConfig::resolve(
         ctx.vhost.isolation.as_ref(),
         &ctx.vhost.doc_root,
-        &vh_root,
+        vh_root,
         &state.server.suexec,
         is_root,
     )
@@ -8735,13 +9461,26 @@ mod tests {
             false,
         ));
         let capacity = |log: &Arc<hj_log::AccessLogger>| {
-            ACCESS_CHUNKS.with(|c| c.borrow()[&(Arc::as_ptr(log) as usize)].buf.capacity())
+            let key = Arc::as_ptr(log) as usize;
+            ACCESS_CHUNKS.with(|c| {
+                c.borrow()
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .unwrap()
+                    .1
+                    .buf
+                    .capacity()
+            })
         };
         let line = vec![b'x'; 300];
         chunk_access_line(&log, |buf, _| buf.extend_from_slice(&line));
         assert!(capacity(&log) >= ACCESS_CHUNK_CAPACITY);
         // Fill past the size threshold: the chunk flushes inline and hands its buffer off.
-        while ACCESS_CHUNKS.with(|c| c.borrow()[&(Arc::as_ptr(&log) as usize)].lines) > 0 {
+        while ACCESS_CHUNKS.with(|c| {
+            let key = Arc::as_ptr(&log) as usize;
+            c.borrow().iter().find(|(k, _)| *k == key).unwrap().1.lines
+        }) > 0
+        {
             chunk_access_line(&log, |buf, _| buf.extend_from_slice(&line));
         }
         chunk_access_line(&log, |buf, _| buf.extend_from_slice(&line));
@@ -8756,9 +9495,12 @@ mod tests {
             "after a ticker flush"
         );
         let (shipped, lines) = ACCESS_CHUNKS.with(|c| {
+            let key = Arc::as_ptr(&log) as usize;
             c.borrow_mut()
-                .get_mut(&(Arc::as_ptr(&log) as usize))
+                .iter_mut()
+                .find(|(k, _)| *k == key)
                 .unwrap()
+                .1
                 .take()
         });
         assert_eq!((shipped.len(), lines), (line.len(), 1));

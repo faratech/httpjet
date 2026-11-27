@@ -95,14 +95,21 @@ impl FrameHeader {
     }
 
     /// Append the serialized 9-octet header to `out` (reserved bit cleared).
+    #[inline]
     pub fn write(&self, out: &mut Vec<u8>) {
-        out.push((self.length >> 16) as u8);
-        out.push((self.length >> 8) as u8);
-        out.push(self.length as u8);
-        out.push(self.kind);
-        out.push(self.flags);
-        let sid = self.stream_id & 0x7fff_ffff;
-        out.extend_from_slice(&sid.to_be_bytes());
+        let sid = (self.stream_id & 0x7fff_ffff).to_be_bytes();
+        let hdr = [
+            (self.length >> 16) as u8,
+            (self.length >> 8) as u8,
+            self.length as u8,
+            self.kind,
+            self.flags,
+            sid[0],
+            sid[1],
+            sid[2],
+            sid[3],
+        ];
+        out.extend_from_slice(&hdr);
     }
 }
 

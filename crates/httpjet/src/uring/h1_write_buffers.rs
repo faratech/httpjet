@@ -174,6 +174,39 @@ impl ResponseBuffers {
         // The body is intentionally released instead of entering scratch storage.
         drop(returned.body);
     }
+
+    /// Fast-path recycle after a `take_shared_head` hit: `shared_head` already
+    /// holds the matching `Weak`, avoiding `Arc::downgrade` + `Weak::drop` atomics.
+    pub(super) fn recycle_full_shared_head_fast(&mut self, mut returned: FullResponse) {
+        debug_assert_eq!(returned.remaining, 0);
+        returned.iovecs.fill(libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        });
+        self.iovecs = Some(returned.iovecs);
+        self.head = returned.head;
+        drop(returned.body);
+    }
+
+    /// Recycle a completed vectored `FullResponse` while keeping its serialized
+    /// response head cached in `shared_head` for repeated >4 KiB keep-alive hits.
+    pub(super) fn recycle_full_shared_head(
+        &mut self,
+        mut returned: FullResponse,
+        headers: &Arc<http::HeaderMap>,
+        body_len: usize,
+    ) {
+        debug_assert_eq!(returned.remaining, 0);
+        returned.iovecs.fill(libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        });
+        self.iovecs = Some(returned.iovecs);
+        let head = returned.head;
+        let head_len = head.len();
+        self.recycle_shared_head(head, head_len, headers, body_len);
+        drop(returned.body);
+    }
 }
 
 /// Owns the head, body, and heap-stable iovec array until io_uring gives them back.
@@ -454,7 +487,7 @@ mod tests {
                 .await;
                 assert!(!result.failed && !reference.failed);
                 assert_eq!(got.wire, want.wire);
-                if index <= 3 {
+                if index <= 3 || index == 7 {
                     assert!(cache.shared_head.is_some());
                     assert!(cache.head.ends_with(b"\r\n\r\n"));
                 } else {

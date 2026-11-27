@@ -147,8 +147,14 @@ pub fn classify_response(
         std.no_store |= one.no_store;
         std.no_cache |= one.no_cache;
         std.must_revalidate |= one.must_revalidate;
-        std.max_age = std.max_age.or(one.max_age);
-        std.s_maxage = std.s_maxage.or(one.s_maxage);
+        std.max_age = match (std.max_age, one.max_age) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        std.s_maxage = match (std.s_maxage, one.s_maxage) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         std.stale_while_revalidate = std.stale_while_revalidate.or(one.stale_while_revalidate);
         std.stale_if_error = std.stale_if_error.or(one.stale_if_error);
     }

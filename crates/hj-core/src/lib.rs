@@ -25,7 +25,7 @@ pub use http_util::{
     coalesce_cookie_crumbs, header_value_lossy, http_date_now, http_date_now_with_sec,
     http_date_sec_if_changed, if_none_match_matches, is_connection_specific_request_header,
     matched_etag_variant, percent_decode, percent_decode_cow, response_body_forbidden,
-    sanitize_h2_h3_body_headers, stamp_date, strip_hop_by_hop_response,
+    sanitize_h2_h3_body_headers, stamp_date, stamp_date_at, strip_hop_by_hop_response,
 };
 pub use net::{
     FORWARDING_AUTHORITY_HEADERS, host_without_port, host_without_port_cow,

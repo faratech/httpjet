@@ -372,32 +372,38 @@ impl Compress {
         ) {
             return None;
         }
-        let enc = self.negotiable(resp, accept_encoding)?;
-
-        // Size + body-kind gating.
-        match resp.body() {
+        // O(1) body size/kind pre-check BEFORE `negotiable()` so sub-min_size
+        // responses and uncached/ranged static files skip Content-Range,
+        // Content-Type globbing, Accept-Encoding parsing, and Cache-Control scans.
+        let needs_dyn = match resp.body() {
             Body::Empty => {
-                let len = self.bodyless_static_len(resp)?;
-                (len >= self.min_size).then_some(enc)
+                if self.bodyless_static_len(resp)? < self.min_size {
+                    return None;
+                }
+                true
             }
-            Body::Full(b) => ((b.len() as u64) >= self.min_size).then_some(enc),
-            Body::Stream(_) => self.dyn_ok(enc).then_some(enc),
+            Body::Full(b) => {
+                if (b.len() as u64) < self.min_size {
+                    return None;
+                }
+                false
+            }
+            Body::Stream(_) => true,
             Body::File(f) => {
-                if !self.dyn_ok(enc) {
-                    return None;
-                }
-                if f.content_len() < self.min_size {
-                    return None;
-                }
                 // Ranged files would break with whole-stream compression; and
                 // we only act on cached (in-memory) bytes — a non-cached file
                 // is left to the zero-copy/sendfile static path.
-                if f.range.is_some() {
+                if f.cached.is_none() || f.range.is_some() || f.content_len() < self.min_size {
                     return None;
                 }
-                f.cached.is_some().then_some(enc)
+                true
             }
+        };
+        let enc = self.negotiable(resp, accept_encoding)?;
+        if needs_dyn && !self.dyn_ok(enc) {
+            return None;
         }
+        Some(enc)
     }
 
     /// Per-codec gate for dynamic (streamed / cached-file) bodies. The codec is
@@ -494,7 +500,9 @@ impl Compress {
         let would_encode = || {
             len >= self.min_size
                 && !resp.headers().contains_key(CONTENT_ENCODING)
-                && self.negotiable(resp, accept_encoding).is_some()
+                && self
+                    .negotiable(resp, accept_encoding)
+                    .is_some_and(|enc| self.dyn_ok(enc))
                 && !no_gzip(ctx)
         };
         if self.enabled && (encoded_tag || would_encode()) {
@@ -602,8 +610,10 @@ impl Compress {
     /// falling back to lower-case / canonical header-name keys the pipeline may
     /// have used.
     fn accept_encoding<'a>(&self, ctx: &'a ReqCtx) -> &'a str {
+        if ctx.env.is_empty() {
+            return "";
+        }
         ctx.get_env(ACCEPT_ENCODING_ENV)
-            .or_else(|| ctx.get_env("accept-encoding"))
             .or_else(|| ctx.get_env(ACCEPT_ENCODING.as_str()))
             .unwrap_or("")
     }

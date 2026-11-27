@@ -843,16 +843,14 @@ mod borrowed_h2_wire_regressions {
             let (stream, _) = listener.accept().await.unwrap();
             let config = Config {
                 conn_idle_timeout: Some(Duration::from_secs(2)),
-                borrowed_memo_probe: Some(BorrowedMemoProbe(Arc::new(move |head| {
+                borrowed_memo_probe: Some(BorrowedMemoProbe(Arc::new(move |head, visit| {
                     if head.uri.path() != "/bulk" {
-                        return None;
+                        return false;
                     }
                     assert_eq!(head.headers[http::header::HOST], "first.local");
                     probe_hits.fetch_add(1, Ordering::Relaxed);
-                    Some(SharedFullResponse {
-                        headers: headers.clone(),
-                        body: body.clone(),
-                    })
+                    let _ = visit(&headers, &body, false);
+                    true
                 }))),
                 ..Config::default()
             };

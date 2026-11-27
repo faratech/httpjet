@@ -157,17 +157,20 @@ impl AsyncWriteRent for DirectWriteSocket {
             if self.ring_small && len <= RING_WRITE_MAX {
                 return self.inner.write(buf).await;
             }
-            // SAFETY: `buf` owns `len` initialized bytes at `read_ptr()` for this call.
-            let n = unsafe { libc::write(self.fd, buf.read_ptr() as *const libc::c_void, len) };
-            if n >= 0 {
-                return (Ok(n as usize), buf);
-            }
-            let e = std::io::Error::last_os_error();
-            let os_error = e.raw_os_error();
-            if os_error == Some(libc::EAGAIN) || os_error == Some(libc::EWOULDBLOCK) {
-                self.inner.write(buf).await
-            } else {
-                (Err(e), buf)
+            loop {
+                // SAFETY: `buf` owns `len` initialized bytes at `read_ptr()` for this call.
+                let n = unsafe { libc::write(self.fd, buf.read_ptr() as *const libc::c_void, len) };
+                if n >= 0 {
+                    return (Ok(n as usize), buf);
+                }
+                let e = std::io::Error::last_os_error();
+                match e.kind() {
+                    std::io::ErrorKind::Interrupted => continue,
+                    std::io::ErrorKind::WouldBlock => {
+                        return self.inner.write(buf).await;
+                    }
+                    _ => return (Err(e), buf),
+                }
             }
         }
     }

@@ -111,10 +111,10 @@ impl ExpiresRule {
         let mut i = 0;
         while i + 1 < rest.len() + 1 {
             let num = rest.get(i)?;
-            let n: i64 = num.parse().ok()?;
-            if n < 0 {
+            if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
                 return None;
             }
+            let n: i64 = num.parse().ok()?;
             let unit = rest.get(i + 1)?;
             let factor = unit_to_seconds(unit)?;
             // Checked arithmetic: an absurdly large value in trusted operator
@@ -357,6 +357,7 @@ mod tests {
     fn parse_verbose_rejects_negative_amounts() {
         assert!(ExpiresRule::parse("access plus -100000 seconds").is_none());
         assert!(ExpiresRule::parse("access plus 1 day -5 seconds").is_none());
+        assert!(ExpiresRule::parse("access plus +1 week").is_none());
     }
 
     #[test]

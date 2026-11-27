@@ -45,13 +45,107 @@ pub fn build_cgi_env<'r>(
     CgiEnvBuilder::new(script_filename).build(req, ctx)
 }
 
+/// Stack-allocated formatting buffer for numeric/IP CGI environment values
+/// (`REMOTE_ADDR`, `REMOTE_PORT`, `SERVER_ADDR`, `SERVER_PORT`, `REQUEST_TIME`,
+/// `REQUEST_TIME_FLOAT`), eliminating 6 heap `String` allocations per PHP request.
+pub struct CgiStackScratch {
+    buf: [u8; 192],
+    len: usize,
+}
+
+impl Default for CgiStackScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CgiStackScratch {
+    pub const fn new() -> Self {
+        Self {
+            buf: [0u8; 192],
+            len: 0,
+        }
+    }
+
+    fn push_u64(&mut self, mut val: u64) -> Option<(usize, usize)> {
+        let mut tmp = [0u8; 20];
+        let mut i = tmp.len();
+        loop {
+            i = i.checked_sub(1)?;
+            *tmp.get_mut(i)? = b'0' + (val % 10) as u8;
+            val /= 10;
+            if val == 0 {
+                break;
+            }
+        }
+        let digits = tmp.get(i..)?;
+        let start = self.len;
+        let dst = self.buf.get_mut(start..start + digits.len())?;
+        dst.copy_from_slice(digits);
+        self.len = start + digits.len();
+        Some((start, self.len))
+    }
+
+    fn push_ip(&mut self, ip: std::net::IpAddr) -> Option<(usize, usize)> {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                let octets = v4.octets();
+                let start = self.len;
+                for (idx, &o) in octets.iter().enumerate() {
+                    if idx > 0 {
+                        let dot = self.buf.get_mut(self.len)?;
+                        *dot = b'.';
+                        self.len += 1;
+                    }
+                    self.push_u64(u64::from(o))?;
+                }
+                Some((start, self.len))
+            }
+            std::net::IpAddr::V6(_) => self.push_display(ip),
+        }
+    }
+
+    fn push_display(&mut self, val: impl std::fmt::Display) -> Option<(usize, usize)> {
+        use std::io::Write;
+        let start = self.len;
+        let mut slice = self.buf.get_mut(start..)?;
+        let before = slice.len();
+        write!(slice, "{val}").ok()?;
+        let written = before - slice.len();
+        self.len = start + written;
+        Some((start, self.len))
+    }
+
+    fn push_float_time(&mut self, secs: u64, mut micros: u32) -> Option<(usize, usize)> {
+        let start = self.len;
+        self.push_u64(secs)?;
+        let dot = self.buf.get_mut(self.len)?;
+        *dot = b'.';
+        self.len += 1;
+        let frac = self.buf.get_mut(self.len..self.len + 6)?;
+        for slot in frac.iter_mut().rev() {
+            *slot = b'0' + (micros % 10) as u8;
+            micros /= 10;
+        }
+        self.len += 6;
+        Some((start, self.len))
+    }
+
+    fn slice(&self, range: (usize, usize)) -> &str {
+        self.buf
+            .get(range.0..range.1)
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .unwrap_or("")
+    }
+}
+
 /// Builder offering control over SCRIPT_NAME / PATH_INFO splitting and extra
 /// `PHP_VALUE` / `PHP_ADMIN_VALUE` passthrough (e.g. `auto_prepend_file`), the
 /// per-context/ext-processor env, and the document root.
 pub struct CgiEnvBuilder<'a> {
     script_filename: &'a Path,
-    script_name: Option<String>,
-    path_info: Option<String>,
+    script_name: Option<Cow<'a, str>>,
+    path_info: Option<Cow<'a, str>>,
     document_root: Option<String>,
     /// Extra env appended verbatim (ext-processor `env`, PHP_VALUE/PHP_ADMIN_VALUE, ...).
     extra: Vec<(String, String)>,
@@ -66,6 +160,39 @@ pub struct CgiEnvBuilder<'a> {
     header_block: bool,
 }
 
+/// A request header bound for lsphp's header block, with its well-known index
+/// slot resolved once: the name mapping and both builder passes all need it.
+pub(crate) struct WireField<'r> {
+    pub(crate) name: Cow<'r, str>,
+    pub(crate) value: Cow<'r, str>,
+    pub(crate) known: Option<usize>,
+}
+
+impl crate::proto::WireHeader for WireField<'_> {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn value(&self) -> &str {
+        &self.value
+    }
+    fn known_index(&self) -> Option<usize> {
+        self.known
+    }
+    /// The name lsphp reports for a header (`getallheaders()`, #950). A well-known
+    /// header is sent by index slot, so the SAPI names it from its own table and the
+    /// name text is never read. Any other name is reported verbatim; the h1 case is
+    /// gone by now (the `http` crate lower-cases), so restore the conventional
+    /// Title-Case FPM/Apache present (`x-hub-signature-256` -> `X-Hub-Signature-256`).
+    /// Only `[A-Za-z0-9-]` names get here ([`header_forwardable`]), so the
+    /// mapping is case-only: `HTTP_*` names and duplicate grouping are unchanged. The
+    /// builder applies it while copying the name, so no per-header String is built.
+    fn title_case(&self) -> bool {
+        self.known.is_none()
+    }
+}
+
+/// Populate a caller-owned `Vec` with the CGI env entries using stack
+/// scratch, allowing repeated bodyless requests to reuse one TLS `Vec`.
 impl<'a> CgiEnvBuilder<'a> {
     pub fn new(script_filename: &'a Path) -> Self {
         CgiEnvBuilder {
@@ -92,13 +219,13 @@ impl<'a> CgiEnvBuilder<'a> {
     }
 
     /// Override SCRIPT_NAME (the URL path of the script, before PATH_INFO).
-    pub fn script_name(mut self, s: impl Into<String>) -> Self {
+    pub fn script_name(mut self, s: impl Into<Cow<'a, str>>) -> Self {
         self.script_name = Some(s.into());
         self
     }
 
     /// Set PATH_INFO (the trailing path after the script).
-    pub fn path_info(mut self, s: impl Into<String>) -> Self {
+    pub fn path_info(mut self, s: impl Into<Cow<'a, str>>) -> Self {
         self.path_info = Some(s.into());
         self
     }
@@ -151,8 +278,74 @@ impl<'a> CgiEnvBuilder<'a> {
     where
         'a: 'r,
     {
+        self.build_inner(req, ctx, content_length, None)
+    }
+
+    /// Like [`Self::build_with_content_length`], but formats numeric and IP CGI
+    /// variables (`REMOTE_ADDR`, `REMOTE_PORT`, `SERVER_ADDR`, `SERVER_PORT`,
+    /// `REQUEST_TIME`, `REQUEST_TIME_FLOAT`) into `scratch` with zero heap
+    /// allocations.
+    pub fn build_with_content_length_scratch<'r>(
+        self,
+        req: &'r Request,
+        ctx: &'r ReqCtx,
+        content_length: Option<&'r str>,
+        scratch: &'r mut CgiStackScratch,
+    ) -> Vec<(Cow<'r, str>, Cow<'r, str>)>
+    where
+        'a: 'r,
+    {
+        let mut env = Vec::with_capacity(24 + req.headers().len());
+        self.build_inner_into(req, ctx, content_length, Some(scratch), &mut env);
+        env
+    }
+
+    /// Populate a caller-owned `Vec` with the CGI env entries using stack
+    /// scratch, allowing repeated bodyless requests to reuse one TLS `Vec`.
+    pub fn build_with_content_length_scratch_into<'r>(
+        self,
+        req: &'r Request,
+        ctx: &'r ReqCtx,
+        content_length: Option<&'r str>,
+        scratch: &'r mut CgiStackScratch,
+        out: &mut Vec<(Cow<'r, str>, Cow<'r, str>)>,
+    ) where
+        'a: 'r,
+    {
+        out.clear();
+        self.build_inner_into(req, ctx, content_length, Some(scratch), out);
+    }
+
+    fn build_inner<'r>(
+        self,
+        req: &'r Request,
+        ctx: &'r ReqCtx,
+        content_length: Option<&'r str>,
+        scratch: Option<&'r mut CgiStackScratch>,
+    ) -> Vec<(Cow<'r, str>, Cow<'r, str>)>
+    where
+        'a: 'r,
+    {
         let mut env: Vec<(Cow<'r, str>, Cow<'r, str>)> =
             Vec::with_capacity(24 + req.headers().len());
+        self.build_inner_into(req, ctx, content_length, scratch, &mut env);
+        env
+    }
+
+    fn build_inner_into<'r>(
+        self,
+        req: &'r Request,
+        ctx: &'r ReqCtx,
+        content_length: Option<&'r str>,
+        mut scratch: Option<&'r mut CgiStackScratch>,
+        env: &mut Vec<(Cow<'r, str>, Cow<'r, str>)>,
+    ) where
+        'a: 'r,
+    {
+        let min_cap = 24 + req.headers().len();
+        if env.capacity() < min_cap {
+            env.reserve(min_cap - env.len());
+        }
 
         // Static constants: push once at the start (zero-alloc).
         env.push((Cow::Borrowed("GATEWAY_INTERFACE"), Cow::Borrowed("CGI/1.1")));
@@ -186,7 +379,7 @@ impl<'a> CgiEnvBuilder<'a> {
             ),
         }
         match self.script_name {
-            Some(s) => push!("SCRIPT_NAME", s),
+            Some(s) => env.push((Cow::Borrowed("SCRIPT_NAME"), s)),
             None => push_borrow!("SCRIPT_NAME", path),
         }
         push_borrow!("QUERY_STRING", query);
@@ -208,17 +401,44 @@ impl<'a> CgiEnvBuilder<'a> {
         };
         if let Some(pi) = path_info {
             let translated = format!("{doc_root}{pi}");
-            push!("PATH_INFO", pi);
+            env.push((Cow::Borrowed("PATH_INFO"), pi));
             env.push((Cow::Borrowed("DOCUMENT_ROOT"), doc_root));
             env.push((Cow::Borrowed("PATH_TRANSLATED"), Cow::Owned(translated)));
         } else {
             env.push((Cow::Borrowed("DOCUMENT_ROOT"), doc_root));
         }
 
+        // Pre-format the 6 numeric/IP values into stack scratch when supplied so
+        // `env` can borrow `&'r str` slices directly with zero heap allocations.
+        let since_epoch = ctx.request_time.duration_since(std::time::UNIX_EPOCH).ok();
+        let stack_ranges = if let Some(sc) = scratch.as_deref_mut() {
+            let r_addr = sc.push_ip(ctx.client_ip);
+            let r_port = sc.push_u64(u64::from(ctx.peer_port));
+            let s_addr = sc.push_ip(ctx.local_addr.ip());
+            let s_port = sc.push_u64(u64::from(ctx.local_addr.port()));
+            let (r_time, r_time_f) = match since_epoch {
+                Some(since) => (
+                    sc.push_u64(since.as_secs()),
+                    sc.push_float_time(since.as_secs(), since.subsec_micros()),
+                ),
+                None => (None, None),
+            };
+            Some((r_addr, r_port, s_addr, s_port, r_time, r_time_f))
+        } else {
+            None
+        };
+        let scratch_ref: Option<&'r CgiStackScratch> = scratch.map(|s| &*s);
+
         // Client / remote. REMOTE_ADDR is the proxy-resolved client IP;
         // REMOTE_PORT is the directly-connected peer's TCP port.
-        push!("REMOTE_ADDR", ctx.client_ip.to_string());
-        push!("REMOTE_PORT", ctx.peer_port.to_string());
+        match (scratch_ref, stack_ranges.and_then(|r| r.0)) {
+            (Some(sc), Some(rng)) => push_borrow!("REMOTE_ADDR", sc.slice(rng)),
+            _ => push!("REMOTE_ADDR", ctx.client_ip.to_string()),
+        }
+        match (scratch_ref, stack_ranges.and_then(|r| r.1)) {
+            (Some(sc), Some(rng)) => push_borrow!("REMOTE_PORT", sc.slice(rng)),
+            _ => push!("REMOTE_PORT", ctx.peer_port.to_string()),
+        }
 
         // Server identity — SERVER_NAME/SOFTWARE now borrow (#282).
         let server_name = match host_header(req) {
@@ -227,19 +447,32 @@ impl<'a> CgiEnvBuilder<'a> {
         };
         env.push((Cow::Borrowed("SERVER_NAME"), Cow::Borrowed(server_name)));
         env.push((Cow::Borrowed("SERVER_SOFTWARE"), self.server_software));
-        push!("SERVER_ADDR", ctx.local_addr.ip().to_string());
+        match (scratch_ref, stack_ranges.and_then(|r| r.2)) {
+            (Some(sc), Some(rng)) => push_borrow!("SERVER_ADDR", sc.slice(rng)),
+            _ => push!("SERVER_ADDR", ctx.local_addr.ip().to_string()),
+        }
 
         // The listener's port, never the client's Host header: SERVER_PORT is
         // server-asserted (LSWS REF_SERVER_PORT; XenForo isSecure() trusts 443).
-        push!("SERVER_PORT", ctx.local_addr.port().to_string());
+        match (scratch_ref, stack_ranges.and_then(|r| r.3)) {
+            (Some(sc), Some(rng)) => push_borrow!("SERVER_PORT", sc.slice(rng)),
+            _ => push!("SERVER_PORT", ctx.local_addr.port().to_string()),
+        }
 
         // Request arrival time. REQUEST_TIME is whole seconds; the _FLOAT variant
         // carries microsecond precision (e.g. "1700000000.123456").
-        if let Ok(since) = ctx.request_time.duration_since(std::time::UNIX_EPOCH) {
-            let secs = since.as_secs();
-            let micros = since.subsec_micros();
-            push!("REQUEST_TIME", secs.to_string());
-            push!("REQUEST_TIME_FLOAT", format!("{secs}.{micros:06}"));
+        if let Some(since) = since_epoch {
+            match (scratch_ref, stack_ranges.and_then(|r| r.4)) {
+                (Some(sc), Some(rng)) => push_borrow!("REQUEST_TIME", sc.slice(rng)),
+                _ => push!("REQUEST_TIME", since.as_secs().to_string()),
+            }
+            match (scratch_ref, stack_ranges.and_then(|r| r.5)) {
+                (Some(sc), Some(rng)) => push_borrow!("REQUEST_TIME_FLOAT", sc.slice(rng)),
+                _ => push!(
+                    "REQUEST_TIME_FLOAT",
+                    format!("{}.{:06}", since.as_secs(), since.subsec_micros())
+                ),
+            }
         }
 
         // (security #269) AUTH_TYPE / REMOTE_USER are SERVER-ASSERTED identity vars.
@@ -308,6 +541,24 @@ impl<'a> CgiEnvBuilder<'a> {
         // NO per-request HashMap allocation (the former O(1) map only existed to
         // avoid an O(n^2) linear scan over the env vec). `http_var_name` still runs
         // once per distinct name; the common single-value header stays borrowed.
+        const SEEN_AE: u8 = 1 << 0;
+        const SEEN_PROTO: u8 = 1 << 1;
+        const SEEN_HTTPS: u8 = 1 << 2;
+        const SEEN_SCHEME: u8 = 1 << 3;
+        const SEEN_REDIRECT: u8 = 1 << 4;
+        #[inline]
+        fn special_env_bit(k: &str) -> u8 {
+            match k {
+                "HTTP_ACCEPT_ENCODING" => SEEN_AE,
+                "SERVER_PROTOCOL" => SEEN_PROTO,
+                "HTTPS" => SEEN_HTTPS,
+                "REQUEST_SCHEME" => SEEN_SCHEME,
+                "REDIRECT_STATUS" => SEEN_REDIRECT,
+                _ => 0,
+            }
+        }
+        let mut seen_flags: u8 = 0;
+
         let mut have_host = false;
         for name in req.headers().keys() {
             let nm = name.as_str();
@@ -329,6 +580,10 @@ impl<'a> CgiEnvBuilder<'a> {
             let Some(first_hv) = values.next() else {
                 continue;
             };
+            let second_hv = values.next();
+            if second_hv.is_none() && self.header_block && header_block_registers_copy(nm) {
+                continue;
+            }
             let first: Cow<'r, str> = match first_hv.to_str() {
                 Ok(v) => Cow::Borrowed(v),
                 Err(_) => Cow::Owned(String::from_utf8_lossy(first_hv.as_bytes()).into_owned()),
@@ -347,8 +602,7 @@ impl<'a> CgiEnvBuilder<'a> {
             };
             // Common case: a single value -> use as-is (borrowed). Repeated header
             // -> join with ", " like CGI does (allocates only then).
-            let value: Cow<'r, str> = match values.next() {
-                None if self.header_block && header_block_registers_copy(nm) => continue,
+            let value: Cow<'r, str> = match second_hv {
                 None => first,
                 Some(second_hv) => {
                     // Cookie crumbs join with `; ` (RFC 9113 §8.2.3), the form every
@@ -371,6 +625,9 @@ impl<'a> CgiEnvBuilder<'a> {
                 }
             };
             have_host |= is_host;
+            if nm.eq_ignore_ascii_case("accept-encoding") {
+                seen_flags |= SEEN_AE;
+            }
             env.push((http_var_name(nm), value));
         }
         if let Some(cl) = content_length {
@@ -420,22 +677,15 @@ impl<'a> CgiEnvBuilder<'a> {
         // Borrowed from `ctx.env` (lives as long as `ctx`).
         for (k, v) in &ctx.env {
             if k == AUTH_USER_ENV {
-                upsert(
-                    &mut env,
-                    Cow::Borrowed("REMOTE_USER"),
-                    Cow::Borrowed(v.as_str()),
-                );
-                upsert(&mut env, Cow::Borrowed("AUTH_TYPE"), Cow::Borrowed("Basic"));
+                upsert(env, Cow::Borrowed("REMOTE_USER"), Cow::Borrowed(v.as_str()));
+                upsert(env, Cow::Borrowed("AUTH_TYPE"), Cow::Borrowed("Basic"));
                 continue;
             }
             if ctx_env_override_denied(k) {
                 continue;
             }
-            upsert(
-                &mut env,
-                Cow::Borrowed(k.as_str()),
-                Cow::Borrowed(v.as_str()),
-            );
+            seen_flags |= special_env_bit(k);
+            upsert(env, Cow::Borrowed(k.as_str()), Cow::Borrowed(v.as_str()));
         }
 
         // Tell PHP the client accepts only identity: both PHP-side compressors key
@@ -448,24 +698,30 @@ impl<'a> CgiEnvBuilder<'a> {
         // dispatch and read back from there, never from this CGI env). Must run
         // AFTER the ctx.env upsert above (which re-adds the real value); placed
         // before `extra` so an explicit caller override still wins.
-        upsert(
-            &mut env,
-            Cow::Borrowed("HTTP_ACCEPT_ENCODING"),
-            Cow::Borrowed("identity"),
-        );
+        if seen_flags & SEEN_AE != 0 {
+            upsert(
+                env,
+                Cow::Borrowed("HTTP_ACCEPT_ENCODING"),
+                Cow::Borrowed("identity"),
+            );
+        } else {
+            env.push((
+                Cow::Borrowed("HTTP_ACCEPT_ENCODING"),
+                Cow::Borrowed("identity"),
+            ));
+            seen_flags |= SEEN_AE;
+        }
 
         // Caller passthrough (borrowed base_env first, then any owned extra which
         // wins last on duplicate keys). base_env is borrowed from the long-lived
         // handler — no per-request clone.
         for (k, v) in self.extra_ref {
-            upsert(
-                &mut env,
-                Cow::Borrowed(k.as_str()),
-                Cow::Borrowed(v.as_str()),
-            );
+            seen_flags |= special_env_bit(k);
+            upsert(env, Cow::Borrowed(k.as_str()), Cow::Borrowed(v.as_str()));
         }
         for (k, v) in self.extra {
-            upsert(&mut env, Cow::Owned(k), Cow::Owned(v));
+            seen_flags |= special_env_bit(&k);
+            upsert(env, Cow::Owned(k), Cow::Owned(v));
         }
 
         // Static TLS/redirect-status/protocol DEFAULTS (zero-alloc). Inserted only if
@@ -473,34 +729,26 @@ impl<'a> CgiEnvBuilder<'a> {
         // entry of the same name WINS — restoring the pre-43a5aa7 "override beats
         // static" contract without shipping a duplicate key to lsphp (PHP's $_SERVER
         // takes the LAST occurrence, so a bare push here clobbered e.g. a PHP
-        // ErrorDocument subrequest's REDIRECT_STATUS=<code> back to 200) (#129). Placed
-        // after the upsert loops so the push closure's mutable borrow of `env` is done.
-        set_default(
-            &mut env,
-            Cow::Borrowed("SERVER_PROTOCOL"),
-            Cow::Borrowed(ctx.protocol.as_str()),
-        );
-        if ctx.is_tls {
-            set_default(&mut env, Cow::Borrowed("HTTPS"), Cow::Borrowed("on"));
-            set_default(
-                &mut env,
-                Cow::Borrowed("REQUEST_SCHEME"),
-                Cow::Borrowed("https"),
-            );
-        } else {
-            set_default(
-                &mut env,
-                Cow::Borrowed("REQUEST_SCHEME"),
-                Cow::Borrowed("http"),
-            );
+        // ErrorDocument subrequest's REDIRECT_STATUS=<code> back to 200) (#129).
+        if seen_flags & SEEN_PROTO == 0 {
+            env.push((
+                Cow::Borrowed("SERVER_PROTOCOL"),
+                Cow::Borrowed(ctx.protocol.as_str()),
+            ));
         }
-        set_default(
-            &mut env,
-            Cow::Borrowed("REDIRECT_STATUS"),
-            Cow::Borrowed("200"),
-        );
-
-        env
+        if ctx.is_tls {
+            if seen_flags & SEEN_HTTPS == 0 {
+                env.push((Cow::Borrowed("HTTPS"), Cow::Borrowed("on")));
+            }
+            if seen_flags & SEEN_SCHEME == 0 {
+                env.push((Cow::Borrowed("REQUEST_SCHEME"), Cow::Borrowed("https")));
+            }
+        } else if seen_flags & SEEN_SCHEME == 0 {
+            env.push((Cow::Borrowed("REQUEST_SCHEME"), Cow::Borrowed("http")));
+        }
+        if seen_flags & SEEN_REDIRECT == 0 {
+            env.push((Cow::Borrowed("REDIRECT_STATUS"), Cow::Borrowed("200")));
+        }
     }
 }
 
@@ -617,19 +865,6 @@ fn upsert<'r>(env: &mut Vec<(Cow<'r, str>, Cow<'r, str>)>, key: Cow<'r, str>, va
     if let Some(slot) = env.iter_mut().find(|(k, _)| k.as_ref() == key.as_ref()) {
         slot.1 = val;
     } else {
-        env.push((key, val));
-    }
-}
-
-/// Insert `key=val` ONLY if `key` is not already present (a default). Used for the
-/// static TLS/protocol/redirect-status vars so an earlier ctx.env/extra override of
-/// the same name wins and no duplicate key is shipped to lsphp (#129).
-fn set_default<'r>(
-    env: &mut Vec<(Cow<'r, str>, Cow<'r, str>)>,
-    key: Cow<'r, str>,
-    val: Cow<'r, str>,
-) {
-    if !env.iter().any(|(k, _)| k.as_ref() == key.as_ref()) {
         env.push((key, val));
     }
 }

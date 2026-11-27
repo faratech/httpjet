@@ -11,8 +11,36 @@ use monoio::{
     io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, Splitable},
     BufResult,
 };
-use monoio_io_wrapper::ReadBuffer;
 use rustls::{ClientConnection, ConnectionCommon, ServerConnection, SideData};
+
+/// Bounded `IoBufMut` wrapper around rustls's `DeframerVecBuffer` backing `Vec<u8>`.
+/// Reads directly from the socket into `vec[vec.len()..min(vec.capacity(), max_len)]`,
+/// eliminating the intermediate 16 KiB `monoio_io_wrapper::ReadBuffer` and per-read `memcpy`.
+struct DeframerIoBuf {
+    vec: Vec<u8>,
+    max_len: usize,
+}
+
+unsafe impl IoBufMut for DeframerIoBuf {
+    fn write_ptr(&mut self) -> *mut u8 {
+        // SAFETY: `self.vec.len() <= self.vec.capacity()`.
+        unsafe { self.vec.as_mut_ptr().add(self.vec.len()) }
+    }
+
+    fn bytes_total(&mut self) -> usize {
+        self.vec
+            .capacity()
+            .min(self.max_len)
+            .saturating_sub(self.vec.len())
+    }
+
+    unsafe fn set_init(&mut self, pos: usize) {
+        let new_len = self.vec.len() + pos;
+        debug_assert!(new_len <= self.vec.capacity());
+        debug_assert!(new_len <= self.max_len);
+        self.vec.set_len(new_len);
+    }
+}
 
 /// One rustls send batch in one write: accommodates a full 64 KiB payload plus
 /// HTTP/1 or HTTP/2 framing and TLS record headers without growing.
@@ -23,6 +51,91 @@ const IDLE_BUFFER_POOL_CAP: usize = 32;
 
 thread_local! {
     static IDLE_BUFFERS: RefCell<Vec<Box<[MaybeUninit<u8>]>>> = const { RefCell::new(Vec::new()) };
+    static RECORD_BATCHES: RefCell<Vec<OwnedRecordBatch>> = const { RefCell::new(Vec::new()) };
+}
+
+struct OwnedRecordBatch {
+    records: Vec<Vec<u8>>,
+    iovecs: Vec<libc::iovec>,
+    start: usize,
+}
+
+impl OwnedRecordBatch {
+    fn new() -> Self {
+        Self {
+            records: Vec::with_capacity(32),
+            iovecs: Vec::with_capacity(32),
+            start: 0,
+        }
+    }
+
+    fn prepare_iovecs(&mut self) -> usize {
+        self.iovecs.clear();
+        self.start = 0;
+        let mut total = 0usize;
+        for rec in &self.records {
+            total += rec.len();
+            self.iovecs.push(libc::iovec {
+                iov_base: rec.as_ptr() as *mut libc::c_void,
+                iov_len: rec.len(),
+            });
+        }
+        total
+    }
+
+    fn advance(&mut self, mut sent: usize) {
+        while self.start < self.iovecs.len() && sent >= self.iovecs[self.start].iov_len {
+            sent -= self.iovecs[self.start].iov_len;
+            self.start += 1;
+        }
+        if sent > 0 && self.start < self.iovecs.len() {
+            let iov = &mut self.iovecs[self.start];
+            // SAFETY: `sent < iov.iov_len` and `iov_base` points into `self.records[self.start]`.
+            iov.iov_base = unsafe { (iov.iov_base as *const u8).add(sent) as *mut libc::c_void };
+            iov.iov_len -= sent;
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        self.start >= self.iovecs.len()
+    }
+}
+
+unsafe impl IoVecBuf for OwnedRecordBatch {
+    fn read_iovec_ptr(&self) -> *const libc::iovec {
+        if self.start >= self.iovecs.len() {
+            self.iovecs.as_ptr()
+        } else {
+            // SAFETY: `self.start < self.iovecs.len()`.
+            unsafe { self.iovecs.as_ptr().add(self.start) }
+        }
+    }
+
+    fn read_iovec_len(&self) -> usize {
+        self.iovecs.len().saturating_sub(self.start)
+    }
+}
+
+fn take_record_batch() -> OwnedRecordBatch {
+    RECORD_BATCHES
+        .try_with(|pool| pool.borrow_mut().pop())
+        .ok()
+        .flatten()
+        .unwrap_or_else(OwnedRecordBatch::new)
+}
+
+fn put_record_batch(mut batch: OwnedRecordBatch) {
+    for rec in batch.records.drain(..) {
+        rustls::recycle_tls_record_vec(rec);
+    }
+    batch.iovecs.clear();
+    batch.start = 0;
+    let _ = RECORD_BATCHES.try_with(move |pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < IDLE_BUFFER_POOL_CAP {
+            pool.push(batch);
+        }
+    });
 }
 
 /// httpjet fork: a connection holds a write buffer only while it has ciphertext to send.
@@ -122,7 +235,7 @@ fn write_plaintext_iovecs<W: Write, T: IoVecBuf>(writer: &mut W, buf: &T) -> io:
 pub struct Stream<IO, C> {
     pub(crate) io: IO,
     pub(crate) session: C,
-    r_buffer: ReadBuffer,
+    read_in_flight: bool,
     w_buffer: WriteBuffer,
     /// httpjet fork: record framing of every ciphertext byte handed to rustls, kept
     /// until the first application read, so [`Stream::drain_received`] can tell whether
@@ -165,26 +278,13 @@ impl RecordBoundary {
     }
 }
 
-struct TrackedRead<'a> {
-    inner: &'a mut ReadBuffer,
-    records: &'a mut RecordBoundary,
-}
-
-impl Read for TrackedRead<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.records.feed(&buf[..n]);
-        Ok(n)
-    }
-}
-
 /// Read half of a TLS stream. Only the raw transport is split: the rustls
 /// connection remains a single value behind a checked, single-threaded cell.
 /// Every borrow of that connection is released before an I/O await.
 pub struct ReadHalf<IO, C> {
     io: IO,
     session: Rc<RefCell<C>>,
-    r_buffer: ReadBuffer,
+    read_in_flight: bool,
 }
 
 /// Write half of a TLS stream. The write adapter buffer belongs exclusively
@@ -220,7 +320,7 @@ impl<IO: Splitable, C> Splitable for Stream<IO, C> {
             ReadHalf {
                 io: read_io,
                 session: Rc::clone(&session),
-                r_buffer: self.r_buffer,
+                read_in_flight: self.read_in_flight,
             },
             WriteHalf {
                 io: write_io,
@@ -236,7 +336,7 @@ impl<IO, C> Stream<IO, C> {
         Self {
             io,
             session,
-            r_buffer: Default::default(),
+            read_in_flight: false,
             rx_records: Some(RecordBoundary::default()),
             #[cfg(target_arch = "aarch64")]
             h1_write_headroom: false,
@@ -256,7 +356,7 @@ impl<IO, C> Stream<IO, C> {
         Self {
             io,
             session,
-            r_buffer: ReadBuffer::new_unsafe(),
+            read_in_flight: false,
             w_buffer: WriteBuffer::new_unsafe(),
             rx_records: Some(RecordBoundary::default()),
             #[cfg(target_arch = "aarch64")]
@@ -300,7 +400,7 @@ impl<IO, C> Stream<IO, C> {
         Stream {
             io: map(self.io),
             session: self.session,
-            r_buffer: self.r_buffer,
+            read_in_flight: self.read_in_flight,
             w_buffer: self.w_buffer,
             rx_records: self.rx_records,
             #[cfg(target_arch = "aarch64")]
@@ -328,7 +428,7 @@ impl<IO, C> Stream<IO, C> {
         Stream {
             io: self.io,
             session: f(self.session),
-            r_buffer: self.r_buffer,
+            read_in_flight: self.read_in_flight,
             w_buffer: self.w_buffer,
             rx_records: self.rx_records,
             #[cfg(target_arch = "aarch64")]
@@ -340,7 +440,7 @@ impl<IO, C> Stream<IO, C> {
 #[cfg(test)]
 mod transition_tests {
     use std::future::Future;
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::sync::Arc;
     use std::task::{Context, Poll, Waker};
 
@@ -417,9 +517,11 @@ mod transition_tests {
 
         let mut buffer = WriteBuffer::idle();
         let mut sink = ShortSink::default();
-        let records = vec![b"abcd".to_vec(), b"efgh".to_vec()];
+        let mut batch = super::take_record_batch();
+        batch.records.push(b"abcd".to_vec());
+        batch.records.push(b"efgh".to_vec());
         assert_eq!(
-            ready(buffer.write_owned_batch(&mut sink, records)).unwrap(),
+            ready(buffer.write_owned_batch(&mut sink, batch)).unwrap(),
             8
         );
         assert_eq!(sink.0 .0, b"abcdefgh");
@@ -654,24 +756,15 @@ mod transition_tests {
     fn map_io_preserves_session_and_adapter_buffers() {
         let session = Arc::new("session-marker");
         let mut stream = Stream::new("original-io", session.clone());
-
-        let mut read_ahead: &[u8] = b"ciphertext-read-ahead";
-        assert_eq!(
-            ready(stream.r_buffer.do_io(&mut read_ahead)).unwrap(),
-            b"ciphertext-read-ahead".len()
-        );
         stream.w_buffer.write_all(b"pending-ciphertext").unwrap();
 
-        let mut mapped = stream.map_io(|io| {
+        let mapped = stream.map_io(|io| {
             assert_eq!(io, "original-io");
             "wrapped-io"
         });
         assert_eq!(mapped.io, "wrapped-io");
         assert!(Arc::ptr_eq(mapped.session(), &session));
 
-        let mut received = [0u8; 21];
-        mapped.r_buffer.read_exact(&mut received).unwrap();
-        assert_eq!(&received, b"ciphertext-read-ahead");
         match &mapped.w_buffer {
             WriteBuffer::Safe(buffer) => assert_eq!(
                 buffer.buffer.as_ref().expect("write buffer").len(),
@@ -745,7 +838,8 @@ impl WriteBuffer {
         };
         let empty = buffer.buffer.take().ok_or_else(write_cancelled_in_flight)?;
         let total = record.len();
-        let (result, _) = io.write_all(record).await;
+        let (result, record) = io.write_all(record).await;
+        rustls::recycle_tls_record_vec(record);
         result?;
         buffer.buffer = Some(empty);
         Ok(total)
@@ -754,38 +848,46 @@ impl WriteBuffer {
     async fn write_owned_batch<IO: AsyncWriteRent>(
         &mut self,
         mut io: IO,
-        records: Vec<Vec<u8>>,
+        mut batch: OwnedRecordBatch,
     ) -> io::Result<usize> {
         #[allow(irrefutable_let_patterns)]
         let Self::Safe(buffer) = self
         else {
+            put_record_batch(batch);
             return Err(write_cancelled_in_flight());
         };
         // A canceled or failed write leaves this adapter unusable. Once records
         // leave rustls, continuing on the connection could skip bytes on the wire.
-        let empty = buffer.buffer.take().ok_or_else(write_cancelled_in_flight)?;
-        let total: usize = records.iter().map(Vec::len).sum();
-        let (result, remainder) = io.writev(monoio::buf::VecBuf::from(records)).await;
-        let mut sent = result?;
-        if sent == 0 || sent > total {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "incomplete TLS record write",
-            ));
-        }
-        if sent < total {
-            // A short batch write leaves an exact byte offset, possibly inside
-            // a record. Keep each record owned through its remaining scalar write.
-            for record in Vec::<Vec<u8>>::from(remainder) {
-                if sent >= record.len() {
-                    sent -= record.len();
-                    continue;
-                }
-                let (result, _) = io.write_all(record.slice(sent..)).await;
-                result?;
-                sent = 0;
+        let empty = match buffer.buffer.take() {
+            Some(empty) => empty,
+            None => {
+                put_record_batch(batch);
+                return Err(write_cancelled_in_flight());
             }
+        };
+        let total = batch.prepare_iovecs();
+        let mut remaining = total;
+        while !batch.is_done() {
+            let (result, returned) = io.writev(batch).await;
+            batch = returned;
+            let sent = match result {
+                Ok(n) => n,
+                Err(err) => {
+                    put_record_batch(batch);
+                    return Err(err);
+                }
+            };
+            if sent == 0 || sent > remaining {
+                put_record_batch(batch);
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "incomplete TLS record write",
+                ));
+            }
+            remaining -= sent;
+            batch.advance(sent);
         }
+        put_record_batch(batch);
         buffer.buffer = Some(empty);
         Ok(total)
     }
@@ -1116,30 +1218,14 @@ where
     /// A KeyUpdate may have rotated rustls's keys; the caller must check the extracted
     /// secrets before programming another implementation.
     pub fn drain_received(&mut self, out: &mut Vec<u8>) -> io::Result<bool> {
+        self.session
+            .process_new_packets()
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         let mut chunk = [0u8; 8192];
         loop {
-            loop {
-                match self.session.reader().read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => out.extend_from_slice(&chunk[..n]),
-                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(err) => return Err(err),
-                }
-            }
-            let Some(records) = self.rx_records.as_mut() else {
-                return Ok(false);
-            };
-            let read = self.session.read_tls(&mut TrackedRead {
-                inner: &mut self.r_buffer,
-                records,
-            });
-            match read {
+            match self.session.reader().read(&mut chunk) {
                 Ok(0) => break,
-                Ok(_) => {
-                    self.session
-                        .process_new_packets()
-                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-                }
+                Ok(n) => out.extend_from_slice(&chunk[..n]),
                 Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => break,
                 Err(err) => return Err(err),
             }
@@ -1148,26 +1234,33 @@ where
     }
 
     pub(crate) async fn read_io(&mut self, splitted: bool) -> io::Result<usize> {
-        let n = loop {
-            let read = match self.rx_records.as_mut() {
-                Some(records) => self.session.read_tls(&mut TrackedRead {
-                    inner: &mut self.r_buffer,
-                    records,
-                }),
-                None => self.session.read_tls(&mut self.r_buffer),
-            };
-            match read {
-                Ok(n) => {
-                    break n;
+        if self.read_in_flight {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "tls read cancelled in flight",
+            ));
+        }
+        let n = match self.session.take_read_tls_buf()? {
+            None => 0,
+            Some((vec, max_len)) => {
+                let prev_len = vec.len();
+                let io_buf = DeframerIoBuf { vec, max_len };
+                self.read_in_flight = true;
+                let (res, io_buf) = self.io.read(io_buf).await;
+                self.read_in_flight = false;
+                match res {
+                    Ok(n) => {
+                        if let Some(records) = self.rx_records.as_mut() {
+                            records.feed(&io_buf.vec[prev_len..prev_len + n]);
+                        }
+                        self.session.commit_read_tls_buf(io_buf.vec, n);
+                        n
+                    }
+                    Err(err) => {
+                        self.session.restore_read_tls_buf(io_buf.vec);
+                        return Err(err);
+                    }
                 }
-                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    #[allow(unused_unsafe)]
-                    unsafe {
-                        self.r_buffer.do_io(&mut self.io).await?
-                    };
-                    continue;
-                }
-                Err(err) => return Err(err),
             }
         };
 
@@ -1210,8 +1303,12 @@ where
             if let Some(record) = self.session.take_single_tls_record() {
                 return self.w_buffer.write_owned_record(&mut self.io, record).await;
             }
-            if let Some(records) = self.session.take_tls_write_batch() {
-                return self.w_buffer.write_owned_batch(&mut self.io, records).await;
+            if self.session.has_tls_write_batch() {
+                let mut batch = take_record_batch();
+                if self.session.take_tls_write_batch_into(&mut batch.records) {
+                    return self.w_buffer.write_owned_batch(&mut self.io, batch).await;
+                }
+                put_record_batch(batch);
             }
         }
         let n = loop {
@@ -1324,20 +1421,34 @@ where
     C: DerefMut + Deref<Target = ConnectionCommon<SD>>,
 {
     async fn read_io(&mut self) -> io::Result<usize> {
-        let n = loop {
-            let result = {
+        if self.read_in_flight {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "tls read cancelled in flight",
+            ));
+        }
+        let taken = {
+            let mut session = self.session.borrow_mut();
+            session.take_read_tls_buf()?
+        };
+        let n = match taken {
+            None => 0,
+            Some((vec, max_len)) => {
+                let io_buf = DeframerIoBuf { vec, max_len };
+                self.read_in_flight = true;
+                let (res, io_buf) = self.io.read(io_buf).await;
+                self.read_in_flight = false;
                 let mut session = self.session.borrow_mut();
-                session.read_tls(&mut self.r_buffer)
-            };
-            match result {
-                Ok(n) => break n,
-                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    #[allow(unused_unsafe)]
-                    unsafe {
-                        self.r_buffer.do_io(&mut self.io).await?
-                    };
+                match res {
+                    Ok(n) => {
+                        session.commit_read_tls_buf(io_buf.vec, n);
+                        n
+                    }
+                    Err(err) => {
+                        session.restore_read_tls_buf(io_buf.vec);
+                        return Err(err);
+                    }
                 }
-                Err(err) => return Err(err),
             }
         };
 
@@ -1411,9 +1522,16 @@ where
             if let Some(record) = single {
                 return self.w_buffer.write_owned_record(&mut self.io, record).await;
             }
-            let batch = self.session.borrow_mut().take_tls_write_batch();
-            if let Some(records) = batch {
-                return self.w_buffer.write_owned_batch(&mut self.io, records).await;
+            if self.session.borrow().has_tls_write_batch() {
+                let mut batch = take_record_batch();
+                let has_batch = self
+                    .session
+                    .borrow_mut()
+                    .take_tls_write_batch_into(&mut batch.records);
+                if has_batch {
+                    return self.w_buffer.write_owned_batch(&mut self.io, batch).await;
+                }
+                put_record_batch(batch);
             }
         }
         let n = loop {

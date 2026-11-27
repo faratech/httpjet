@@ -141,7 +141,8 @@ pub(crate) fn prepare(
             .transpose()?,
         None => None,
     };
-    if quic_policy.is_some() != view.load_full().server.quic_enable {
+    let expects_quic = plan.https.is_some() && view.load_full().server.quic_enable;
+    if quic_policy.is_some() != expects_quic {
         anyhow::bail!("candidate QUIC policy does not match configured topology");
     }
     if acquired.http.listeners.is_empty()

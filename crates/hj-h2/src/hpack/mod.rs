@@ -819,6 +819,20 @@ impl Decoder {
         self.table_revision
     }
 
+    /// Borrow only a table entry's `(name, pre_validated_header_name)` without
+    /// cloning its `HeaderValue` (`Bytes` atomic RMW) when the caller only
+    /// needs the indexed name for a literal header field.
+    #[inline]
+    fn entry_name_ref(&self, index: usize) -> Option<(&[u8], Option<http::HeaderName>)> {
+        if let Some((n, _)) = static_table::get(index) {
+            return Some((n.as_bytes(), static_table::request_header_name(index)));
+        }
+        let dyn_idx = index.checked_sub(static_table::TABLE.len() + 1)?;
+        self.dynamic
+            .get(dyn_idx)
+            .map(|(n, _, hdr)| (&**n, hdr.clone()))
+    }
+
     /// Borrow a table entry's `(name, pre_validated_header_name, value, pre_validated_header_value)`
     /// — static (`'static`) or dynamic (borrowing `self.dynamic`). Returning pre-validated
     /// `HeaderName` + `HeaderValue` lets indexed hits skip redundant byte validation and heap
@@ -963,54 +977,55 @@ impl Decoder {
             }
             Ok(())
         };
-        while pos < buf.len() {
-            let b = buf[pos];
-            if b & 0x80 != 0 {
-                // §6.1 Indexed Header Field.
-                let idx = integer::decode(buf, &mut pos, 7).ok_or(Error::Truncated)? as usize;
-                let (n, hdr, v, hv) = self.entry_ref(idx).ok_or(Error::BadIndex)?;
-                seen_field = true;
-                emit_checked(n, hdr, v, hv)?;
-            } else if b & 0x40 != 0 {
-                // §6.2.1 Literal with incremental indexing (6-bit name index prefix).
-                let (n, hdr, v) = self.read_literal(buf, &mut pos, 6)?;
-                seen_field = true;
-                // Own once and pre-validate `HeaderValue` before emitting so both the
-                // emitted request header and the dynamic table share one refcounted Bytes
-                // allocation with a single validation pass.
-                let n: Box<[u8]> = n.into_owned().into();
-                let dyn_val = DynValue::from_bytes(v.into_owned().into());
-                emit_checked(&n, hdr.clone(), dyn_val.as_bytes(), dyn_val.header_value())?;
-                self.insert_dyn(n, dyn_val, hdr);
-            } else if b & 0x20 != 0 {
-                // §6.3 Dynamic table size update (5-bit prefix).
-                if seen_field {
-                    return Err(Error::InvalidSizeUpdate); // §4.2: not at block start
-                }
-                let new_max = integer::decode(buf, &mut pos, 5).ok_or(Error::Truncated)? as usize;
-                self.set_max_size(new_max)?;
-            } else {
-                // §6.2.2 without indexing / §6.2.3 never indexed (4-bit name prefix). The field is
-                // emitted and NEVER stored, so its name+value are TRANSIENT — decode them into the
-                // reused thread-local scratch and emit straight from the borrow, so a per-request
-                // Huffman field (Cookie, `:path`) costs no per-field `String` allocation. (The
-                // incremental-indexing arm above still owns, as that entry outlives the block.)
-                let name_idx = integer::decode(buf, &mut pos, 4).ok_or(Error::Truncated)? as usize;
-                seen_field = true;
-                DECODE_SCRATCH.with(|cell| -> Result<(), Error> {
-                    let mut guard = cell.borrow_mut();
-                    let (nb, vb) = &mut *guard;
+        DECODE_SCRATCH.with(|cell| -> Result<(), Error> {
+            let mut guard = cell.borrow_mut();
+            let (nb, vb) = &mut *guard;
+            while pos < buf.len() {
+                let b = buf[pos];
+                if b & 0x80 != 0 {
+                    // §6.1 Indexed Header Field.
+                    let idx = integer::decode(buf, &mut pos, 7).ok_or(Error::Truncated)? as usize;
+                    let (n, hdr, v, hv) = self.entry_ref(idx).ok_or(Error::BadIndex)?;
+                    seen_field = true;
+                    emit_checked(n, hdr, v, hv)?;
+                } else if b & 0x40 != 0 {
+                    // §6.2.1 Literal with incremental indexing (6-bit name index prefix).
+                    let (n, hdr, v) = self.read_literal(buf, &mut pos, 6)?;
+                    seen_field = true;
+                    // Own once and pre-validate `HeaderValue` before emitting so both the
+                    // emitted request header and the dynamic table share one refcounted Bytes
+                    // allocation with a single validation pass.
+                    let n: Box<[u8]> = n.into_owned().into();
+                    let dyn_val = DynValue::from_bytes(v.into_owned().into());
+                    emit_checked(&n, hdr.clone(), dyn_val.as_bytes(), dyn_val.header_value())?;
+                    self.insert_dyn(n, dyn_val, hdr);
+                } else if b & 0x20 != 0 {
+                    // §6.3 Dynamic table size update (5-bit prefix).
+                    if seen_field {
+                        return Err(Error::InvalidSizeUpdate); // §4.2: not at block start
+                    }
+                    let new_max =
+                        integer::decode(buf, &mut pos, 5).ok_or(Error::Truncated)? as usize;
+                    self.set_max_size(new_max)?;
+                } else {
+                    // §6.2.2 without indexing / §6.2.3 never indexed (4-bit name prefix). The field
+                    // is emitted and NEVER stored, so its name+value are TRANSIENT — decode them
+                    // into the reused thread-local scratch (borrowed once per block) and emit
+                    // straight from the borrow, avoiding per-field TLS borrows and `String` allocs.
+                    let name_idx =
+                        integer::decode(buf, &mut pos, 4).ok_or(Error::Truncated)? as usize;
+                    seen_field = true;
                     let (name, hdr): (&[u8], Option<http::HeaderName>) = if name_idx == 0 {
                         (decode_string_into(buf, &mut pos, nb)?, None)
                     } else {
-                        let (n, hdr, _, _) = self.entry_ref(name_idx).ok_or(Error::BadIndex)?;
-                        (n, hdr)
+                        self.entry_name_ref(name_idx).ok_or(Error::BadIndex)?
                     };
                     let value: &[u8] = decode_string_into(buf, &mut pos, vb)?;
-                    emit_checked(name, hdr, value, None)
-                })?;
+                    emit_checked(name, hdr, value, None)?;
+                }
             }
-        }
+            Ok(())
+        })?;
         if listed.get() > list_limit {
             return Err(Error::HeaderListTooLarge);
         }
@@ -1036,7 +1051,7 @@ impl Decoder {
             let hdr = validate_request_header_name(&n);
             (n, hdr)
         } else {
-            let (n, hdr, _, _) = self.entry_ref(name_idx).ok_or(Error::BadIndex)?;
+            let (n, hdr) = self.entry_name_ref(name_idx).ok_or(Error::BadIndex)?;
             (Cow::Borrowed(n), hdr)
         };
         let value = decode_string(buf, pos)?;

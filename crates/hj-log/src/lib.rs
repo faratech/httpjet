@@ -329,16 +329,10 @@ impl AccessRecord {
     }
 
     fn render_into(&self, out: &mut Vec<u8>, format: LogFormat) {
-        let escaped_reqid = (format != LogFormat::Json)
-            .then(|| self.request_id.as_deref().map(escape))
-            .flatten();
-        let reqid_disp: Option<&dyn std::fmt::Display> = match format {
-            LogFormat::Json => self
-                .request_id
-                .as_ref()
-                .map(|r| r as &dyn std::fmt::Display),
-            _ => escaped_reqid.as_ref().map(|r| r as &dyn std::fmt::Display),
-        };
+        let reqid_disp: Option<&dyn std::fmt::Display> = self
+            .request_id
+            .as_ref()
+            .map(|r| r as &dyn std::fmt::Display);
         render_line(
             out,
             format,
@@ -667,7 +661,15 @@ fn render_line(out: &mut Vec<u8>, format: LogFormat, f: &LineFields<'_>) {
     } else if let Some(id) = f.request_id {
         // Trailing token in every text format so the line is joinable with the
         // error/php-slow logs; absent ⇒ nothing appended (legacy layout).
-        let _ = write!(out, " reqid={}", id);
+        struct Esc<'a>(&'a mut Vec<u8>);
+        impl std::fmt::Write for Esc<'_> {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                self.0.extend_from_slice(escape(s).as_bytes());
+                Ok(())
+            }
+        }
+        out.extend_from_slice(b" reqid=");
+        let _ = std::fmt::write(&mut Esc(out), format_args!("{id}"));
     }
 }
 
@@ -1861,6 +1863,15 @@ mod tests {
             r.render(LogFormat::Json)
                 .contains("\"remote_user\":\"bob \\\"x\\\" caf\u{e9}\"")
         );
+    }
+
+    #[test]
+    fn text_request_id_is_escaped() {
+        let mut r = sample();
+        r.request_id = Some("abc\r\nforged".into());
+        let line = r.render(LogFormat::Combined);
+        assert!(!line.contains('\r') && !line.contains('\n'), "{line}");
+        assert!(line.contains(r"reqid=abc\r\nforged"), "{line}");
     }
 
     #[test]

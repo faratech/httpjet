@@ -80,7 +80,14 @@ impl AtomicHistogram {
         if i == NB {
             self.inf.fetch_add(1, Relaxed);
         }
-        self.sum_us.fetch_add(us, Relaxed);
+        if us != 0 {
+            self.sum_us.fetch_add(us, Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn record_zero_batch(&self, count: u64) {
+        self.buckets[0].fetch_add(count, Relaxed);
     }
 
     fn snapshot(&self) -> HistogramSnapshot {
@@ -576,6 +583,39 @@ impl Telemetry {
     #[inline]
     pub fn shard(&self) -> &TelemetryShard {
         SHARD_IDX.with(|i| &self.shards[*i].0)
+    }
+
+    #[inline]
+    pub fn record_requests_batch_200(&self, proto: hj_core::Proto, vhost_idx: usize, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let s = self.shard();
+        let Some(vh) = s.per_vhost.get(vhost_idx.min(VHOST_OVERFLOW)) else {
+            return;
+        };
+        vh.duration.record_zero_batch(count);
+        match proto {
+            hj_core::Proto::Http1 | hj_core::Proto::Http10 => &s.proto_h1,
+            hj_core::Proto::Http2 => &s.proto_h2,
+            hj_core::Proto::Http3 => &s.proto_h3,
+        }
+        .fetch_add(count, Relaxed);
+        vh.status_2xx.fetch_add(count, Relaxed);
+    }
+
+    #[inline]
+    pub fn record_cache_hits_batch_idx(&self, loopback: bool, vhost_idx: usize, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let s = self.shard();
+        if let Some(vh) = s.per_vhost.get(vhost_idx.min(VHOST_OVERFLOW)) {
+            vh.cache_hits.fetch_add(count, Relaxed);
+        }
+        if loopback {
+            s.cache_hits_loopback.fetch_add(count, Relaxed);
+        }
     }
 
     /// Record protocol + status class + total wall time (every request).

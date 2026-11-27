@@ -269,18 +269,16 @@ impl Handler for FastCgi {
         };
 
         let status = parsed.status;
-        let headers = parsed.headers;
+        let mut headers = parsed.headers;
         let prefix = parsed.body_prefix;
         let is_head = req.method() == http::Method::HEAD;
-        // Keep validating an application's Content-Length on non-HEAD responses,
-        // but do not enforce it against statuses whose wire response has no body.
-        // A 304 may legitimately carry the selected representation's length even
-        // though it sends zero body bytes.
-        let declared = if is_head {
-            None
-        } else {
-            response_content_length(&headers)?
-        };
+        // Always validate and canonicalize an application's Content-Length
+        // (including on HEAD), while skipping body-length enforcement on
+        // responses whose wire framing forbids a body (HEAD, 204, 304).
+        let declared = response_content_length(&headers)?;
+        if let Some(len) = declared {
+            headers.insert(http::header::CONTENT_LENGTH, http::HeaderValue::from(len));
+        }
         let body_forbidden = hj_core::response_body_forbidden(is_head, status);
         let expected = if body_forbidden { None } else { declared };
 
@@ -741,8 +739,13 @@ fn response_content_length(headers: &http::HeaderMap) -> Result<Option<u64>, Han
             .map_err(|_| HandlerError::BadGateway("invalid FastCGI Content-Length".into()))?
             .split(',')
         {
-            let value = value
-                .trim()
+            let trimmed = value.trim();
+            if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(HandlerError::BadGateway(
+                    "invalid FastCGI Content-Length".into(),
+                ));
+            }
+            let value = trimmed
                 .parse::<u64>()
                 .map_err(|_| HandlerError::BadGateway("invalid FastCGI Content-Length".into()))?;
             if length.is_some_and(|previous| previous != value) {
@@ -1767,5 +1770,29 @@ mod tests {
                 "{name} must be protected"
             );
         }
+    }
+
+    #[test]
+    fn response_content_length_rejects_plus_and_empty_and_conflicts() {
+        let mut h = http::HeaderMap::new();
+        h.append(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("+5"),
+        );
+        assert!(response_content_length(&h).is_err());
+
+        let mut h = http::HeaderMap::new();
+        h.append(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("5, 5"),
+        );
+        assert_eq!(response_content_length(&h).unwrap(), Some(5));
+
+        let mut h = http::HeaderMap::new();
+        h.append(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("5, 6"),
+        );
+        assert!(response_content_length(&h).is_err());
     }
 }

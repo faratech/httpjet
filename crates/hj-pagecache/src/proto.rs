@@ -31,6 +31,21 @@ pub enum LsCacheControl {
     Absent,
 }
 
+/// Parse an RFC 9111 §1.2.2 `delta-seconds` (`1*DIGIT`), tolerating at most one
+/// matching pair of surrounding double quotes (`"600"`). Rejects signed forms
+/// (`+60`) and multiple/unmatched quotes (`""60""`).
+fn parse_delta_seconds(raw: &str) -> Option<u32> {
+    let s = raw.trim();
+    let s = s
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(s);
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<u32>().ok()
+}
+
 /// Parse a `name=seconds` cache directive token, tolerant of optional whitespace
 /// around `=` and optional quotes (RFC 7234 allows `max-age="600"`).
 fn dir_secs(tok: &str, name: &str) -> Option<u32> {
@@ -38,8 +53,7 @@ fn dir_secs(tok: &str, name: &str) -> Option<u32> {
     if k.trim() != name {
         return None;
     }
-    let v = v.trim().trim_matches('"');
-    Some(v.parse().unwrap_or(0))
+    Some(parse_delta_seconds(v).unwrap_or(0))
 }
 
 /// Split a Cache-Control field at commas outside quoted strings. Backslash
@@ -119,16 +133,23 @@ pub fn parse_lscache_control(v: &str) -> LsCacheControl {
             stale_secs = stale_secs.max(age);
         } else if let Some((k, val)) = tok.split_once('=') {
             if k.trim() == "s-maxage" {
-                match val.trim().trim_matches('"').parse::<u32>() {
-                    Ok(0) | Err(_) => return LsCacheControl::NoCache,
-                    Ok(n) => s_maxage = Some(n),
+                match parse_delta_seconds(val) {
+                    Some(0) | None => return LsCacheControl::NoCache,
+                    Some(n) => s_maxage = Some(s_maxage.map_or(n, |cur| cur.min(n))),
                 }
             } else if k.trim() == "max-age" {
                 // An EXPLICIT max-age must be distinguished from an absent one: `0`
                 // means "immediately stale", and a malformed/overflowing value fails
                 // CLOSED (do not cache) rather than silently default-cache. Absent
                 // max-age (a bare `public`/`private`) still means the configured default.
-                max_age = Some(val.trim().trim_matches('"').parse::<u32>().ok());
+                // Duplicate max-age directives preserve any prior failure/zero and take
+                // the minimum (most restrictive) valid value (#1309).
+                let parsed = parse_delta_seconds(val);
+                max_age = Some(match (max_age, parsed) {
+                    (Some(None), _) | (_, None) => None,
+                    (Some(Some(cur)), Some(n)) => Some(cur.min(n)),
+                    (None, Some(n)) => Some(n),
+                });
             }
         }
     }
@@ -214,10 +235,10 @@ pub fn parse_std_cache_control(v: &str) -> StdCacheControl {
                 } else if name == Some("no-cache") {
                     cc.no_cache = true;
                 } else if let Some(n) = dir_secs(&low, "s-maxage") {
-                    cc.s_maxage.get_or_insert(n);
+                    cc.s_maxage = Some(cc.s_maxage.map_or(n, |cur| cur.min(n)));
                     cc.must_revalidate = true;
                 } else if let Some(n) = dir_secs(&low, "max-age") {
-                    cc.max_age.get_or_insert(n);
+                    cc.max_age = Some(cc.max_age.map_or(n, |cur| cur.min(n)));
                 } else if let Some(n) = dir_secs(&low, "stale-while-revalidate") {
                     cc.stale_while_revalidate.get_or_insert(n);
                 } else if let Some(n) = dir_secs(&low, "stale-if-error") {
@@ -363,6 +384,43 @@ mod tests {
             parse_lscache_control("public, max-age = 0"),
             LsCacheControl::NoCache
         );
+        // (#1309) Duplicate max-age / s-maxage must fail closed and take minimum.
+        assert_eq!(
+            parse_lscache_control("public, max-age=0, max-age=3600"),
+            LsCacheControl::NoCache
+        );
+        assert_eq!(
+            parse_lscache_control("public, max-age=invalid, max-age=3600"),
+            LsCacheControl::NoCache
+        );
+        assert_eq!(
+            parse_lscache_control("public, max-age=3600, max-age=60"),
+            LsCacheControl::Public {
+                ttl_secs: 60,
+                stale_secs: 0,
+                stale_if_error_secs: 0
+            }
+        );
+        assert_eq!(
+            parse_lscache_control("public, s-maxage=30, s-maxage=3600"),
+            LsCacheControl::Public {
+                ttl_secs: 30,
+                stale_secs: 0,
+                stale_if_error_secs: 0
+            }
+        );
+    }
+
+    #[test]
+    fn standard_cache_control_duplicate_max_age_takes_minimum() {
+        // (#1297) RFC 9111: duplicate max-age / s-maxage must take the most
+        // restrictive (minimum) value, not first-wins.
+        let cc = parse_std_cache_control("public, max-age=3600, max-age=0");
+        assert_eq!(cc.max_age, Some(0));
+        let cc2 = parse_std_cache_control("public, s-maxage=600, s-maxage=30");
+        assert_eq!(cc2.s_maxage, Some(30));
+        let cc3 = parse_std_cache_control("public, max-age=10, max-age=3600");
+        assert_eq!(cc3.max_age, Some(10));
     }
 
     #[test]
@@ -469,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn std_cc_duplicate_numeric_directives_keep_the_first_value() {
+    fn std_cc_duplicate_numeric_directives_take_the_minimum() {
         let cc = parse_std_cache_control(
             "public, max-age=0, max-age=300, s-maxage=0, s-maxage=600, \
              stale-if-error=0, stale-if-error=90",
@@ -479,7 +537,7 @@ mod tests {
         assert_eq!(cc.stale_if_error, Some(0));
 
         let reversed = parse_std_cache_control("max-age=300, max-age=0");
-        assert_eq!(reversed.max_age, Some(300));
+        assert_eq!(reversed.max_age, Some(0));
     }
 
     #[test]
@@ -659,5 +717,33 @@ mod tests {
             parse_lscache_control("public, max-age=0"),
             LsCacheControl::NoCache
         );
+    }
+
+    #[test]
+    fn cache_control_rejects_signed_and_multi_quoted_delta_seconds() {
+        assert_eq!(
+            parse_lscache_control("public, max-age=+60"),
+            LsCacheControl::NoCache
+        );
+        assert_eq!(
+            parse_lscache_control("public, s-maxage=+60"),
+            LsCacheControl::NoCache
+        );
+        assert_eq!(
+            parse_lscache_control("public, max-age=\"\"60\"\""),
+            LsCacheControl::NoCache
+        );
+        assert_eq!(
+            parse_lscache_control("public, max-age=\"60\""),
+            LsCacheControl::Public {
+                ttl_secs: 60,
+                stale_secs: 0,
+                stale_if_error_secs: 0,
+            }
+        );
+        let std_signed = parse_std_cache_control("public, max-age=+60");
+        assert_eq!(std_signed.max_age, Some(0));
+        let std_quoted = parse_std_cache_control("public, max-age=\"120\"");
+        assert_eq!(std_quoted.max_age, Some(120));
     }
 }

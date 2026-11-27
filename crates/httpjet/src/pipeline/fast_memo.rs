@@ -111,6 +111,8 @@ pub(super) struct MemoKey<'a> {
     pub path: &'a str,
     pub query: &'a str,
     pub ae: &'a [u8],
+    pub has_cookie: bool,
+    pub cookie_vary: &'a str,
 }
 
 /// The ruleset a [`VaryItem::UaClass`] bitmap was computed against, pinned so a
@@ -160,6 +162,16 @@ impl VaryItem {
     fn matches(&self, req: &Request, ua_cache: &UaClassifyCache) -> bool {
         match self {
             VaryItem::Header { name, value } => {
+                if name == &http::header::COOKIE
+                    && req
+                        .headers()
+                        .get_all(http::header::COOKIE)
+                        .iter()
+                        .nth(1)
+                        .is_some()
+                {
+                    return false;
+                }
                 req.headers().get(name).map(|v| v.as_bytes()) == value.as_deref()
             }
             VaryItem::UaClass {
@@ -187,8 +199,14 @@ impl VaryItem {
     ) -> bool {
         match self {
             VaryItem::Header { name, value } => {
-                if *name == http::header::COOKIE {
-                    return value.is_none();
+                if name == &http::header::COOKIE
+                    && headers
+                        .get_all(http::header::COOKIE)
+                        .iter()
+                        .nth(1)
+                        .is_some()
+                {
+                    return false;
                 }
                 headers.get(name).map(|v| v.as_bytes()) == value.as_deref()
             }
@@ -268,6 +286,7 @@ struct MemoEntry {
     path: String,
     query: String,
     ae: Vec<u8>,
+    cookie_vary: String,
     vary: Vec<VaryItem>,
     bandwidth: Option<super::PerConnBandwidth>,
     status: http::StatusCode,
@@ -276,6 +295,10 @@ struct MemoEntry {
     stamp_date: bool,
     /// Last observed epoch second, shared by access logging and generated Date headers.
     stamped_date_sec: u64,
+    /// Page-cache entry whose `Age` header was not overridden by header transforms:
+    /// refresh `Age` in place on each second tick instead of expiring the memo every 1 s.
+    stamp_age: bool,
+    stamped_age_sec: u64,
     body: Bytes,
     expires: Instant,
 }
@@ -392,6 +415,7 @@ fn key_hash(k: &MemoKey) -> u64 {
     k.path.hash(&mut h);
     k.query.hash(&mut h);
     k.ae.hash(&mut h);
+    k.cookie_vary.hash(&mut h);
     h.finish()
 }
 
@@ -423,6 +447,7 @@ fn matches(e: &MemoEntry, k: &MemoKey) -> bool {
         && e.path == k.path
         && same_optional_bytes(e.query.as_bytes(), k.query.as_bytes())
         && same_optional_bytes(&e.ae, k.ae)
+        && same_optional_bytes(e.cookie_vary.as_bytes(), k.cookie_vary.as_bytes())
 }
 
 #[derive(Clone)]
@@ -540,6 +565,7 @@ pub(super) fn probe_shared_serve<E>(
                     .iter_mut()
                     .find(|e| {
                         (k.allow_page_responses || e.page.is_none())
+                            && (!k.has_cookie || e.page.is_some())
                             && matches(e, k)
                             && e.vary
                                 .iter()
@@ -554,13 +580,29 @@ pub(super) fn probe_shared_serve<E>(
                             Err(err) => return Some(Err(err)),
                         };
                         let page_serve = if let Some(page) = &e.page {
-                            if now >= page.deadline || !purge_epoch_current(page.purge_epoch) {
+                            let effective_deadline = if e.stamp_age {
+                                page.fresh_until
+                            } else {
+                                page.deadline
+                            };
+                            if now >= effective_deadline || !purge_epoch_current(page.purge_epoch) {
                                 return Some(Err(memo_changed_err));
+                            }
+                            if e.stamp_age {
+                                let age_sec =
+                                    now.saturating_duration_since(page.stored_at).as_secs();
+                                if age_sec != e.stamped_age_sec {
+                                    Arc::make_mut(&mut e.headers).insert(
+                                        http::header::AGE,
+                                        http::HeaderValue::from(age_sec),
+                                    );
+                                    e.stamped_age_sec = age_sec;
+                                }
                             }
                             Some(PageMemoServe {
                                 key_hash: page.key_hash,
                                 variant_codec: e.variant_codec,
-                                deadline: page.deadline,
+                                deadline: effective_deadline.min(e.expires),
                                 lease: page.lease.clone(),
                             })
                         } else {
@@ -607,12 +649,28 @@ pub(super) fn probe(
         }
         let e = m.map.get_mut(&h)?.iter_mut().find(|e| {
             (k.allow_page_responses || e.page.is_none())
+                && (!k.has_cookie || e.page.is_some())
                 && e.page.as_ref().is_none_or(|page| page.lease.is_current())
                 && matches(e, k)
                 && e.vary.iter().all(|v| v.matches(req, ua_cache))
         })?;
-        if e.page.is_some() && Instant::now() >= e.expires {
-            return None;
+        if let Some(page) = &e.page {
+            let effective_deadline = if e.stamp_age {
+                page.fresh_until
+            } else {
+                page.deadline
+            };
+            if Instant::now() >= e.expires || now >= effective_deadline {
+                return None;
+            }
+            if e.stamp_age {
+                let age_sec = now.saturating_duration_since(page.stored_at).as_secs();
+                if age_sec != e.stamped_age_sec {
+                    Arc::make_mut(&mut e.headers)
+                        .insert(http::header::AGE, http::HeaderValue::from(age_sec));
+                    e.stamped_age_sec = age_sec;
+                }
+            }
         }
         if e.stamp_date {
             let (sec, date_val) = hj_core::http_date_now_with_sec();
@@ -655,9 +713,25 @@ pub(super) fn store_until(
     {
         return false;
     }
-    let expires = (now + TTL)
-        .min(policy_deadline)
-        .min(page.as_ref().map_or(policy_deadline, |page| page.deadline));
+    let (stamp_age, stamped_age_sec, page_deadline) = match page.as_ref() {
+        Some(p) => {
+            let expected = http::HeaderValue::from(p.initial_age_secs);
+            let mut age_iter = resp.headers().get_all(http::header::AGE).iter();
+            let untouched_age = age_iter.next() == Some(&expected) && age_iter.next().is_none();
+            if untouched_age {
+                (true, p.initial_age_secs, p.fresh_until)
+            } else {
+                (false, 0, p.deadline)
+            }
+        }
+        None => (false, 0, policy_deadline),
+    };
+    let page_ttl = if stamp_age {
+        Duration::from_secs(30)
+    } else {
+        TTL
+    };
+    let expires = (now + page_ttl).min(policy_deadline).min(page_deadline);
     if expires <= Instant::now() {
         return false;
     }
@@ -703,9 +777,10 @@ pub(super) fn store_until(
     } else {
         resp.headers().clone()
     };
-    // Pre-strip hop-by-hop headers once at store time so H2/H3 writers can
-    // serialize directly from `SharedHeaders(Arc<HeaderMap>)` without cloning.
+    // Pre-strip hop-by-hop headers and duplicate Content-Length once at store
+    // time so H2/H3 writers can serialize directly from `SharedHeaders` (#1296).
     hj_core::strip_hop_by_hop_response(&mut headers);
+    hj_core::sanitize_h2_h3_body_headers(&mut headers, false, http::StatusCode::OK, false);
     let stamp_date = !headers.contains_key(http::header::DATE);
     let stamped_date_sec = if stamp_date {
         let (sec, date_val) = hj_core::http_date_now_with_sec();
@@ -737,12 +812,15 @@ pub(super) fn store_until(
         path: k.path.to_owned(),
         query: k.query.to_owned(),
         ae: k.ae.to_owned(),
+        cookie_vary: k.cookie_vary.to_owned(),
         vary,
         bandwidth: resp.extensions().get::<super::PerConnBandwidth>().copied(),
         status: resp.status(),
         headers,
         stamp_date,
         stamped_date_sec,
+        stamp_age,
+        stamped_age_sec,
         // Held for the memo's TTL. A pooled egress buffer (marked `FreshBody` by its producer)
         // is copied out, or the entry would pin it whole while the byte budget counted only
         // its length; any other body (static cache or shrink_to_fit page-cache variants) is shared.
@@ -814,6 +892,8 @@ mod tests {
             path,
             query: "",
             ae,
+            has_cookie: false,
+            cookie_vary: "",
         }
     }
 
@@ -926,6 +1006,9 @@ mod tests {
             .insert(crate::lscache::PublicResponseMemo {
                 key_hash: 123,
                 purge_epoch: 0,
+                stored_at: now,
+                fresh_until: now + TTL,
+                initial_age_secs: 0,
                 deadline: now + TTL,
                 lease,
             });
@@ -986,6 +1069,9 @@ mod tests {
             .insert(crate::lscache::PublicResponseMemo {
                 key_hash: 123,
                 purge_epoch: 0,
+                stored_at: now,
+                fresh_until: now + Duration::from_millis(250),
+                initial_age_secs: 0,
                 deadline: now + Duration::from_millis(250),
                 lease,
             });
@@ -1024,6 +1110,9 @@ mod tests {
             .insert(crate::lscache::PublicResponseMemo {
                 key_hash: 456,
                 purge_epoch: 0,
+                stored_at: now,
+                fresh_until: now + TTL,
+                initial_age_secs: 0,
                 deadline: now + TTL,
                 lease,
             });
@@ -1089,6 +1178,9 @@ mod tests {
             .insert(crate::lscache::PublicResponseMemo {
                 key_hash: 789,
                 purge_epoch: 0,
+                stored_at: now,
+                fresh_until: now + TTL,
+                initial_age_secs: 0,
                 deadline: now + TTL,
                 lease,
             });
@@ -1115,6 +1207,9 @@ mod tests {
             .insert(crate::lscache::PublicResponseMemo {
                 key_hash: 999,
                 purge_epoch: 0,
+                stored_at: now,
+                fresh_until: now + TTL,
+                initial_age_secs: 0,
                 deadline: now + TTL,
                 lease: lease.clone(),
             });
@@ -1688,5 +1783,29 @@ mod tests {
         let r = http::Response::new(Body::Empty);
         store(&key("/d", b""), Vec::new(), &r, t0);
         assert!(probe(&key("/d", b""), &req(&[]), &ua_cache(), t0).is_none());
+    }
+
+    #[test]
+    fn multi_header_cookie_never_matches_single_cookie_vary() {
+        // #1285: HTTP/2 splits cookies across multiple `cookie:` headers.
+        // `VaryItem::Header { name: COOKIE }` must never match a multi-cookie request.
+        let item = VaryItem::Header {
+            name: http::header::COOKIE,
+            value: Some(Bytes::from_static(b"theme=light")),
+        };
+        let mut h = http::HeaderMap::new();
+        h.append(
+            http::header::COOKIE,
+            http::HeaderValue::from_static("theme=light"),
+        );
+        assert!(item.matches_headers_cookieless(&h, &ua_cache()));
+        h.append(
+            http::header::COOKIE,
+            http::HeaderValue::from_static("xf_user=12345%2Ctoken"),
+        );
+        assert!(
+            !item.matches_headers_cookieless(&h, &ua_cache()),
+            "second Cookie header must disqualify VaryItem::Header(COOKIE)"
+        );
     }
 }

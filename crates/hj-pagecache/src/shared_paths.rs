@@ -58,23 +58,94 @@ pub fn path_has_segment_prefix(path: &str, prefix: &str) -> bool {
     }
 }
 
-/// `query` carries the parameter `param` with a value — `param=…` as a whole
-/// parameter name at the start of the query or right after `&`. Name match is exact
-/// and case-sensitive; `paramx=…`, a bare `param` and an empty `param=` do not count:
-/// an empty value selects nothing, so the endpoint answers for its other parameters
-/// (`proxy.php?image=&link=…` is the link proxy, not an image). Uses PHP's last-wins
-/// semantics when `param` appears multiple times (`image=1&image=&link=…` resolves to
-/// empty in PHP `$_GET` and therefore must not match).
+/// URL-decode a query parameter name (`+` → space, `%XX` → byte) and normalize
+/// it using PHP's `PARSE_GET` / `php_register_variable_ex` rules (trim leading
+/// spaces; map ` ` and `.` to `_`; detect `[` array syntax). Returns `None` on
+/// malformed percent-encoding or non-UTF-8 (caller fails closed).
+fn decode_php_get_param_name(raw: &str) -> Option<(String, bool)> {
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes.get(i).copied()? {
+            b'+' => {
+                decoded.push(b' ');
+                i += 1;
+            }
+            b'%' => {
+                let hi = (*bytes.get(i + 1)? as char).to_digit(16)?;
+                let lo = (*bytes.get(i + 2)? as char).to_digit(16)?;
+                decoded.push(((hi << 4) | lo) as u8);
+                i += 3;
+            }
+            b => {
+                decoded.push(b);
+                i += 1;
+            }
+        }
+    }
+    // PHP's `php_register_variable_ex` treats the decoded name as a NUL-terminated
+    // C string (`strlen`), so `image%00x=` overwrites `$_GET["image"]` (#1305).
+    if decoded.contains(&0) {
+        return None;
+    }
+    let s = std::str::from_utf8(&decoded).ok()?;
+    let trimmed = s.trim_start_matches(' ');
+    // Only treat `[` as array syntax when a closing `]` follows; PHP maps an
+    // unmatched `[` to `_` and stops replacing ` ` / `.` / `[` after it (#1305, #1315).
+    match trimmed.split_once('[') {
+        Some((prefix, rest)) if rest.contains(']') => {
+            let mut norm = String::with_capacity(prefix.len());
+            for ch in prefix.chars() {
+                norm.push(if matches!(ch, ' ' | '.') { '_' } else { ch });
+            }
+            Some((norm, true))
+        }
+        Some((prefix, rest)) => {
+            let mut norm = String::with_capacity(trimmed.len());
+            for ch in prefix.chars() {
+                norm.push(if matches!(ch, ' ' | '.') { '_' } else { ch });
+            }
+            norm.push('_');
+            norm.push_str(rest);
+            Some((norm, false))
+        }
+        None => {
+            let mut norm = String::with_capacity(trimmed.len());
+            for ch in trimmed.chars() {
+                norm.push(if matches!(ch, ' ' | '.') { '_' } else { ch });
+            }
+            Some((norm, false))
+        }
+    }
+}
+
+/// `query` carries the parameter `param` with a non-empty scalar value using
+/// PHP `PARSE_GET` decoding, normalization, and last-wins semantics (#1294):
+/// `image=1&image=&link=…`, `image=1&%69mage=&…`, `image=1&+image=&…`, and
+/// `image=1&image[0]=…` all fail closed to `false`.
 fn query_has_param(query: &str, param: &str) -> bool {
     let mut last_value: Option<&str> = None;
     for kv in query.split('&') {
-        if kv == param {
-            last_value = Some("");
-        } else if let Some(value) = kv
-            .strip_prefix(param)
-            .and_then(|rest| rest.strip_prefix('='))
+        if kv.is_empty() {
+            continue;
+        }
+        let (raw_name, value) = kv.split_once('=').unwrap_or((kv, ""));
+        // Fast path: ASCII name with no `%`, `+`, ` `, `.`, or `[`.
+        if !raw_name
+            .bytes()
+            .any(|b| matches!(b, b'%' | b'+' | b' ' | b'.' | b'['))
         {
-            last_value = Some(value);
+            if raw_name == param {
+                last_value = Some(value);
+            }
+            continue;
+        }
+        let Some((norm, is_array)) = decode_php_get_param_name(raw_name) else {
+            return false;
+        };
+        if norm == param {
+            last_value = if is_array { Some("") } else { Some(value) };
         }
     }
     last_value.is_some_and(|value| !value.is_empty())
@@ -239,6 +310,22 @@ mod tests {
         assert!(!m.matches("/proxy.php", "image=1&image=&link=https%3A%2F%2Fx"));
         assert!(!m.matches("/proxy.php", "image=1&image&link=https%3A%2F%2Fx"));
         assert!(m.matches("/proxy.php", "image=&image=1"));
+        // PHP PARSE_GET URL-decoding / normalization bypasses (#1294):
+        // percent-encoded key, leading space/`+`, array bracket suffix, or malformed `%` escape.
+        assert!(!m.matches("/proxy.php", "image=1&%69mage=&link=https%3A%2F%2Fx"));
+        assert!(!m.matches("/proxy.php", "image=1&+image=&link=https%3A%2F%2Fx"));
+        assert!(!m.matches("/proxy.php", "image=1&%20image=&link=https%3A%2F%2Fx"));
+        assert!(!m.matches("/proxy.php", "image=1&image[0]=&link=https%3A%2F%2Fx"));
+        assert!(!m.matches("/proxy.php", "image=1&%ZZ=1&link=https%3A%2F%2Fx"));
+        assert!(!m.matches("/proxy.php", "image=1&image%00x=&link=https%3A%2F%2Fx"));
+        assert!(m.matches("/proxy.php", "%69mage=1&hash=abc"));
+        // Unmatched `[` maps to `_` in PHP (#1305).
+        let m_under = &parse_shared_paths("proxy.php?foo_bar").unwrap()[0];
+        assert!(!m_under.matches("/proxy.php", "foo_bar=1&foo[bar="));
+        assert!(m_under.matches("/proxy.php", "foo[bar=1"));
+        // Characters after an unmatched `[` are NOT mapped to `_` in PHP (#1315).
+        let m_two = &parse_shared_paths("proxy.php?foo_bar_baz").unwrap()[0];
+        assert!(!m_two.matches("/proxy.php", "foo[bar.baz=1"));
     }
 
     #[test]

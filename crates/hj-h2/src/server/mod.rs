@@ -41,7 +41,7 @@ use hj_core::body_deadline::BodyProgress;
 use hj_core::{Request, Response};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::frame::{self, FrameHeader, error_code, settings};
+use crate::frame::{self, FrameHeader, error_code, flags, kind, settings};
 use recv::{FrameOutcome, process_frame_with_ready};
 use send::{
     Pulls, SendSchedule, apply_pull, begin_ready_response, begin_response, cancel_outstream,
@@ -368,6 +368,8 @@ pub struct BorrowedRequestHead<'a> {
     pub method: &'a http::Method,
     pub uri: &'a http::Uri,
     pub headers: &'a http::HeaderMap,
+    /// Optional per-read-batch timestamp shared across frames in the same TCP read.
+    pub now: Option<std::time::Instant>,
 }
 
 /// An authorized status-200 full response with the same pre-sanitized shared
@@ -378,8 +380,12 @@ pub struct SharedFullResponse {
     pub body: bytes::Bytes,
 }
 
-pub type BorrowedMemoProbeFn =
-    dyn Fn(&BorrowedRequestHead<'_>) -> Option<SharedFullResponse> + Send + Sync;
+pub type BorrowedMemoProbeFn = dyn Fn(
+        &BorrowedRequestHead<'_>,
+        &mut dyn FnMut(&std::sync::Arc<http::HeaderMap>, &bytes::Bytes, bool) -> bool,
+    ) -> bool
+    + Send
+    + Sync;
 
 #[derive(Clone)]
 pub struct BorrowedMemoProbe(pub std::sync::Arc<BorrowedMemoProbeFn>);
@@ -387,6 +393,20 @@ pub struct BorrowedMemoProbe(pub std::sync::Arc<BorrowedMemoProbeFn>);
 impl std::fmt::Debug for BorrowedMemoProbe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("BorrowedMemoProbe(..)")
+    }
+}
+
+/// Optional batch-commit callback for intra-read-batch identical H2 memo frames:
+/// `(template_id, batch_now, extra_count)` where `extra_count == 0` queries
+/// whether `template_id` is batch-eligible and `extra_count > 0` commits.
+pub type BorrowedMemoBatchCommitFn = dyn Fn(u64, std::time::Instant, u64) -> bool + Send + Sync;
+
+#[derive(Clone)]
+pub struct BorrowedMemoBatchCommit(pub std::sync::Arc<BorrowedMemoBatchCommitFn>);
+
+impl std::fmt::Debug for BorrowedMemoBatchCommit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BorrowedMemoBatchCommit(..)")
     }
 }
 
@@ -493,6 +513,7 @@ pub struct Config {
     /// Optional synchronous memo probe, offered only an exact stable, complete
     /// bodiless GET head. A miss takes the unchanged Request/handler path.
     pub borrowed_memo_probe: Option<BorrowedMemoProbe>,
+    pub borrowed_memo_batch_commit: Option<BorrowedMemoBatchCommit>,
 }
 
 impl Default for Config {
@@ -518,6 +539,7 @@ impl Default for Config {
             shutdown_idle_stream_timeout: Some(SHUTDOWN_IDLE_STREAM_TIMEOUT),
             early_reject: None,
             borrowed_memo_probe: None,
+            borrowed_memo_batch_commit: None,
         }
     }
 }
@@ -926,6 +948,7 @@ where
                 &mut inflight_sids,
                 Some(&mut ready_responses),
                 None,
+                None,
                 |fut| {
                     if spare_cores() {
                         TaggedInner::Spawned(AbortOnDrop(tokio::spawn(fut)))
@@ -934,20 +957,22 @@ where
                     }
                 },
             );
-            for (sid, is_head, resp) in ready_responses.drain(..) {
-                begin_ready_response(
-                    sid,
-                    is_head,
-                    resp,
-                    &mut enc,
-                    &mut out,
-                    &mut outstreams,
-                    &mut send_schedule,
-                    &mut pending_window,
-                    &mut send_conn,
-                    &peer,
-                    &mut block_scratch,
-                );
+            if !ready_responses.is_empty() {
+                for (sid, is_head, resp) in ready_responses.drain(..) {
+                    begin_ready_response(
+                        sid,
+                        is_head,
+                        resp,
+                        &mut enc,
+                        &mut out,
+                        &mut outstreams,
+                        &mut send_schedule,
+                        &mut pending_window,
+                        &mut send_conn,
+                        &peer,
+                        &mut block_scratch,
+                    );
+                }
             }
             header_block_deadline = next_header_block_deadline(
                 block_was_open,
@@ -1018,7 +1043,7 @@ where
                             });
                             cancel_outstream(&mut outstreams, stream_id);
                         } else if was_blocked && st.window > 0 {
-                            if !st.pending.is_empty() {
+                            if !st.pending_is_empty() {
                                 send_schedule.wake(stream_id, st);
                             }
                             // (#241) Real forward progress: a blocked response body can
@@ -1088,19 +1113,23 @@ where
                         }
                     }
                 }
-                FrameOutcome::InitialWindowDelta(delta) => {
-                    // §6.9.2: shift every in-flight stream's send window by the change.
+                FrameOutcome::InitialWindowDelta(delta, max_delta) => {
+                    // §6.9.2: shift every in-flight stream's send window by the change,
+                    // checking the high-water mark for intermediate overflow (#1317).
                     let mut overflow = false;
+                    let max_initial = peer.initial_window - delta + max_delta;
                     for (&sid, st) in &mut outstreams {
                         let was_blocked = st.window <= 0;
+                        overflow |= st.window + max_delta > i32::MAX as i64;
                         st.window += delta;
                         overflow |= st.window > i32::MAX as i64;
-                        if was_blocked && st.window > 0 && !st.pending.is_empty() {
+                        if was_blocked && st.window > 0 && !st.pending_is_empty() {
                             send_schedule.wake(sid, st);
                         }
                     }
                     for &credit in pending_window.values() {
-                        overflow |= peer.initial_window + credit > i32::MAX as i64;
+                        overflow |= max_initial + credit > i32::MAX as i64
+                            || peer.initial_window + credit > i32::MAX as i64;
                     }
                     if overflow {
                         {
@@ -1118,7 +1147,10 @@ where
                 }
             }
         }
-        if cursor > 0 {
+        if cursor == inbuf.len() {
+            inbuf.clear();
+            cursor = 0;
+        } else if cursor > 0 {
             inbuf.drain(..cursor);
             cursor = 0;
         }
@@ -1472,6 +1504,13 @@ enum Seg {
     Inline(usize, usize),
     /// A response body chunk, held by reference (zero copy).
     Body(Bytes),
+    /// A sub-slice of `OutQueue::body_backings[backing]`, allowing multiple
+    /// 16 KiB DATA frames from one 64 KiB body to share a single `Bytes` handle.
+    BodySlice {
+        backing: usize,
+        offset: usize,
+        len: usize,
+    },
 }
 
 /// Vectored output queue. Small frames are coalesced into one contiguous `inline` buffer
@@ -1483,6 +1522,8 @@ enum Seg {
 pub(super) struct OutQueue {
     inline: Vec<u8>,
     segs: Vec<Seg>,
+    body_backings: Vec<Bytes>,
+    flush_gen: u64,
     completions: Vec<hj_core::ResponseCompletion>,
     data_remaining: Option<usize>,
     #[cfg(any(target_arch = "aarch64", test))]
@@ -1498,12 +1539,13 @@ pub(super) struct OutQueue {
 }
 
 const SMALL_BODY_INLINE_MAX: usize = 2048;
+#[cfg(any(target_arch = "aarch64", test))]
 const TLS_FRAMING_HEADROOM: usize = 1024;
 
 // Flush metadata kept between writes. One large response must not grow the scratch
 // of every idle connection for its lifetime.
 #[cfg(feature = "monoio")]
-const RETAINED_FLUSH_METADATA: usize = 64;
+const RETAINED_FLUSH_METADATA: usize = 256;
 #[cfg(test)]
 mod completion_tests;
 #[cfg(feature = "monoio")]
@@ -1535,6 +1577,7 @@ impl OutQueue {
             .map(|s| match s {
                 Seg::Inline(_, l) => *l,
                 Seg::Body(b) => b.len(),
+                Seg::BodySlice { len, .. } => *len,
             })
             .sum()
     }
@@ -1583,17 +1626,114 @@ impl OutQueue {
         let _ = bytes;
     }
 
+    #[inline]
+    pub(super) fn consume_data(&mut self, bytes: usize) {
+        if let Some(remaining) = self.data_remaining.as_mut() {
+            *remaining = remaining.saturating_sub(bytes);
+        }
+    }
+
+    #[inline]
+    pub(super) fn flush_gen(&self) -> u64 {
+        self.flush_gen
+    }
+
+    #[inline]
+    pub(super) fn push_body_backing(&mut self, b: Bytes) -> usize {
+        let idx = self.body_backings.len();
+        self.body_backings.push(b);
+        idx
+    }
+
+    #[inline]
+    pub(super) fn push_body_backing_dedup(&mut self, b: &Bytes) -> usize {
+        let ptr = b.as_ptr();
+        let len = b.len();
+        let n = self.body_backings.len();
+        for idx in (n.saturating_sub(2)..n).rev() {
+            if let Some(existing) = self.body_backings.get(idx)
+                && existing.as_ptr() == ptr
+                && existing.len() == len
+            {
+                return idx;
+            }
+        }
+        let idx = n;
+        self.body_backings.push(b.clone());
+        idx
+    }
+
+    #[inline]
+    pub(super) fn replay_inline_frame(
+        &mut self,
+        resp_start: usize,
+        resp_end: usize,
+        sid: u32,
+        data_rel: usize,
+        has_data: bool,
+    ) {
+        let dst = self.inline.len();
+        self.inline.extend_from_within(resp_start..resp_end);
+        let added = self.inline.len() - dst;
+        if added == 0 {
+            return;
+        }
+        let sid_bytes = (sid & 0x7fff_ffff).to_be_bytes();
+        if let Some(slot) = self.inline.get_mut(dst + 5..dst + 9) {
+            slot.copy_from_slice(&sid_bytes);
+        }
+        if has_data && let Some(slot) = self.inline.get_mut(dst + data_rel + 5..dst + data_rel + 9)
+        {
+            slot.copy_from_slice(&sid_bytes);
+        }
+        if let Some(Seg::Inline(off, len)) = self.segs.last_mut()
+            && *off + *len == dst
+        {
+            *len += added;
+        } else {
+            self.segs.push(Seg::Inline(dst, added));
+        }
+    }
+
+    #[inline]
+    pub(super) fn body_slice(&mut self, backing: usize, offset: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        self.consume_data(len);
+        if len <= SMALL_BODY_INLINE_MAX
+            && let Some(slice) = self
+                .body_backings
+                .get(backing)
+                .and_then(|b| b.get(offset..offset + len))
+        {
+            let start = self.inline.len();
+            self.inline.extend_from_slice(slice);
+            if let Some(Seg::Inline(off, prev)) = self.segs.last_mut()
+                && *off + *prev == start
+            {
+                *prev += len;
+                return;
+            }
+            self.segs.push(Seg::Inline(start, len));
+            return;
+        }
+        self.segs.push(Seg::BodySlice {
+            backing,
+            offset,
+            len,
+        });
+    }
+
     /// Append a DATA body chunk. Small bodies (<= 2 KiB) coalesce into `inline` so a
     /// multiplexed batch of small responses flushes as one contiguous segment instead of
-    /// overflowing `STACK_IOV` / `RETAINED_FLUSH_METADATA` (64). Larger bodies stay zero-copy.
+    /// overflowing `STACK_IOV` / `RETAINED_FLUSH_METADATA`. Larger bodies stay zero-copy.
     #[inline]
     pub(super) fn body(&mut self, b: Bytes) {
         if b.is_empty() {
             return;
         }
-        if let Some(remaining) = self.data_remaining.as_mut() {
-            *remaining -= b.len();
-        }
+        self.consume_data(b.len());
         if b.len() <= SMALL_BODY_INLINE_MAX {
             self.frames(|buf| buf.extend_from_slice(&b));
             return;
@@ -1606,6 +1746,8 @@ impl OutQueue {
             self.inline.shrink_to(64 * 1024);
         }
         self.segs.clear();
+        self.body_backings.clear();
+        self.flush_gen = self.flush_gen.wrapping_add(1);
     }
 }
 
@@ -1637,6 +1779,16 @@ async fn flush_inner<W: AsyncWrite + Unpin>(w: &mut W, q: &mut OutQueue) -> std:
             stack[i] = match seg {
                 Seg::Inline(off, len) => std::io::IoSlice::new(&q.inline[*off..*off + *len]),
                 Seg::Body(b) => std::io::IoSlice::new(&b[..]),
+                Seg::BodySlice {
+                    backing,
+                    offset,
+                    len,
+                } => std::io::IoSlice::new(
+                    q.body_backings
+                        .get(*backing)
+                        .and_then(|b| b.get(*offset..*offset + *len))
+                        .unwrap_or(&[]),
+                ),
             };
         }
         &mut stack[..n_segs]
@@ -1646,6 +1798,16 @@ async fn flush_inner<W: AsyncWrite + Unpin>(w: &mut W, q: &mut OutQueue) -> std:
             heap.push(match seg {
                 Seg::Inline(off, len) => std::io::IoSlice::new(&q.inline[*off..*off + *len]),
                 Seg::Body(b) => std::io::IoSlice::new(&b[..]),
+                Seg::BodySlice {
+                    backing,
+                    offset,
+                    len,
+                } => std::io::IoSlice::new(
+                    q.body_backings
+                        .get(*backing)
+                        .and_then(|b| b.get(*offset..*offset + *len))
+                        .unwrap_or(&[]),
+                ),
             });
         }
         &mut heap[..]
@@ -1695,7 +1857,9 @@ async fn monoio_flush<IO: monoio::io::AsyncWriteRent>(
     let measurement = q.timing.as_ref().filter(|_| !q.is_empty()).map(|_| {
         (
             q.total_bytes(),
-            q.segs.iter().any(|segment| matches!(segment, Seg::Body(_))),
+            q.segs
+                .iter()
+                .any(|segment| matches!(segment, Seg::Body(_) | Seg::BodySlice { .. })),
         )
     });
     let result = monoio_flush_inner(stream, q, ktls_fd).await;
@@ -1751,6 +1915,18 @@ async fn monoio_flush_inner<IO: monoio::io::AsyncWriteRent>(
                         *l,
                     ),
                     Seg::Body(b) => (b.as_ptr() as *mut libc::c_void, b.len()),
+                    Seg::BodySlice {
+                        backing,
+                        offset,
+                        len,
+                    } => {
+                        let s = q
+                            .body_backings
+                            .get(*backing)
+                            .and_then(|b| b.get(*offset..*offset + *len))
+                            .unwrap_or(&[]);
+                        (s.as_ptr() as *mut libc::c_void, s.len())
+                    }
                 };
                 if len > 0 {
                     let entry = libc::iovec {
@@ -1784,6 +1960,15 @@ async fn monoio_flush_inner<IO: monoio::io::AsyncWriteRent>(
                     let bytes: &[u8] = match seg {
                         Seg::Inline(o, l) => &q.inline[*o..*o + *l],
                         Seg::Body(b) => &b[..],
+                        Seg::BodySlice {
+                            backing,
+                            offset,
+                            len,
+                        } => q
+                            .body_backings
+                            .get(*backing)
+                            .and_then(|b| b.get(*offset..*offset + *len))
+                            .unwrap_or(&[]),
                     };
                     if skip >= bytes.len() {
                         skip -= bytes.len();
@@ -1810,8 +1995,13 @@ async fn monoio_flush_inner<IO: monoio::io::AsyncWriteRent>(
     {
         let buf = std::mem::take(&mut q.inline);
         q.segs.clear();
+        q.body_backings.clear();
+        q.flush_gen = q.flush_gen.wrapping_add(1);
         let (res, mut buf) = stream.write_all(buf).await;
         buf.clear();
+        if buf.capacity() > 256 * 1024 {
+            buf.shrink_to(64 * 1024);
+        }
         q.inline = buf;
         if q.segs.capacity() > RETAINED_FLUSH_METADATA {
             q.segs = Vec::new();
@@ -1830,9 +2020,12 @@ async fn monoio_flush_inner<IO: monoio::io::AsyncWriteRent>(
         let inline = Bytes::from(std::mem::take(&mut q.inline));
         let mut backings = std::mem::take(&mut q.write_backings);
         let mut spans = std::mem::take(&mut q.write_spans);
-        backings.reserve(q.segs.len() + 1);
+        backings.reserve(q.body_backings.len() + q.segs.len() + 1);
         spans.reserve(q.segs.len());
         backings.push(inline);
+        let body_base = backings.len();
+        backings.extend(q.body_backings.drain(..));
+        q.flush_gen = q.flush_gen.wrapping_add(1);
         for segment in q.segs.drain(..) {
             match segment {
                 Seg::Inline(offset, len) => spans.push(IoVecSpan::new(0, offset, len)),
@@ -1842,6 +2035,11 @@ async fn monoio_flush_inner<IO: monoio::io::AsyncWriteRent>(
                     backings.push(body);
                     spans.push(IoVecSpan::new(backing, 0, len));
                 }
+                Seg::BodySlice {
+                    backing,
+                    offset,
+                    len,
+                } => spans.push(IoVecSpan::new(body_base + backing, offset, len)),
             }
         }
         let buffer =
@@ -1884,6 +2082,7 @@ async fn monoio_flush_inner<IO: monoio::io::AsyncWriteRent>(
         .map(|s| match s {
             Seg::Inline(_, l) => *l,
             Seg::Body(b) => b.len(),
+            Seg::BodySlice { len, .. } => *len,
         })
         .sum::<usize>()
         .min(FLUSH_CAP + 16 * 1024);
@@ -1892,6 +2091,19 @@ async fn monoio_flush_inner<IO: monoio::io::AsyncWriteRent>(
         match seg {
             Seg::Inline(off, len) => pending.extend_from_slice(&q.inline[*off..*off + *len]),
             Seg::Body(b) => pending.extend_from_slice(&b[..]),
+            Seg::BodySlice {
+                backing,
+                offset,
+                len,
+            } => {
+                if let Some(s) = q
+                    .body_backings
+                    .get(*backing)
+                    .and_then(|b| b.get(*offset..*offset + *len))
+                {
+                    pending.extend_from_slice(s);
+                }
+            }
         }
         if pending.len() >= FLUSH_CAP {
             let (res, _) = stream.write_all(std::mem::take(&mut pending)).await;
@@ -2052,13 +2264,16 @@ where
     inbuf.drain(..crate::conn::PREFACE.len());
 
     // Bound DATA batches so the connection loop can service newly ready
-    // streams between flushes. Keep the uncapped path for rollback and A/B.
-    const DATA_BATCH_LIMIT: usize = 64 * 1024;
+    // streams between flushes while still fitting multiple full 64 KiB
+    // responses into one 16-record TLS `sendmsg` without 63K+1K splits.
+    const DATA_BATCH_LIMIT: usize = 256 * 1024;
     static LIMIT_DATA_BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static MEASURE_SEND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let bulk_headroom = cfg!(target_arch = "aarch64") && config.reserve_tls_framing;
     let batch = if config.reserve_tls_framing && !bulk_headroom {
-        DATA_BATCH_LIMIT - TLS_FRAMING_HEADROOM
+        // 15 x 16 KiB = 240 KiB: exact 16 KiB frame alignment (no 12K+4K tail
+        // split) while leaving full framing headroom inside a 16-record TLS write.
+        240 * 1024
     } else {
         DATA_BATCH_LIMIT
     };
@@ -2193,6 +2408,20 @@ where
     loop {
         // 1) Process every complete buffered frame (mirrors serve()).
         let mut completed_frame = false;
+        let mut batch_now: Option<std::time::Instant> = Some(last_activity);
+        struct ActiveMemoBatch {
+            template_id: u64,
+            req_block_start: usize,
+            req_block_end: usize,
+            resp_start: usize,
+            resp_end: usize,
+            data_hdr_off: usize,
+            body_len: usize,
+            shared_body: Option<bytes::Bytes>,
+            shared_backing: Option<usize>,
+            extra_count: u64,
+        }
+        let mut active_batch: Option<ActiveMemoBatch> = None;
         while reading && inbuf.len() - cursor >= FrameHeader::LEN {
             let Some(hdr) = FrameHeader::parse(&inbuf[cursor..]) else {
                 {
@@ -2223,17 +2452,164 @@ where
             let payload = cursor + FrameHeader::LEN..cursor + total;
             cursor += total;
             completed_frame = true;
+
+            // Intra-batch fast loop: when Frame 1 already validated every guard
+            // and this frame carries byte-identical HPACK HEADERS on a valid new
+            // odd stream, copy the already-encoded wire bytes via `extend_from_within`
+            // and patch the 4-byte stream IDs (0 dyn, 0 ArcSwap, 0 TLS, 0 Arc/Bytes
+            // clones, 0 replay_shared_response). Also keep the batch alive across
+            // valid stream-0 WINDOW_UPDATE frames.
+            if let Some(batch) = active_batch.as_mut() {
+                if hdr.kind == kind::WINDOW_UPDATE && hdr.stream_id == 0 && hdr.length == 4 {
+                    if let Some(raw) = inbuf.get(payload.clone())
+                        && let Ok(arr) = <[u8; 4]>::try_from(raw)
+                    {
+                        let inc = u32::from_be_bytes(arr) & 0x7fff_ffff;
+                        if inc > 0 && send_conn + inc as i64 <= i32::MAX as i64 {
+                            let next_no_progress = recv.no_progress_frames.saturating_add(1);
+                            let was_blocked = send_conn <= 0;
+                            if was_blocked || next_no_progress <= recv::NO_PROGRESS_BUDGET {
+                                send_conn += inc as i64;
+                                recv.no_progress_frames = if was_blocked && send_conn > 0 {
+                                    0
+                                } else {
+                                    next_no_progress
+                                };
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if accepting
+                    && hdr.kind == kind::HEADERS
+                    && hdr.flags == (flags::END_HEADERS | flags::END_STREAM)
+                    && hdr.stream_id > recv.last_client_stream
+                    && (hdr.stream_id & 1) == 1
+                    && recv.open_header_block.is_none()
+                    && streams.is_empty()
+                    && inflight.is_empty()
+                    && pending_window.is_empty()
+                    && inbuf.get(payload.clone())
+                        == inbuf.get(batch.req_block_start..batch.req_block_end)
+                {
+                    if let Some(shared_body) = batch.shared_body.as_ref() {
+                        if outstreams.len() < recv.max_concurrent {
+                            recv.last_client_stream = hdr.stream_id;
+                            recv.no_progress_frames = 0;
+                            out.replay_inline_frame(
+                                batch.resp_start,
+                                batch.resp_end,
+                                hdr.stream_id,
+                                0,
+                                false,
+                            );
+                            outstreams.insert(
+                                hdr.stream_id,
+                                OutStream {
+                                    completion: None,
+                                    pending: shared_body.clone(),
+                                    pending_off: 0,
+                                    out_backing: None,
+                                    body: None,
+                                    pulling: false,
+                                    eof: true,
+                                    done: false,
+                                    window: peer.initial_window.min(i32::MAX as i64),
+                                    cancel: None,
+                                    stall: None,
+                                    send_blocked: false,
+                                    send_queued: true,
+                                },
+                            );
+                            send_schedule.ready.push_back(hdr.stream_id);
+                            batch.extra_count += 1;
+                            continue;
+                        }
+                    } else if let Some(backing) = batch.shared_backing {
+                        let body_len = batch.body_len;
+                        if outstreams.is_empty()
+                            && recv.max_concurrent >= 1
+                            && body_len <= out.remaining_data_for(body_len)
+                            && (body_len as i64) <= send_conn.min(peer.initial_window)
+                        {
+                            recv.last_client_stream = hdr.stream_id;
+                            recv.no_progress_frames = 0;
+                            let data_rel = batch.data_hdr_off.saturating_sub(batch.resp_start);
+                            out.reserve_bulk_headroom(body_len);
+                            out.replay_inline_frame(
+                                batch.resp_start,
+                                batch.resp_end,
+                                hdr.stream_id,
+                                data_rel,
+                                true,
+                            );
+                            out.body_slice(backing, 0, body_len);
+                            send_conn -= body_len as i64;
+                            batch.extra_count += 1;
+                            continue;
+                        }
+                    } else if outstreams.is_empty() && recv.max_concurrent >= 1 {
+                        let body_len = batch.body_len;
+                        let can_emit = body_len == 0
+                            || (body_len <= SMALL_BODY_INLINE_MAX
+                                && body_len <= out.remaining_data_for(body_len)
+                                && (body_len as i64) <= send_conn.min(peer.initial_window));
+                        if can_emit {
+                            recv.last_client_stream = hdr.stream_id;
+                            recv.no_progress_frames = 0;
+                            if let Some(timing) = out.timing.as_mut() {
+                                timing.short_ready();
+                            }
+                            let data_rel = batch.data_hdr_off.saturating_sub(batch.resp_start);
+                            let has_data = batch.data_hdr_off > 0;
+                            out.replay_inline_frame(
+                                batch.resp_start,
+                                batch.resp_end,
+                                hdr.stream_id,
+                                data_rel,
+                                has_data,
+                            );
+                            if body_len > 0 {
+                                out.consume_data(body_len);
+                                send_conn -= body_len as i64;
+                            }
+                            batch.extra_count += 1;
+                            continue;
+                        }
+                    }
+                }
+                if batch.extra_count > 0
+                    && let Some(commit) = config.borrowed_memo_batch_commit.as_ref()
+                    && let Some(now) = batch_now
+                {
+                    (commit.0)(batch.template_id, now, batch.extra_count);
+                }
+                active_batch = None;
+            }
+
             let block_was_open = recv.open_header_block.is_some();
+            let more_frames_buffered = inbuf.len() - cursor >= FrameHeader::LEN;
+            let mut batch_seed: Option<recv::BatchSeed> = None;
+            let seed_opt = if more_frames_buffered
+                && config.borrowed_memo_batch_commit.is_some()
+                && hdr.kind == kind::HEADERS
+                && hdr.flags == (flags::END_HEADERS | flags::END_STREAM)
+            {
+                Some(&mut batch_seed)
+            } else {
+                None
+            };
+            let outstreams_len = outstreams.len();
             let outcome = process_frame_with_ready(
                 hdr,
-                &inbuf[payload],
+                &inbuf[payload.clone()],
                 &mut streams,
                 &mut dec,
                 &mut enc,
                 &mut out,
                 &mut peer,
                 &mut recv,
-                outstreams.len(),
+                outstreams_len,
                 accepting,
                 &service,
                 &mut inflight,
@@ -2241,22 +2617,48 @@ where
                 &mut inflight_sids,
                 Some(&mut ready_responses),
                 config.borrowed_memo_probe.as_ref(),
+                Some(recv::InlineSendCtx {
+                    send_conn: &mut send_conn,
+                    pending_window: &mut pending_window,
+                    outstreams: &mut outstreams,
+                    send_schedule: &mut send_schedule,
+                    batch_now: &mut batch_now,
+                    batch_seed: seed_opt,
+                }),
                 TaggedInner::Inline,
             );
-            for (sid, is_head, resp) in ready_responses.drain(..) {
-                begin_ready_response(
-                    sid,
-                    is_head,
-                    resp,
-                    &mut enc,
-                    &mut out,
-                    &mut outstreams,
-                    &mut send_schedule,
-                    &mut pending_window,
-                    &mut send_conn,
-                    &peer,
-                    &mut block_scratch,
-                );
+            if let Some(seed) = batch_seed.take() {
+                active_batch = Some(ActiveMemoBatch {
+                    template_id: seed.template_id,
+                    req_block_start: payload.start,
+                    req_block_end: payload.end,
+                    resp_start: seed.resp_start,
+                    resp_end: seed.resp_end,
+                    data_hdr_off: seed.data_hdr_off,
+                    body_len: seed.body_len,
+                    shared_body: seed.shared_body,
+                    shared_backing: seed.shared_backing,
+                    // Frame 1 deferred its accounting into this batch when `visit`
+                    // returned `true`, so all `1 + extra` frames commit in one shot.
+                    extra_count: 1,
+                });
+            }
+            if !ready_responses.is_empty() {
+                for (sid, is_head, resp) in ready_responses.drain(..) {
+                    begin_ready_response(
+                        sid,
+                        is_head,
+                        resp,
+                        &mut enc,
+                        &mut out,
+                        &mut outstreams,
+                        &mut send_schedule,
+                        &mut pending_window,
+                        &mut send_conn,
+                        &peer,
+                        &mut block_scratch,
+                    );
+                }
             }
             header_block_deadline = next_header_block_deadline(
                 block_was_open,
@@ -2327,7 +2729,7 @@ where
                             });
                             cancel_outstream(&mut outstreams, stream_id);
                         } else if was_blocked && st.window > 0 {
-                            if !st.pending.is_empty() {
+                            if !st.pending_is_empty() {
                                 send_schedule.wake(stream_id, st);
                             }
                             // (#241) Real forward progress; grants on idle/closed/
@@ -2372,18 +2774,21 @@ where
                         }
                     }
                 }
-                FrameOutcome::InitialWindowDelta(delta) => {
+                FrameOutcome::InitialWindowDelta(delta, max_delta) => {
                     let mut overflow = false;
+                    let max_initial = peer.initial_window - delta + max_delta;
                     for (&sid, st) in &mut outstreams {
                         let was_blocked = st.window <= 0;
+                        overflow |= st.window + max_delta > i32::MAX as i64;
                         st.window += delta;
                         overflow |= st.window > i32::MAX as i64;
-                        if was_blocked && st.window > 0 && !st.pending.is_empty() {
+                        if was_blocked && st.window > 0 && !st.pending_is_empty() {
                             send_schedule.wake(sid, st);
                         }
                     }
                     for &credit in pending_window.values() {
-                        overflow |= peer.initial_window + credit > i32::MAX as i64;
+                        overflow |= max_initial + credit > i32::MAX as i64
+                            || peer.initial_window + credit > i32::MAX as i64;
                     }
                     if overflow {
                         {
@@ -2401,7 +2806,17 @@ where
                 }
             }
         }
-        if cursor > 0 {
+        if let Some(batch) = active_batch.take()
+            && batch.extra_count > 0
+            && let Some(commit) = config.borrowed_memo_batch_commit.as_ref()
+            && let Some(now) = batch_now
+        {
+            (commit.0)(batch.template_id, now, batch.extra_count);
+        }
+        if cursor == inbuf.len() {
+            inbuf.clear();
+            cursor = 0;
+        } else if cursor > 0 {
             inbuf.drain(..cursor);
             cursor = 0;
         }
@@ -2493,17 +2908,26 @@ where
                 &mut send_schedule,
             );
         }
-        let send_again = pump_streams(
-            &mut outstreams,
-            &mut send_schedule,
-            &mut out,
-            &mut send_conn,
-            &mut pulls,
-            &peer,
-        );
-        // Checked on every pass (not only by the timer arm below) so a peer that keeps
-        // the biased, first-polled read arm ready cannot starve the deadline.
-        let stall_deadline = reset_stalled_streams(&mut outstreams, &mut out, send_stall_timeout);
+        let (send_again, stall_deadline) = if outstreams.is_empty() {
+            (false, None)
+        } else {
+            let send_again = pump_streams(
+                &mut outstreams,
+                &mut send_schedule,
+                &mut out,
+                &mut send_conn,
+                &mut pulls,
+                &peer,
+            );
+            // Checked on every pass (not only by the timer arm below) so a peer that keeps
+            // the biased, first-polled read arm ready cannot starve the deadline.
+            let stall_deadline = if outstreams.values().any(|st| st.stall.is_some()) {
+                reset_stalled_streams(&mut outstreams, &mut out, send_stall_timeout)
+            } else {
+                None
+            };
+            (send_again, stall_deadline)
+        };
         let drain_idle_deadline = match config.shutdown_idle_stream_timeout {
             Some(grace) if shutdown_drain => {
                 reset_drain_idle_streams(&mut outstreams, &mut drain_idle, &mut out, grace)
@@ -2546,12 +2970,16 @@ where
         let mut read_done: Option<(std::io::Result<usize>, Vec<u8>, IO::OwnedRead)> = None;
         let frame_wait = earliest(partial_frame_deadline, header_block_deadline)
             .map(|dl| dl.saturating_duration_since(std::time::Instant::now()));
-        let body_wait = streams
-            .values()
-            .filter_map(|st| st.body_deadline)
-            .map(|dl| dl.into_std())
-            .min()
-            .map(|dl| dl.saturating_duration_since(std::time::Instant::now()));
+        let body_wait = if streams.is_empty() {
+            None
+        } else {
+            streams
+                .values()
+                .filter_map(|st| st.body_deadline)
+                .map(|dl| dl.into_std())
+                .min()
+                .map(|dl| dl.saturating_duration_since(std::time::Instant::now()))
+        };
         let stall_wait =
             stall_deadline.map(|dl| dl.saturating_duration_since(std::time::Instant::now()));
         let peer_goaway_wait =
@@ -3933,7 +4361,7 @@ mod tests {
         let hits = Arc::new(AtomicUsize::new(0));
         let first_head = Arc::new(AtomicUsize::new(0));
         let (hit_count, head_identity) = (hits.clone(), first_head.clone());
-        let probe = BorrowedMemoProbe(Arc::new(move |head| {
+        let probe = BorrowedMemoProbe(Arc::new(move |head, visit| {
             assert_eq!(head.method, &http::Method::GET);
             assert_eq!(head.headers[http::header::HOST], "first.local");
             let address = head.headers as *const http::HeaderMap as usize;
@@ -3942,10 +4370,10 @@ mod tests {
                 assert_eq!(previous, address, "the same normalized map is borrowed");
             }
             hit_count.fetch_add(1, Ordering::Relaxed);
-            Some(SharedFullResponse {
-                headers: Arc::new(http::HeaderMap::new()),
-                body: Bytes::from_static(b"ok"),
-            })
+            let hdrs = Arc::new(http::HeaderMap::new());
+            let body = Bytes::from_static(b"ok");
+            let _ = visit(&hdrs, &body, false);
+            true
         }));
         let mut dec = Decoder::new(4096, 8192);
         dec.decode_octets(b"\x41\x0bfirst.local", |_, _| {})
@@ -3983,6 +4411,7 @@ mod tests {
                 &mut inflight_sids,
                 Some(&mut ready),
                 Some(&probe),
+                None,
                 TaggedInner::Inline,
             );
             assert!(matches!(result, FrameOutcome::Continue));
@@ -4036,6 +4465,7 @@ mod tests {
                 &mut inflight_sids,
                 Some(&mut ready),
                 Some(&probe),
+                None,
                 TaggedInner::Inline,
             );
             if sid == 9 {
@@ -4076,6 +4506,7 @@ mod tests {
             &mut inflight_sids,
             Some(&mut ready),
             Some(&probe),
+            None,
             TaggedInner::Inline,
         );
         assert!(matches!(result, FrameOutcome::StopReading));

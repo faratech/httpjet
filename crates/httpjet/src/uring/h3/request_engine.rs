@@ -83,11 +83,40 @@ impl H3RequestEngine {
             if telemetry_active {
                 TELEMETRY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
             } else if let Some(snapshot) = context.request_generation.as_ref() {
+                let skip_memo_probe = if http_body::Body::is_end_stream(request.body()) {
+                    let (memo_hit, probed_miss) = crate::pipeline::probe_borrowed_h3_memo(
+                        &snapshot.0,
+                        &self.listener_name,
+                        context.peer.ip(),
+                        context.is_tls,
+                        context.client_auth_requested,
+                        context.peer_unix,
+                        context.tls.as_ref(),
+                        request.method(),
+                        request.uri(),
+                        request.headers(),
+                    );
+                    if let Some((shared_headers, body)) = memo_hit {
+                        ON_CORE_RESPONSES.fetch_add(1, Ordering::Relaxed);
+                        return Some(BridgeResp {
+                            completion: None,
+                            status: http::StatusCode::OK,
+                            headers: http::HeaderMap::new(),
+                            shared_headers: Some(shared_headers),
+                            body: crate::uring::bridge::BridgeBody::Full(body),
+                            bw_rate: None,
+                        });
+                    }
+                    probed_miss
+                } else {
+                    false
+                };
                 if let Some(response) = super::super::CoreHandler::fast_for_listener(
                     &self.listener_name,
                     &snapshot.0,
                     &context,
                     &request,
+                    skip_memo_probe,
                 )
                 .await
                 {
@@ -189,6 +218,24 @@ mod tests {
             panic!("cached response must remain buffered");
         };
         assert_eq!(body, b"cached H3 representation"[..]);
+        assert_eq!(bridged.load(Ordering::Relaxed), 0);
+
+        // Second request hits the synchronous borrowed H3 memo fast path directly,
+        // returning shared_headers with Date already stamped and zero bridge hops.
+        let warm = engine(H3EngineMode::Accelerated)
+            .dispatch(&bridge, request(), fixture.context())
+            .await
+            .unwrap();
+        assert_eq!(warm.status, http::StatusCode::OK);
+        let shared = warm
+            .shared_headers
+            .as_ref()
+            .expect("warm H3 memo hit should return shared_headers");
+        assert!(shared.contains_key(http::header::DATE));
+        let BridgeBody::Full(warm_body) = warm.body else {
+            panic!("warm H3 memo hit must remain buffered");
+        };
+        assert_eq!(warm_body, b"cached H3 representation"[..]);
         assert_eq!(bridged.load(Ordering::Relaxed), 0);
     }
 

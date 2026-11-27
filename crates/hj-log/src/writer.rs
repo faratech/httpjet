@@ -20,6 +20,7 @@ use tokio::sync::{Semaphore, mpsc};
 use crate::Msg;
 use crate::fmt;
 
+const WRITER_BUF_CAPACITY: usize = 64 * 1024;
 const MAX_ARCHIVE_JOBS: usize = 4;
 const ACCESS_COALESCE: Duration = Duration::from_millis(2);
 const MAX_RETAINED_RECORD_BYTES: usize = 16 * 1024;
@@ -75,7 +76,7 @@ impl Writer {
         let size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
         Ok(Writer {
             cfg,
-            file: BufWriter::new(file),
+            file: BufWriter::with_capacity(WRITER_BUF_CAPACITY, file),
             size,
             archiver,
             archive_jobs: tokio::task::JoinSet::new(),
@@ -148,7 +149,7 @@ impl Writer {
         fs::rename(&self.cfg.path, &rolled).await?;
 
         let fresh = open_live(&self.cfg.path).await?;
-        self.file = BufWriter::new(fresh);
+        self.file = BufWriter::with_capacity(WRITER_BUF_CAPACITY, fresh);
         self.size = 0;
 
         if self.cfg.compress_archive

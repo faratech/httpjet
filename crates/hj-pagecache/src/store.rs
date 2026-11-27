@@ -2336,7 +2336,7 @@ impl PageStore {
     /// caller must fail closed (degrade to a miss and invalidate the key); the
     /// bytes are re-rendered, never partially served.
     pub fn body_bytes(&self, entry: &CachedResponse) -> Option<Bytes> {
-        self.body_bytes_inner(&entry.body, true, None)
+        self.body_bytes_inner(&entry.body, entry.dict_gen == 0, None)
     }
 
     /// [`Self::body_bytes`] for a hit attempt that a concurrently swapped
@@ -2347,7 +2347,10 @@ impl PageStore {
         entry: &CachedResponse,
         failures: &BodyReadFailures,
     ) -> Option<Bytes> {
-        self.body_bytes_inner(&entry.body, true, Some(failures))
+        // Dict-compressed entries are immediately decoded into `hot_identity` by
+        // `lscache::hit::identity_body`, so promoting raw dict-compressed bytes
+        // into the hot tier would double-cache them and evict decoded entries.
+        self.body_bytes_inner(&entry.body, entry.dict_gen == 0, Some(failures))
     }
 
     /// Resolve stored-form body bytes for background jobs that need the payload
@@ -2763,6 +2766,14 @@ impl PageStore {
     /// Count one served hit found by an uncounted probe.
     pub fn record_hit(&self) {
         self.hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count `n` served hits from a batched response-memo burst.
+    #[inline]
+    pub fn record_hits(&self, n: u64) {
+        if n != 0 {
+            self.hits.fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     /// Like [`get_entry`](Self::get_entry) but does NOT bump the global hit/miss counters.

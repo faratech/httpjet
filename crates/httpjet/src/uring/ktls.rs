@@ -380,7 +380,12 @@ struct RekeyState {
     kind: SuiteKind,
     rx_secret: Vec<u8>,
     tx_secret: Vec<u8>,
+    key_updates: u32,
 }
+
+/// Cap per-connection TLS 1.3 KeyUpdate messages on kTLS to prevent unbounded
+/// HKDF / setsockopt CPU floods (#1312).
+const MAX_KTLS_KEY_UPDATES: u32 = 32;
 
 impl RekeyState {
     /// Peer sent KeyUpdate: advance our RX secret and re-program `TLS_RX` (seq → 0).
@@ -436,6 +441,7 @@ fn upgrade_server(
         kind,
         rx_secret,
         tx_secret,
+        key_updates: 0,
     })
 }
 
@@ -482,8 +488,20 @@ async fn handle_rx_control(state: &mut RekeyState) -> io::Result<RxControl> {
     match record_type {
         Some(TlsGetRecordType::Alert) => Ok(RxControl::Closed),
         Some(TlsGetRecordType::Handshake) => {
-            // A post-handshake handshake record. To a server the realistic one is KeyUpdate.
-            if n >= 5 && data[0] == HS_KEY_UPDATE {
+            // Post-handshake handshake record: validate exact TLS 1.3 KeyUpdate
+            // framing (RFC 8446 §4.6.3) and enforce per-connection cap (#1312).
+            if n == 5
+                && data[0] == HS_KEY_UPDATE
+                && data[1..4] == [0, 0, 1]
+                && matches!(data[4], UPDATE_NOT_REQUESTED | UPDATE_REQUESTED)
+            {
+                state.key_updates = state.key_updates.saturating_add(1);
+                if state.key_updates > MAX_KTLS_KEY_UPDATES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "excessive TLS 1.3 KeyUpdate records",
+                    ));
+                }
                 state.rekey_rx()?;
                 if data[4] == UPDATE_REQUESTED {
                     // RFC 8446 §4.6.3: we MUST send our own KeyUpdate (not_requested) before
@@ -491,8 +509,13 @@ async fn handle_rx_control(state: &mut RekeyState) -> io::Result<RxControl> {
                     state.send_key_update().await?;
                     state.rekey_tx()?;
                 }
+                Ok(RxControl::Continue)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "malformed or unexpected post-handshake TLS record",
+                ))
             }
-            Ok(RxControl::Continue)
         }
         // ChangeCipherSpec (middlebox compat) / unknown: ignore and retry.
         _ => Ok(RxControl::Continue),

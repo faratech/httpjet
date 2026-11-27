@@ -192,6 +192,54 @@ pub fn build_begin_request_framed_into<K, V, H>(
     out[4..8].copy_from_slice(&total.to_le_bytes());
 }
 
+/// Returned by [`try_build_begin_request_framed_into`] when an env, special-env,
+/// or header field exceeds the LSAPI `u16` length prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldTooLong(pub &'static str);
+
+/// Fallible counterpart to [`build_begin_request_framed_into`] that validates
+/// `u16` field lengths inline while encoding, eliminating the separate pre-scan
+/// passes over `env`, `special_env`, and `headers`.
+pub fn try_build_begin_request_framed_into<K, V, H>(
+    out: &mut BytesMut,
+    env: &[(K, V)],
+    special_env: &[(SpecialEnvType, String, String)],
+    headers: &[H],
+    req_body_len: i32,
+) -> Result<(), FieldTooLong>
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    H: WireHeader,
+{
+    out.clear();
+    let est = REQ_HEADER_LEN
+        + special_env.len() * 48
+        + env.len() * 48
+        + headers.len() * 64
+        + HEADER_INDEX_LEN;
+    out.reserve(est);
+    out.put_bytes(0, PACKET_HEADER_LEN);
+    if let Err(err) = try_build_begin_request_into(out, env, special_env, headers, req_body_len) {
+        out.clear();
+        return Err(err);
+    }
+    let total = (out.len() as u32).to_le_bytes();
+    if let Some(hdr) = out.get_mut(..PACKET_HEADER_LEN) {
+        hdr.copy_from_slice(&[
+            VERSION_B0,
+            VERSION_B1,
+            PacketType::BeginRequest as u8,
+            HOST_LSAPI_ENDIAN,
+            total[0],
+            total[1],
+            total[2],
+            total[3],
+        ]);
+    }
+    Ok(())
+}
+
 /// Core BEGIN_REQUEST body builder, writing into `out`. `out` may already hold the
 /// 8-byte packet header (framed form) or be empty (legacy body-only form). All
 /// LSAPI offsets are absolute *including* the packet header; `body_start` (the
@@ -203,6 +251,23 @@ fn build_begin_request_into<K, V, H>(
     headers: &[H],
     req_body_len: i32,
 ) where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    H: WireHeader,
+{
+    let res = try_build_begin_request_into(out, env, special_env, headers, req_body_len);
+    let msg = res.as_ref().err().map_or("", |e| e.0);
+    assert!(res.is_ok(), "{msg}");
+}
+
+fn try_build_begin_request_into<K, V, H>(
+    out: &mut BytesMut,
+    env: &[(K, V)],
+    special_env: &[(SpecialEnvType, String, String)],
+    headers: &[H],
+    req_body_len: i32,
+) -> Result<(), FieldTooLong>
+where
     K: AsRef<str>,
     V: AsRef<str>,
     H: WireHeader,
@@ -225,6 +290,7 @@ fn build_begin_request_into<K, V, H>(
     let mut script_name_off = 0i32;
     let mut query_string_off = 0i32;
     let mut request_method_off = 0i32;
+    let mut found_special: u8 = 0;
 
     // --- special-env table (php.ini overrides) ---
     // Same wire encoding as the env table, but each KEY is prefixed with `\x01`
@@ -237,11 +303,11 @@ fn build_begin_request_into<K, V, H>(
         let vb = value.as_bytes();
         let klen = 2 + nb.len() + 1; // \x01 + type + name + NUL
         let vlen = vb.len() + 1;
-        // Held in release too: a wrapped length prefix desynchronizes lsphp's parser.
-        assert!(
-            klen <= u16::MAX as usize && vlen <= u16::MAX as usize,
-            "LSAPI special-env field exceeds u16 length prefix (klen={klen}, vlen={vlen})"
-        );
+        if klen > u16::MAX as usize || vlen > u16::MAX as usize {
+            return Err(FieldTooLong(
+                "LSAPI special-env field exceeds u16 length prefix",
+            ));
+        }
         out.put_u16(klen as u16); // big-endian
         out.put_u16(vlen as u16); // big-endian
         out.put_u8(0x01);
@@ -260,14 +326,9 @@ fn build_begin_request_into<K, V, H>(
         // lengths include the trailing NUL
         let klen = kb.len() + 1;
         let vlen = vb.len() + 1;
-        // (#3) The u16 length prefix would silently wrap (desyncing lsphp's env
-        // parser) past 65535. The LSAPI handler rejects such requests with 431
-        // before reaching here; a caller that bypasses that guard stops here, in
-        // release builds too, instead of sending a frame lsphp would misparse.
-        assert!(
-            klen <= u16::MAX as usize && vlen <= u16::MAX as usize,
-            "LSAPI env field exceeds u16 length prefix (klen={klen}, vlen={vlen})"
-        );
+        if klen > u16::MAX as usize || vlen > u16::MAX as usize {
+            return Err(FieldTooLong("LSAPI env field exceeds u16 length prefix"));
+        }
         out.put_u16(klen as u16); // big-endian
         out.put_u16(vlen as u16); // big-endian
         out.extend_from_slice(kb);
@@ -276,12 +337,26 @@ fn build_begin_request_into<K, V, H>(
         out.extend_from_slice(vb);
         out.put_u8(0);
 
-        match k.as_ref() {
-            "SCRIPT_FILENAME" => script_file_off = abs(value_pos),
-            "SCRIPT_NAME" => script_name_off = abs(value_pos),
-            "QUERY_STRING" => query_string_off = abs(value_pos),
-            "REQUEST_METHOD" => request_method_off = abs(value_pos),
-            _ => {}
+        if found_special != 0b1111 {
+            match k.as_ref() {
+                "SCRIPT_FILENAME" => {
+                    script_file_off = abs(value_pos);
+                    found_special |= 1;
+                }
+                "SCRIPT_NAME" => {
+                    script_name_off = abs(value_pos);
+                    found_special |= 2;
+                }
+                "QUERY_STRING" => {
+                    query_string_off = abs(value_pos);
+                    found_special |= 4;
+                }
+                "REQUEST_METHOD" => {
+                    request_method_off = abs(value_pos);
+                    found_special |= 8;
+                }
+                _ => {}
+            }
         }
     }
     // env table terminator
@@ -329,6 +404,11 @@ fn build_begin_request_into<K, V, H>(
     for header in headers {
         let nb = header.name().as_bytes();
         let vb = header.value().as_bytes();
+        if nb.len() > u16::MAX as usize || vb.len() > u16::MAX as usize {
+            return Err(FieldTooLong(
+                "LSAPI known-header value exceeds u16 len slot",
+            ));
+        }
         let name_off = block_rel;
         if header.title_case() {
             put_title_case(out, nb);
@@ -347,14 +427,6 @@ fn build_begin_request_into<K, V, H>(
         match header.known_index() {
             // Last occurrence wins, matching how a single indexed slot behaves.
             Some(i) => {
-                // (#3) The known-header index `len` slot is also a u16; a value
-                // over 65535 bytes would truncate it. Guarded by the handler's
-                // 431 reject; a bypassing caller stops here in every build.
-                assert!(
-                    vb.len() <= u16::MAX as usize,
-                    "LSAPI known-header value exceeds u16 len slot ({})",
-                    vb.len()
-                );
                 known[i] = (vb.len() as u16, value_off);
             }
             None => {
@@ -413,6 +485,7 @@ fn build_begin_request_into<K, V, H>(
         let at = header_fields_start + i * 4;
         out[at..at + 4].copy_from_slice(&f.to_le_bytes());
     }
+    Ok(())
 }
 
 #[cfg(test)]

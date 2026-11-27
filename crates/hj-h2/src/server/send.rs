@@ -253,6 +253,8 @@ pub(super) fn begin_ready_response(
                     OutStream {
                         completion: None,
                         pending: bytes,
+                        pending_off: 0,
+                        out_backing: None,
                         body: None,
                         pulling: false,
                         eof: true,
@@ -480,6 +482,8 @@ pub(super) fn begin_ready_response(
             OutStream {
                 completion,
                 pending,
+                pending_off: 0,
+                out_backing: None,
                 body,
                 pulling: false,
                 eof,
@@ -735,7 +739,8 @@ fn pump_one_frame(
     send_conn: &mut i64,
     max_frame: usize,
 ) -> bool {
-    if !st.pending.is_empty() {
+    let rem = st.pending_len();
+    if rem > 0 {
         let frame_limit = max_frame.min(out.remaining_data()) as i64;
         let allow = (*send_conn).min(st.window).min(frame_limit);
         if allow <= 0 {
@@ -743,15 +748,12 @@ fn pump_one_frame(
             return false;
         }
         st.send_blocked = false;
-        let proposed = (allow as usize).min(st.pending.len());
+        let proposed = (allow as usize).min(rem);
         out.reserve_bulk_headroom(proposed);
         let n = proposed.min(out.remaining_data());
-        let chunk = if n == st.pending.len() {
-            std::mem::take(&mut st.pending)
-        } else {
-            st.pending.split_to(n)
-        };
-        let last = st.eof && st.pending.is_empty();
+        let off = st.pending_off;
+        let is_final_pending = n == rem;
+        let last = st.eof && is_final_pending;
         let dflags = if last { flags::END_STREAM } else { 0 };
         out.frames(|b| {
             FrameHeader {
@@ -762,7 +764,39 @@ fn pump_one_frame(
             }
             .write(b)
         });
-        out.body(chunk);
+        if is_final_pending {
+            if let Some((fgen, idx)) = st.out_backing
+                && fgen == out.flush_gen()
+            {
+                // Already pinned in this flush batch: emit slice and drop `st.pending`
+                // with zero additional `Bytes` clones.
+                out.body_slice(idx, off, n);
+                st.pending = Bytes::new();
+                st.pending_off = 0;
+                st.out_backing = None;
+            } else {
+                let b = std::mem::take(&mut st.pending);
+                st.pending_off = 0;
+                st.out_backing = None;
+                if off == 0 {
+                    out.body(b);
+                } else {
+                    let idx = out.push_body_backing(b);
+                    out.body_slice(idx, off, n);
+                }
+            }
+        } else {
+            let idx = match st.out_backing {
+                Some((fgen, idx)) if fgen == out.flush_gen() => idx,
+                _ => {
+                    let idx = out.push_body_backing_dedup(&st.pending);
+                    st.out_backing = Some((out.flush_gen(), idx));
+                    idx
+                }
+            };
+            out.body_slice(idx, off, n);
+            st.pending_off = off + n;
+        }
         *send_conn -= n as i64;
         st.window -= n as i64;
         if last {
@@ -816,7 +850,7 @@ fn note_send_blocked(st: &mut OutStream, conn_starved: bool) -> bool {
 /// its waiters together, in send order.
 #[derive(Default)]
 pub(super) struct SendSchedule {
-    ready: VecDeque<u32>,
+    pub(super) ready: VecDeque<u32>,
     connection_wait: VecDeque<u32>,
 }
 
@@ -861,7 +895,21 @@ pub(super) fn pump_streams(
         if !st.done {
             let window_before = st.window;
             pump_one_frame(sid, st, out, send_conn, max_frame);
-            if !st.done && st.pending.is_empty() && !st.eof && !st.pulling {
+            // When no other stream is queued for round-robin fairness, drain
+            // additional frames from this already-fetched stream without
+            // repeated `SendSchedule` queue + `outstreams` hash lookups.
+            while !st.done
+                && send_schedule.ready.is_empty()
+                && out.remaining_data() > 0
+                && !st.pending_is_empty()
+                && st.window > 0
+                && *send_conn > 0
+            {
+                if !pump_one_frame(sid, st, out, send_conn, max_frame) {
+                    break;
+                }
+            }
+            if !st.done && st.pending_is_empty() && !st.eof && !st.pulling {
                 if let Some(body) = st.body.take() {
                     st.pulling = true;
                     let cancel = st
@@ -873,8 +921,18 @@ pub(super) fn pump_streams(
             }
             if !st.done {
                 let sent = (window_before - st.window).max(0) as u64;
-                st.stall = advance_stall(st.stall, sent, !st.pending.is_empty());
-                if !st.pending.is_empty() && st.window > 0 {
+                let has_pending = !st.pending_is_empty();
+                // Only consider the stream blocked when it lacks peer flow-control
+                // credit; hitting `out.remaining_data() == 0` is our own flush batch
+                // boundary and will be re-pumped immediately after `paced_flush`.
+                let still_runnable = has_pending && st.window > 0 && (*send_conn > 0 || sent > 0);
+                // Only touch `Instant::now()` when the stream is actually blocked, hit the
+                // batch limit, or already has an active stall timer — avoids 3x `clock_gettime`
+                // per healthy 64 KiB response that completes inside one `pump_streams` pass.
+                if st.stall.is_some() || (has_pending && !still_runnable) {
+                    st.stall = advance_stall(st.stall, sent, has_pending);
+                }
+                if has_pending && st.window > 0 {
                     // A stream that spent the last credit goes behind
                     // streams that have not yet had their turn this round.
                     if *send_conn <= 0 && sent == 0 {
@@ -884,7 +942,7 @@ pub(super) fn pump_streams(
                     } else {
                         send_schedule.wake(sid, st);
                     }
-                } else if !st.pending.is_empty() {
+                } else if has_pending {
                     note_send_blocked(st, false);
                 }
             }
@@ -972,7 +1030,7 @@ pub(super) fn reset_drain_idle_streams(
     let mut earliest: Option<std::time::Instant> = None;
     let mut expired = Vec::new();
     for (&sid, st) in outstreams.iter() {
-        if st.done || !st.pulling || !st.pending.is_empty() {
+        if st.done || !st.pulling || !st.pending_is_empty() {
             idle_since.remove(&sid);
             continue;
         }
@@ -1020,16 +1078,21 @@ pub(super) fn apply_pull(
         Some(Ok(data)) => {
             st.body = Some(body);
             // We only pull when `pending` is empty, so this just sets the next chunk.
-            if st.pending.is_empty() {
+            if st.pending_is_empty() {
                 st.pending = data;
+                st.pending_off = 0;
+                st.out_backing = None;
             } else {
                 // Rare coalesce (we normally only pull with `pending` empty). This Vec is NOT a
                 // poolable scratch: it becomes `st.pending` and is written to the wire by
                 // `pump_streams` (zero-copy `Bytes`), so it escapes the request — it must own.
-                let mut v = Vec::with_capacity(st.pending.len() + data.len());
-                v.extend_from_slice(&st.pending);
+                let slice = st.pending_slice();
+                let mut v = Vec::with_capacity(slice.len() + data.len());
+                v.extend_from_slice(slice);
                 v.extend_from_slice(&data);
                 st.pending = Bytes::from(v);
+                st.pending_off = 0;
+                st.out_backing = None;
             }
         }
         None => st.eof = true,
@@ -1264,6 +1327,8 @@ mod tests {
             OutStream {
                 completion: None,
                 pending: Bytes::from_static(body),
+                pending_off: 0,
+                out_backing: None,
                 body: None,
                 pulling: false,
                 eof: true,
@@ -1283,6 +1348,19 @@ mod tests {
                         wire.extend_from_slice(&out.inline[*offset..*offset + *len]);
                     }
                     super::super::Seg::Body(b) => wire.extend_from_slice(b),
+                    super::super::Seg::BodySlice {
+                        backing,
+                        offset,
+                        len,
+                    } => {
+                        if let Some(s) = out
+                            .body_backings
+                            .get(*backing)
+                            .and_then(|b| b.get(*offset..*offset + *len))
+                        {
+                            wire.extend_from_slice(s);
+                        }
+                    }
                 }
             }
             let mut ids = Vec::new();
@@ -1349,6 +1427,8 @@ mod tests {
                 OutStream {
                     completion: None,
                     pending: Bytes::from_static(b"data"),
+                    pending_off: 0,
+                    out_backing: None,
                     body: None,
                     pulling: false,
                     eof: true,
@@ -1407,6 +1487,8 @@ mod tests {
             OutStream {
                 completion: None,
                 pending: Bytes::from_static(b"abcdefghij"),
+                pending_off: 0,
+                out_backing: None,
                 body: None,
                 pulling: false,
                 eof: true,
@@ -1439,7 +1521,7 @@ mod tests {
         ));
         assert_eq!(out.remaining_data(), 0);
         assert_eq!(conn_window, 4);
-        assert_eq!(streams[&1].pending, b"ghij"[..]);
+        assert_eq!(streams[&1].pending_slice(), b"ghij");
         out.clear();
         out.data_remaining = Some(6);
         assert!(!pump_streams(
@@ -1461,6 +1543,8 @@ mod tests {
         let mut st = OutStream {
             completion: None,
             pending: Bytes::from_static(b"abcdefgh"),
+            pending_off: 0,
+            out_backing: None,
             body: None,
             pulling: false,
             eof: true,
@@ -1636,6 +1720,8 @@ mod tests {
                 OutStream {
                     completion: None,
                     pending: Bytes::new(),
+                    pending_off: 0,
+                    out_backing: None,
                     body: None,
                     pulling: true,
                     eof: false,
@@ -1709,6 +1795,8 @@ mod tests {
                 OutStream {
                     completion: None,
                     pending: Bytes::from_static(payload),
+                    pending_off: 0,
+                    out_backing: None,
                     eof: body.is_none(),
                     body,
                     pulling: false,

@@ -62,7 +62,7 @@ const HEADER_LEN: u64 = 80;
 /// (#323) Bodies at or above this are served as a zero-copy mmap view of the
 /// immutable container; below it one read(2) into spare capacity is cheaper
 /// than map + minor faults + TLB shootdown on drop.
-const MMAP_BODY_MIN: u64 = 16 * 1024;
+const MMAP_BODY_MIN: u64 = 512 * 1024;
 const TAG_LEN: usize = 16;
 const FLAG_PRIVATE: u16 = 1 << 0;
 const FLAG_STATIC: u16 = 1 << 1;

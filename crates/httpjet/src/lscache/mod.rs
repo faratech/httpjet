@@ -339,11 +339,13 @@ fn vhost_allows_public(ctx: &ReqCtx, store: &hj_pagecache::PageStore, path: &str
 /// checks the private pair; false the public pair.
 fn context_denies_cache(ctx: &ReqCtx, path: &str, private: bool) -> bool {
     ctx.vhost.contexts.iter().any(|c| {
+        if !c.enabled {
+            return false;
+        }
         // (Tier 2) A sub_filter context bypasses the cache entirely: the cache
         // hot path must never serve entries whose filtering depends on the
         // transform vec running on a path it may not see.
-        if c.enabled
-            && c.sub_filter.as_ref().is_some_and(|s| s.is_active())
+        if c.sub_filter.as_ref().is_some_and(|s| s.is_active())
             && crate::pipeline::context_uri_matches(path, &c.uri)
         {
             return true;
@@ -648,9 +650,17 @@ impl LookupCounters {
     }
 
     fn record_result(&self, path: usize, result: usize) {
+        self.record_result_n(path, result, 1);
+    }
+
+    #[inline]
+    fn record_result_n(&self, path: usize, result: usize, n: u64) {
+        if n == 0 {
+            return;
+        }
         let shard = &self.0[crate::telemetry::shard_index()];
         if let Some(c) = shard.0.get(path * Self::RESULTS.len() + result) {
-            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            c.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -669,6 +679,39 @@ impl LookupCounters {
     }
 }
 
+/// Compute the public `cookie_vary` dimension for a cookied GUEST request so
+/// `fast_memo` and `H2_MEMO_HINTS` can safely serve warm public page-cache hits
+/// for guests carrying benign/style/analytics cookies. Returns `None` unless
+/// `private_enabled` and `response_memo` are both active and the `Cookie` header
+/// is valid UTF-8 (`<= 1024 B`) containing neither `private_session_cookie` nor
+/// `private_user_cookie`.
+pub(crate) fn guest_cookie_vary_for_memo(
+    state: &ServerState,
+    cookie: &http::HeaderValue,
+) -> Option<String> {
+    let store = state.page_cache.as_ref()?;
+    let cfg = store.config();
+    if !cfg.response_memo || !cfg.private_enabled {
+        return None;
+    }
+    let raw = cookie.to_str().ok()?;
+    if raw.len() > 1024 {
+        return None;
+    }
+    if crate::pipeline::has_member_session_cookie(
+        raw,
+        &cfg.private_session_cookie,
+        &cfg.private_user_cookie,
+    ) {
+        return None;
+    }
+    Some(compute_vary_value_with_defaults(
+        Some(raw),
+        &cfg.vary_cookies,
+        &cfg.vary_defaults,
+    ))
+}
+
 pub(crate) fn response_variant_codec(response: &Response) -> Option<u8> {
     response
         .headers()
@@ -683,8 +726,20 @@ pub(crate) fn record_response_memo_hit_codec(
     key_hash: u64,
     variant_codec: Option<u8>,
 ) {
+    record_response_memo_hits_batch(state, key_hash, variant_codec, 1);
+}
+
+pub(crate) fn record_response_memo_hits_batch(
+    state: &ServerState,
+    key_hash: u64,
+    variant_codec: Option<u8>,
+    count: u64,
+) {
+    if count == 0 {
+        return;
+    }
     if let Some(store) = state.page_cache.as_ref() {
-        store.record_hit();
+        store.record_hits(count);
         // Sample W-TinyLFU admission bumps on already-admitted response_memo hits
         // (1 in 16 per thread) to avoid bouncing the hot key's admission cache line
         // across cores on every cached H2 hit.
@@ -692,44 +747,54 @@ pub(crate) fn record_response_memo_hit_codec(
             static ADMIT_STRIDE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
         }
         let tick = ADMIT_STRIDE.with(|c| {
-            let v = c.get().wrapping_add(1);
+            let v = c.get().wrapping_add(count as u8);
             c.set(v);
             v
         });
-        if (tick & 15) == 0 {
+        if count >= 16 || (tick & 15) == 0 {
             state.page_cache_admission.record(key_hash);
         }
-        state.metrics.pagecache_lookup.record_result(2, 0);
+        state.metrics.pagecache_lookup.record_result_n(2, 0, count);
         if let Some(counter) = variant_codec
             .and_then(|index| state.metrics.pagecache_variant_serves.get(index as usize))
         {
-            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            counter.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
 
 /// Fresh public selection that may be retained by the finalized-response memo.
-/// Expiry at the next entry-Age tick preserves Age even if header transforms
-/// override it; a memo never invents a new freshness window.
+/// `deadline` caps expiry at the next Age tick when header transforms override `Age`;
+/// when `Age` is untouched, `fast_memo` refreshes `Age` in place up to `fresh_until`
+/// while `lease.is_current()` and `purge_epoch` hold.
 #[derive(Clone)]
 pub(crate) struct PublicResponseMemo {
     pub key_hash: u64,
     pub purge_epoch: u64,
+    pub stored_at: Instant,
+    pub fresh_until: Instant,
+    pub initial_age_secs: u64,
     pub deadline: Instant,
     pub lease: hj_pagecache::SnapshotLease,
 }
 
-fn response_memo_deadline(stored_at: Instant, ttl: Duration, now: Instant) -> Option<Instant> {
+fn response_memo_deadlines(
+    stored_at: Instant,
+    ttl: Duration,
+    now: Instant,
+) -> Option<(Instant, Instant, u64)> {
     let fresh_until = stored_at.checked_add(ttl)?;
     if now >= fresh_until {
         return None;
     }
-    let age = now
-        .checked_duration_since(stored_at)?
-        .as_secs()
-        .checked_add(1)?;
-    let age_tick = stored_at.checked_add(Duration::from_secs(age))?;
-    Some(fresh_until.min(age_tick))
+    let initial_age = now.checked_duration_since(stored_at)?.as_secs();
+    let age_tick = stored_at.checked_add(Duration::from_secs(initial_age.checked_add(1)?))?;
+    Some((fresh_until, fresh_until.min(age_tick), initial_age))
+}
+
+#[cfg(test)]
+fn response_memo_deadline(stored_at: Instant, ttl: Duration, now: Instant) -> Option<Instant> {
+    response_memo_deadlines(stored_at, ttl, now).map(|(_, deadline, _)| deadline)
 }
 
 pub fn cache_lookup(
@@ -1186,18 +1251,23 @@ fn lookup(
             record_fast_path_hit(state, store, mode, key_hash);
             if let Some(purge_epoch) = memo_epoch
                 && method == Method::GET
-                && cc.cookie.is_none()
+                && varied_base.is_none()
+                && (cc.cookie.is_none() || store.config().private_enabled)
                 && matches!(route, PrivateRoute::Public)
                 && matches!(entry.scope, hj_pagecache::PageScope::Public)
                 && resp.status() == StatusCode::OK
                 && matches!(resp.body(), Body::Full(body)
                     if body.len() <= crate::pipeline::fast_memo::MAX_BODY)
-                && let Some(deadline) = response_memo_deadline(entry.stored_at, entry.ttl, now)
+                && let Some((fresh_until, deadline, initial_age_secs)) =
+                    response_memo_deadlines(entry.stored_at, entry.ttl, now)
                 && let Some(lease) = store.lease_snapshot_hashed(key_hash, &entry)
             {
                 resp.extensions_mut().insert(PublicResponseMemo {
                     key_hash,
                     purge_epoch,
+                    stored_at: entry.stored_at,
+                    fresh_until,
+                    initial_age_secs,
                     deadline,
                     lease,
                 });
@@ -3539,7 +3609,8 @@ fn stale_if_error_fallback(
         AcceptEncoding::parse(egress_ae(state, ctx)),
         method == Method::HEAD,
         |candidate| {
-            (candidate.dict_gen == 0 || matching_dict(state, candidate.dict_gen).is_some())
+            candidate.status < 400
+                && (candidate.dict_gen == 0 || matching_dict(state, candidate.dict_gen).is_some())
                 && !entry_is_self_redirect(candidate, ctx.is_tls, host, req_path, req_query)
         },
     )?;

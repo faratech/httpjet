@@ -922,13 +922,16 @@ impl StaticFiles {
         if (is_head || overrides.ignore_range || !req.headers().contains_key(RANGE))
             && !overrides.no_precompressed_sibling
         {
-            let accepts = req
-                .headers()
-                .get(ACCEPT_ENCODING)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            let accepted = AcceptEncoding::parse(accepts);
-            if accepted.accepts(Encoding::Brotli) || accepted.accepts(Encoding::Gzip) {
+            let mut accepts_br = false;
+            let mut accepts_gz = false;
+            for val in req.headers().get_all(ACCEPT_ENCODING) {
+                if let Ok(s) = val.to_str() {
+                    let parsed = AcceptEncoding::parse(s);
+                    accepts_br |= parsed.accepts(Encoding::Brotli);
+                    accepts_gz |= parsed.accepts(Encoding::Gzip);
+                }
+            }
+            if accepts_br || accepts_gz {
                 let now = Instant::now();
                 let mut sib_h = rustc_hash::FxHasher::default();
                 doc_root.hash(&mut sib_h);
@@ -942,16 +945,23 @@ impl StaticFiles {
                 let mut mask = cached_mask.unwrap_or(0);
                 let mut mask_dirty = false;
                 let mut primary_path: Option<PathBuf> = None;
-                for (enc, ext_suffix, probed_bit, present_bit) in [
+                for (enc, ext_suffix, probed_bit, present_bit, wanted) in [
                     (
                         Encoding::Brotli,
                         ".br",
                         SIBLING_BR_PROBED,
                         SIBLING_BR_PRESENT,
+                        accepts_br,
                     ),
-                    (Encoding::Gzip, ".gz", SIBLING_GZ_PROBED, SIBLING_GZ_PRESENT),
+                    (
+                        Encoding::Gzip,
+                        ".gz",
+                        SIBLING_GZ_PROBED,
+                        SIBLING_GZ_PRESENT,
+                        accepts_gz,
+                    ),
                 ] {
-                    if !accepted.accepts(enc) {
+                    if !wanted {
                         continue;
                     }
                     if (mask & probed_bit) != 0 && (mask & present_bit) == 0 {
@@ -968,8 +978,10 @@ impl StaticFiles {
                         if (mask & (probed_bit | present_bit)) != (probed_bit | present_bit) {
                             mask |= probed_bit | present_bit;
                             mask_dirty = true;
-                            primary_path.get_or_insert_with(|| resolved.path.clone());
                         }
+                        // Always capture the primary path before swapping `resolved`
+                        // to the sibling, even if the sibling bit was already cached (#1299).
+                        primary_path.get_or_insert_with(|| resolved.path.clone());
                         // Judged only once a sibling exists: a `no-gzip` request gets identity.
                         if hj_compress::no_gzip(ctx) {
                             break;
@@ -1042,8 +1054,9 @@ impl StaticFiles {
         };
 
         // ---- Conditional requests (RFC 7232) -----------------------------
-        let precondition_failed = if let Some(if_match) = req.headers().get(IF_MATCH) {
-            !if_match_passes(if_match, etag_str)
+        let mut if_match_iter = req.headers().get_all(IF_MATCH).iter().peekable();
+        let precondition_failed = if if_match_iter.peek().is_some() {
+            !if_match_iter.any(|if_match| if_match_passes(if_match, etag_str))
         } else if let Some(ius) = req.headers().get(IF_UNMODIFIED_SINCE) {
             !if_unmodified_since_passes(ius, resolved.mtime)
         } else {
@@ -1064,9 +1077,12 @@ impl StaticFiles {
 
         // If-None-Match takes precedence over If-Modified-Since. The wildcard tests
         // representation existence, so it remains meaningful when ETags are disabled.
-        let not_modified = if let Some(inm) = req.headers().get(IF_NONE_MATCH) {
-            inm.to_str().is_ok_and(|s| s.trim() == "*")
-                || etag_str.is_some_and(|e| if_none_match_matches(inm.as_bytes(), e))
+        let mut inm_iter = req.headers().get_all(IF_NONE_MATCH).iter().peekable();
+        let not_modified = if inm_iter.peek().is_some() {
+            inm_iter.any(|inm| {
+                inm.to_str().is_ok_and(|s| s.trim() == "*")
+                    || etag_str.is_some_and(|e| if_none_match_matches(inm.as_bytes(), e))
+            })
         } else if let Some(ims) = req.headers().get(IF_MODIFIED_SINCE) {
             if_modified_since_not_modified(ims, resolved.mtime, now)
         } else {
@@ -1095,12 +1111,14 @@ impl StaticFiles {
                 // Like OLS `testMod`, echo the variant the client holds
                 // (`"<core>;gz"`): the compressed 200 it revalidates carried
                 // that tag, not the identity one.
-                let echoed = req
-                    .headers()
-                    .get(IF_NONE_MATCH)
-                    .and_then(|inm| inm.to_str().ok())
-                    .zip(etag_str)
-                    .and_then(|(inm, base)| hj_core::matched_etag_variant(inm, base))
+                let echoed = etag_str
+                    .and_then(|base| {
+                        req.headers()
+                            .get_all(IF_NONE_MATCH)
+                            .iter()
+                            .filter_map(|inm| inm.to_str().ok())
+                            .find_map(|inm| hj_core::matched_etag_variant(inm, base))
+                    })
                     .and_then(|tok| HeaderValue::from_str(tok).ok());
                 encoded_variant = echoed
                     .as_ref()
@@ -1958,7 +1976,12 @@ fn parse_ranges(value: &[u8], len: u64) -> RangeOutcome {
     }
 
     let mut ranges: Vec<(u64, u64)> = Vec::new();
+    let mut parts_seen: usize = 0;
     for part in spec.split(',').map(str::trim) {
+        parts_seen += 1;
+        if parts_seen > MAX_RANGES {
+            return RangeOutcome::Ignore;
+        }
         let Some((start_s, end_s)) = part.split_once('-') else {
             return RangeOutcome::Ignore;
         };
@@ -1967,6 +1990,9 @@ fn parse_ranges(value: &[u8], len: u64) -> RangeOutcome {
         if start_s.is_empty() {
             // Suffix form `-N`: N=0 is invalid → whole header invalid; the last
             // N bytes of an empty entity are unsatisfiable.
+            if end_s.is_empty() || !end_s.bytes().all(|b| b.is_ascii_digit()) {
+                return RangeOutcome::Ignore;
+            }
             let Ok(n) = end_s.parse::<u64>() else {
                 return RangeOutcome::Ignore;
             };
@@ -1979,12 +2005,18 @@ fn parse_ranges(value: &[u8], len: u64) -> RangeOutcome {
             ranges.push((len.saturating_sub(n), len - 1));
             continue;
         }
+        if !start_s.bytes().all(|b| b.is_ascii_digit()) {
+            return RangeOutcome::Ignore;
+        }
         let Ok(start) = start_s.parse::<u64>() else {
             return RangeOutcome::Ignore;
         };
         let parsed_end = if end_s.is_empty() {
             None
         } else {
+            if !end_s.bytes().all(|b| b.is_ascii_digit()) {
+                return RangeOutcome::Ignore;
+            }
             let Ok(n) = end_s.parse::<u64>() else {
                 return RangeOutcome::Ignore;
             };
@@ -2003,9 +2035,6 @@ fn parse_ranges(value: &[u8], len: u64) -> RangeOutcome {
 
     if ranges.is_empty() {
         return RangeOutcome::Unsatisfiable;
-    }
-    if ranges.len() > MAX_RANGES {
-        return RangeOutcome::Ignore;
     }
     ranges.sort_unstable();
     let mut coalesced: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
@@ -2138,6 +2167,9 @@ fn parse_range(value: &[u8], len: u64) -> RangeOutcome {
 
     if start_s.is_empty() {
         // Suffix range: last N bytes.
+        if end_s.is_empty() || !end_s.bytes().all(|b| b.is_ascii_digit()) {
+            return RangeOutcome::Ignore;
+        }
         let n: u64 = match end_s.parse() {
             Ok(n) => n,
             Err(_) => return RangeOutcome::Ignore,
@@ -2154,6 +2186,9 @@ fn parse_range(value: &[u8], len: u64) -> RangeOutcome {
         return RangeOutcome::Single(start, len - 1);
     }
 
+    if !start_s.bytes().all(|b| b.is_ascii_digit()) {
+        return RangeOutcome::Ignore;
+    }
     let start: u64 = match start_s.parse() {
         Ok(n) => n,
         Err(_) => return RangeOutcome::Ignore,
@@ -2162,6 +2197,9 @@ fn parse_range(value: &[u8], len: u64) -> RangeOutcome {
     let parsed_end = if end_s.is_empty() {
         None
     } else {
+        if !end_s.bytes().all(|b| b.is_ascii_digit()) {
+            return RangeOutcome::Ignore;
+        }
         let Ok(n) = end_s.parse::<u64>() else {
             return RangeOutcome::Ignore;
         };
@@ -2179,6 +2217,42 @@ fn parse_range(value: &[u8], len: u64) -> RangeOutcome {
 
     let end = parsed_end.map_or(len - 1, |n| n.min(len - 1));
     RangeOutcome::Single(start, end)
+}
+
+#[cfg(test)]
+mod range_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn parse_ranges_rejects_signed_numbers_and_caps_components_early() {
+        assert!(matches!(
+            parse_ranges(b"bytes=+0-5", 100),
+            RangeOutcome::Ignore
+        ));
+        assert!(matches!(
+            parse_ranges(b"bytes=0-+5", 100),
+            RangeOutcome::Ignore
+        ));
+        assert!(matches!(
+            parse_ranges(b"bytes=-+5", 100),
+            RangeOutcome::Ignore
+        ));
+        assert!(matches!(
+            parse_ranges(b"bytes=+0-1,2-3", 100),
+            RangeOutcome::Ignore
+        ));
+        let many = format!(
+            "bytes={}",
+            (0..=MAX_RANGES)
+                .map(|i| format!("{i}-{i}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(matches!(
+            parse_ranges(many.as_bytes(), 100),
+            RangeOutcome::Ignore
+        ));
+    }
 }
 
 /// Evaluate an `If-None-Match` header value (raw header bytes) against the entity

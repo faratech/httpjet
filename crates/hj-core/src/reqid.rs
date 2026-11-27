@@ -59,6 +59,44 @@ pub fn next() -> ReqId {
     })
 }
 
+/// Batch of pre-claimed sequential request IDs minted in one TLS access.
+pub struct ReqIdBatch {
+    cur: u64,
+    seed: u64,
+}
+
+impl ReqIdBatch {
+    /// Finalize and return the next 64-bit request id in this batch.
+    #[inline]
+    pub fn next_u64(&mut self) -> u64 {
+        let cur = self.cur;
+        self.cur = cur.wrapping_add(1);
+        splitmix64(self.seed.wrapping_add(cur))
+    }
+}
+
+/// Claim `count` sequential request IDs in a single TLS access (falling back to
+/// one relaxed atomic `fetch_add` on the global counter when the thread-local
+/// batch does not have `count` IDs remaining).
+#[inline]
+pub fn next_batch(count: u64) -> ReqIdBatch {
+    if count == 0 {
+        return ReqIdBatch { cur: 0, seed: 0 };
+    }
+    LOCAL_BATCH.with(|cell| {
+        let (cur, end, s) = cell.get();
+        if end.saturating_sub(cur) >= count {
+            cell.set((cur + count, end, s));
+            return ReqIdBatch { cur, seed: s };
+        }
+        let s = seed();
+        let claim = BATCH.max(count);
+        let base = COUNTER.fetch_add(claim, Relaxed);
+        cell.set((base + count, base + claim, s));
+        ReqIdBatch { cur: base, seed: s }
+    })
+}
+
 /// SplitMix64 finalizer — turns the sequential counter into a well-distributed
 /// 64-bit value so consecutive ids share no visible prefix.
 #[inline]
@@ -91,5 +129,29 @@ impl fmt::Display for ReqId {
     /// `.to_string()` (one small alloc, off the per-request fast path).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:016x}", self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn next_batch_produces_unique_ids_across_refill_boundaries() {
+        let mut seen = HashSet::new();
+        // Mix single next() and small/large next_batch() calls across BATCH (1024).
+        for _ in 0..16 {
+            assert!(seen.insert(next().as_u64()));
+        }
+        let mut small = next_batch(64);
+        for _ in 0..64 {
+            assert!(seen.insert(small.next_u64()));
+        }
+        let mut large = next_batch(BATCH + 17);
+        for _ in 0..(BATCH + 17) {
+            assert!(seen.insert(large.next_u64()));
+        }
+        assert!(seen.insert(next().as_u64()));
     }
 }

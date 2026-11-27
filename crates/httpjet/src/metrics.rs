@@ -186,7 +186,7 @@ async fn serve_metrics_with_limit(
             // so this is always true in practice — but gate the state-mutating / expensive control
             // routes (CPU profiler, alloc-count reset) on it directly so they stay
             // loopback-only even if the bind constraint is ever loosened to allow remote read-only.
-            let peer_loopback = peer.ip().is_loopback();
+            let peer_loopback = peer.ip().to_canonical().is_loopback();
             let local = match stream.local_addr() {
                 Ok(local) => local,
                 Err(_) => return,

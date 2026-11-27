@@ -632,6 +632,144 @@ pub fn finalize_inline_body(chunks: Vec<Bytes>, len: usize) -> Bytes {
     inline_body(chunks, len)
 }
 
+/// Single-pass parser from raw LSAPI `RESP_HEADER` bytes straight into an
+/// `http::Response` head + `(enforced_content_length, unbuffered_flag)`,
+/// eliminating the intermediate `Vec<(HeaderName, HeaderValue)>` allocation.
+/// When `timing` is `None` (fast path with slow-log disabled), skips allocating
+/// `http::Extensions`.
+pub fn parse_inline_response_head_raw(
+    body: &[u8],
+    little_endian: bool,
+    is_head: bool,
+    timing: Option<(Duration, Duration)>,
+) -> Result<(Response, Option<u64>, bool), HandlerError> {
+    let hdr_cnt_hint = body
+        .get(..4)
+        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+        .map(|arr| {
+            let n = if little_endian {
+                i32::from_le_bytes(arr)
+            } else {
+                i32::from_be_bytes(arr)
+            };
+            if (0..=64).contains(&n) {
+                (n as usize) + 2
+            } else {
+                16 + RESPONSE_HEADER_SLACK
+            }
+        })
+        .unwrap_or(16 + RESPONSE_HEADER_SLACK);
+    let mut head = http::HeaderMap::with_capacity(hdr_cnt_hint);
+    let mut has_status_header = None;
+    let mut declared_len: Option<u64> = None;
+    let mut cl_err: Option<&'static str> = None;
+    let (raw_status, _) =
+        crate::proto::parse_resp_header_raw_into(body, little_endian, |name, value| {
+            if name.eq_ignore_ascii_case(b"status") {
+                if let Some(code) = std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|v| v.split_whitespace().next())
+                    .and_then(|c| c.parse::<u16>().ok())
+                    .and_then(|c| http::StatusCode::from_u16(c).ok())
+                {
+                    has_status_header = Some(code);
+                }
+                return Ok(());
+            }
+            if name.eq_ignore_ascii_case(b"content-length") {
+                match http::header::HeaderValue::from_bytes(value) {
+                    Ok(hv) => match parse_single_content_length_value(&hv, &mut declared_len) {
+                        Ok(()) => return Ok(()),
+                        Err(reason) => {
+                            cl_err = Some(reason);
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                reason,
+                            ));
+                        }
+                    },
+                    Err(_) => {
+                        let reason = "invalid Content-Length bytes";
+                        cl_err = Some(reason);
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, reason));
+                    }
+                }
+            }
+            if let (Ok(hn), Ok(hv)) = (
+                http::header::HeaderName::from_bytes(name),
+                http::header::HeaderValue::from_bytes(value),
+            ) {
+                head.try_append(hn, hv).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })?;
+            }
+            Ok(())
+        })
+        .map_err(|e| {
+            if let Some(reason) = cl_err {
+                HandlerError::BadGateway(format!("invalid lsapi Content-Length: {reason}"))
+            } else {
+                HandlerError::BadGateway(format!("invalid lsapi RESP_HEADER: {e}"))
+            }
+        })?;
+    if let Some(len) = declared_len {
+        head.try_append(http::header::CONTENT_LENGTH, len.into())
+            .map_err(|e| HandlerError::Other(format!("build response: {e}")))?;
+    }
+    let status = has_status_header
+        .unwrap_or_else(|| http::StatusCode::from_u16(raw_status).unwrap_or(http::StatusCode::OK));
+    if status.is_informational() {
+        return Err(HandlerError::BadGateway(format!(
+            "lsapi final status {} is informational",
+            status.as_u16()
+        )));
+    }
+    let enforced_len = if hj_core::response_body_forbidden(is_head, status) {
+        None
+    } else {
+        declared_len
+    };
+    let unbuffered = accel_buffering_off(&head);
+    let mut response = Response::new(Body::Empty);
+    *response.status_mut() = status;
+    *response.headers_mut() = head;
+    if let Some((acquire, ttfb)) = timing {
+        response
+            .extensions_mut()
+            .insert(LsapiTiming { acquire, ttfb });
+    }
+    Ok((response, enforced_len, unbuffered))
+}
+
+fn parse_single_content_length_value(
+    value: &http::HeaderValue,
+    declared: &mut Option<u64>,
+) -> Result<(), &'static str> {
+    let raw = value.to_str().map_err(|_| "non-ascii Content-Length")?;
+    let mut saw_part = false;
+    for part in raw.split(',') {
+        saw_part = true;
+        let trimmed = part.trim();
+        if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("non-numeric Content-Length");
+        }
+        let parsed = trimmed
+            .parse::<u64>()
+            .map_err(|_| "overflowing Content-Length")?;
+        if let Some(prev) = *declared {
+            if prev != parsed {
+                return Err("conflicting Content-Length values");
+            }
+        } else {
+            *declared = Some(parsed);
+        }
+    }
+    if !saw_part {
+        return Err("empty Content-Length");
+    }
+    Ok(())
+}
+
 /// Parse a `RESP_HEADER` packet into an `http::Response` head plus
 /// `(enforced_content_length, unbuffered_flag)` identically to the Tokio handler.
 pub fn parse_inline_response_head(
@@ -723,21 +861,18 @@ impl Lsapi {
             .extra_ref(&self.base_env)
             .header_block(!self.full_header_env);
         if let Some(sn) = &ls.script_name {
-            builder = builder.script_name(sn.clone());
+            builder = builder.script_name(sn.as_str());
         }
         if let Some(pi) = &ls.path_info {
-            builder = builder.path_info(pi.clone());
+            builder = builder.path_info(pi.as_str());
         }
-        let env = builder.build_with_content_length(req, ctx, None);
-        let headers = collect_wire_headers(req, None, ctx.forwarding_trusted);
-        if lsapi_fields_overflow_u16(&env)
-            || lsapi_fields_overflow_u16(&headers)
-            || lsapi_special_env_overflow_u16(&ls.special_env)
-        {
-            return Err(HandlerError::RequestHeaderFieldsTooLarge);
-        }
-        build_begin_request_framed_into(out, &env, &ls.special_env, &headers, 0);
-        Ok(())
+        let mut scratch = crate::cgi::CgiStackScratch::new();
+        with_tls_begin_scratch(|env, headers| {
+            builder.build_with_content_length_scratch_into(req, ctx, None, &mut scratch, env);
+            collect_wire_headers_into(req, None, ctx.forwarding_trusted, headers);
+            crate::proto::try_build_begin_request_framed_into(out, env, &ls.special_env, headers, 0)
+                .map_err(|_| HandlerError::RequestHeaderFieldsTooLarge)
+        })
     }
 
     /// Dispatch while returning the consumed request's head to the caller. The
@@ -2945,25 +3080,36 @@ fn collect_wire_headers<'r>(
     content_length: Option<&'r str>,
     forwarding_trusted: bool,
 ) -> Vec<WireField<'r>> {
-    let mut headers: Vec<_> = req
-        .headers()
-        .iter()
-        .filter(|(name, _)| {
-            crate::cgi::header_forwardable(name.as_str(), forwarding_trusted)
-                && !(content_length.is_some() && *name == http::header::CONTENT_LENGTH)
-        })
-        .map(|(name, value)| {
-            let value = value.to_str().map(Cow::Borrowed).unwrap_or_else(|_| {
-                Cow::Owned(String::from_utf8_lossy(value.as_bytes()).into_owned())
-            });
-            let known = crate::proto::known_header_index(name.as_str());
-            WireField {
-                name: Cow::Borrowed(name.as_str()),
-                value,
-                known,
-            }
-        })
-        .collect();
+    let mut headers =
+        Vec::with_capacity(req.headers().len() + usize::from(content_length.is_some()));
+    collect_wire_headers_into(req, content_length, forwarding_trusted, &mut headers);
+    headers
+}
+
+fn collect_wire_headers_into<'r>(
+    req: &'r Request,
+    content_length: Option<&'r str>,
+    forwarding_trusted: bool,
+    headers: &mut Vec<WireField<'r>>,
+) {
+    headers.clear();
+    for (name, value) in req.headers() {
+        if !crate::cgi::header_forwardable(name.as_str(), forwarding_trusted)
+            || (content_length.is_some() && *name == http::header::CONTENT_LENGTH)
+        {
+            continue;
+        }
+        let value = value
+            .to_str()
+            .map(Cow::Borrowed)
+            .unwrap_or_else(|_| Cow::Owned(String::from_utf8_lossy(value.as_bytes()).into_owned()));
+        let known = crate::proto::known_header_index(name.as_str());
+        headers.push(WireField {
+            name: Cow::Borrowed(name.as_str()),
+            value,
+            known,
+        });
+    }
     if let Some(length) = content_length {
         headers.push(WireField {
             name: Cow::Borrowed("content-length"),
@@ -2971,39 +3117,70 @@ fn collect_wire_headers<'r>(
             known: crate::proto::known_header_index("content-length"),
         });
     }
-    headers
 }
 
-/// A request header bound for lsphp's header block, with its well-known index
-/// slot resolved once: the name mapping and both builder passes all need it.
-struct WireField<'r> {
-    name: Cow<'r, str>,
-    value: Cow<'r, str>,
-    known: Option<usize>,
+/// Reuse thread-local empty `env` and `headers` `Vec` backing allocations across
+/// bodyless `BEGIN_REQUEST` encodes. Both vectors are guaranteed empty whenever
+/// stored in TLS and are cleared on exit (including unwind) before lifetime `'r`
+/// ends.
+fn with_tls_begin_scratch<'r, R>(
+    f: impl FnOnce(&mut Vec<(Cow<'r, str>, Cow<'r, str>)>, &mut Vec<WireField<'r>>) -> R,
+) -> R {
+    struct TlsBeginScratch {
+        env: Vec<(Cow<'static, str>, Cow<'static, str>)>,
+        headers: Vec<WireField<'static>>,
+    }
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<TlsBeginScratch> = const {
+            std::cell::RefCell::new(TlsBeginScratch {
+                env: Vec::new(),
+                headers: Vec::new(),
+            })
+        };
+    }
+    struct Guard<'r> {
+        env: Vec<(Cow<'r, str>, Cow<'r, str>)>,
+        headers: Vec<WireField<'r>>,
+    }
+    impl Drop for Guard<'_> {
+        fn drop(&mut self) {
+            self.env.clear();
+            self.headers.clear();
+            let env = std::mem::take(&mut self.env);
+            let headers = std::mem::take(&mut self.headers);
+            // SAFETY: Both Vecs are empty; no `'r` references exist in them.
+            let env_static: Vec<(Cow<'static, str>, Cow<'static, str>)> =
+                unsafe { std::mem::transmute(env) };
+            let headers_static: Vec<WireField<'static>> = unsafe { std::mem::transmute(headers) };
+            let _ = SCRATCH.try_with(|cell| {
+                if let Ok(mut s) = cell.try_borrow_mut() {
+                    if env_static.capacity() <= 256 {
+                        s.env = env_static;
+                    }
+                    if headers_static.capacity() <= 256 {
+                        s.headers = headers_static;
+                    }
+                }
+            });
+        }
+    }
+    let (env_static, headers_static) = SCRATCH
+        .try_with(|cell| {
+            cell.try_borrow_mut()
+                .map(|mut s| (std::mem::take(&mut s.env), std::mem::take(&mut s.headers)))
+                .unwrap_or_else(|_| (Vec::new(), Vec::new()))
+        })
+        .unwrap_or_else(|_| (Vec::new(), Vec::new()));
+    debug_assert!(env_static.is_empty() && headers_static.is_empty());
+    // SAFETY: Both Vecs are empty; changing the phantom lifetime parameter is a no-op.
+    let mut guard = Guard {
+        env: unsafe { std::mem::transmute(env_static) },
+        headers: unsafe { std::mem::transmute(headers_static) },
+    };
+    f(&mut guard.env, &mut guard.headers)
 }
 
-impl WireHeader for WireField<'_> {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn value(&self) -> &str {
-        &self.value
-    }
-    fn known_index(&self) -> Option<usize> {
-        self.known
-    }
-    /// The name lsphp reports for a header (`getallheaders()`, #950). A well-known
-    /// header is sent by index slot, so the SAPI names it from its own table and the
-    /// name text is never read. Any other name is reported verbatim; the h1 case is
-    /// gone by now (the `http` crate lower-cases), so restore the conventional
-    /// Title-Case FPM/Apache present (`x-hub-signature-256` -> `X-Hub-Signature-256`).
-    /// Only `[A-Za-z0-9-]` names get here ([`crate::cgi::header_forwardable`]), so the
-    /// mapping is case-only: `HTTP_*` names and duplicate grouping are unchanged. The
-    /// builder applies it while copying the name, so no per-header String is built.
-    fn title_case(&self) -> bool {
-        self.known.is_none()
-    }
-}
+use crate::cgi::WireField;
 
 fn log_stderr(body: &[u8]) {
     let text = String::from_utf8_lossy(body);
@@ -4258,6 +4435,27 @@ mod retry_tag_tests {
             Some(RetryKind::PreFlush),
         );
         assert!(matches!(e, Err(HandlerError::ServiceUnavailable)));
+    }
+
+    #[test]
+    fn parse_inline_response_head_raw_rejects_invalid_content_length_bytes() {
+        // Build a minimal little-endian LSAPI RESP_HEADER body:
+        // cnt=1 (i32), status=200 (i32), len[0] (u16 including trailing NUL),
+        // then "Content-Length: 5\x01\0" (0x01 is invalid in HTTP HeaderValue).
+        let line = b"Content-Length: 5\x01\0";
+        let mut body = Vec::new();
+        body.extend_from_slice(&1i32.to_le_bytes());
+        body.extend_from_slice(&200i32.to_le_bytes());
+        body.extend_from_slice(&(line.len() as u16).to_le_bytes());
+        body.extend_from_slice(line);
+        let err = match parse_inline_response_head_raw(&body, true, false, None) {
+            Err(e) => e,
+            Ok(_) => panic!("expected BadGateway for invalid Content-Length bytes"),
+        };
+        assert!(
+            matches!(err, HandlerError::BadGateway(ref msg) if msg.contains("Content-Length")),
+            "expected BadGateway for invalid Content-Length bytes, got {err:?}"
+        );
     }
 }
 

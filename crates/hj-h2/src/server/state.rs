@@ -295,6 +295,11 @@ pub(super) struct OutStream {
     pub(super) completion: Option<hj_core::ResponseCompletion>,
     /// Bytes pulled but not yet sent (the window-blocked remainder of the current chunk).
     pub(super) pending: Bytes,
+    /// Byte cursor into `pending` so multi-frame sends advance without `Bytes::split_to`.
+    pub(super) pending_off: usize,
+    /// `(OutQueue::flush_gen, body_backings index)` when `pending` is already pinned in
+    /// the current flush batch, avoiding duplicate `Bytes` clones across 16 KiB frames.
+    pub(super) out_backing: Option<(u64, usize)>,
     /// The streaming source while it is "at home" (not currently being pulled). `None`
     /// for in-memory bodies and while a pull future holds it.
     pub(super) body: Option<hj_core::StreamBody>,
@@ -315,6 +320,23 @@ pub(super) struct OutStream {
     pub(super) send_blocked: bool,
     /// An ID already present in either queue, kept there until the sender pops it.
     pub(super) send_queued: bool,
+}
+
+impl OutStream {
+    #[inline]
+    pub(super) fn pending_len(&self) -> usize {
+        self.pending.len().saturating_sub(self.pending_off)
+    }
+
+    #[inline]
+    pub(super) fn pending_is_empty(&self) -> bool {
+        self.pending_off >= self.pending.len()
+    }
+
+    #[inline]
+    pub(super) fn pending_slice(&self) -> &[u8] {
+        self.pending.get(self.pending_off..).unwrap_or(&[])
+    }
 }
 
 /// One response's send-stall clock: when its current window started and how many DATA

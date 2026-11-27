@@ -621,6 +621,8 @@ pub mod client {
 pub use client::ClientConfig;
 #[cfg(feature = "std")]
 pub use client::ClientConnection;
+#[cfg(feature = "std")]
+pub use crate::msgs::message::recycle_tls_record_vec;
 
 /// Items for use in a server.
 pub mod server {

@@ -497,7 +497,12 @@ pub(super) struct ControlStreamParser {
     pub(super) settings_received: bool,
     pub(super) settings: Option<SettingsParser>,
     pub(super) completed_settings: Option<PeerSettings>,
+    pub(super) no_progress_frames: u32,
 }
+
+/// Cap consecutive non-SETTINGS control frames (e.g. empty unknown/GREASE frames)
+/// on the HTTP/3 control stream, matching `H3FrameCounter` (#1318).
+const H3_CONTROL_NO_PROGRESS_LIMIT: u32 = 10_000;
 
 #[derive(Clone, Copy, Default)]
 pub(super) enum ControlFramePhase {
@@ -542,6 +547,15 @@ impl ControlStreamParser {
                             H3_FRAME_UNEXPECTED,
                             b"frame is forbidden on the control stream",
                         ));
+                    }
+                    if frame_type != 0x04 {
+                        self.no_progress_frames = self.no_progress_frames.saturating_add(1);
+                        if self.no_progress_frames > H3_CONTROL_NO_PROGRESS_LIMIT {
+                            return Err(H3ConnectionError::new(
+                                H3_EXCESSIVE_LOAD,
+                                b"excessive HTTP/3 control stream frames",
+                            ));
+                        }
                     }
                     self.frame_type = frame_type;
                     self.phase = ControlFramePhase::Length;

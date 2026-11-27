@@ -126,10 +126,19 @@ impl ClientThrottle {
         self.admit_at(ip, false, None)
     }
 
+    /// True when per-IP rate limiting is disabled (`rate == 0`).
+    #[inline]
+    pub fn is_disabled(&self) -> bool {
+        self.rate == 0
+    }
+
     /// Like [`allow_deferring_rejection`](Self::allow_deferring_rejection), reusing a
     /// caller-captured `now` timestamp to avoid an extra `Instant::now()` syscall.
     #[inline]
     pub fn allow_deferring_rejection_at(&self, ip: IpAddr, now: Instant) -> bool {
+        if self.rate == 0 {
+            return true;
+        }
         self.admit_at(ip, false, Some(now))
     }
 

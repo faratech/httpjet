@@ -1106,7 +1106,7 @@ impl LsapiPool {
             retry_timeout: Duration::ZERO,
             breaker: None,
             inflight_max: AtomicU64::new(0),
-            monoio_idle: Mutex::new(Vec::new()),
+            monoio_idle: Mutex::new(Vec::with_capacity(max_conns)),
         }
     }
 
@@ -1178,28 +1178,32 @@ impl LsapiPool {
         self.max_conns
     }
 
-    /// Acquire one permit from this pool's `max_conns` semaphore for on-core
-    /// monoio LSAPI dispatch. Fast-paths uncontended `try_acquire_owned()`.
+    pub fn idle_ttl_duration(&self) -> Duration {
+        self.idle_ttl
+    }
+
+    /// Acquire one borrowed permit from this pool's `max_conns` semaphore for
+    /// on-core monoio LSAPI dispatch. Fast-paths uncontended `try_acquire()`
+    /// without cloning `Arc<Semaphore>` on every PHP request.
     pub async fn acquire_monoio_permit(
         &self,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, PoolError> {
-        if let Ok(permit) = self.sem.clone().try_acquire_owned() {
+    ) -> Result<tokio::sync::SemaphorePermit<'_>, PoolError> {
+        if let Ok(permit) = self.sem.try_acquire() {
             return Ok(permit);
         }
-        self.sem
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| PoolError::Closed)
+        self.sem.acquire().await.map_err(|_| PoolError::Closed)
     }
 
     /// Pop the newest live idle UDS socket for `generation` (LIFO), discarding
     /// stale or expired entries.
-    pub fn pop_monoio_idle(&self, generation: u64) -> Option<std::os::unix::net::UnixStream> {
+    pub fn pop_monoio_idle(
+        &self,
+        generation: u64,
+        now: Instant,
+    ) -> Option<std::os::unix::net::UnixStream> {
         if self.idle_ttl.is_zero() {
             return None;
         }
-        let now = Instant::now();
         let mut idle = self.monoio_idle.lock();
         while let Some((stream, entry_gen, since)) = idle.pop() {
             if entry_gen == generation && now.saturating_duration_since(since) < self.idle_ttl {
@@ -1223,7 +1227,12 @@ impl LsapiPool {
     }
 
     /// Return a clean UDS socket to the shared monoio idle pool for `generation`.
-    pub fn push_monoio_idle(&self, stream: std::os::unix::net::UnixStream, generation: u64) {
+    pub fn push_monoio_idle(
+        &self,
+        stream: std::os::unix::net::UnixStream,
+        generation: u64,
+        now: Instant,
+    ) {
         if self.idle_ttl.is_zero() {
             return;
         }
@@ -1232,7 +1241,7 @@ impl LsapiPool {
             idle.retain(|(_, entry_gen, _)| *entry_gen == generation);
         }
         if idle.len() < self.max_conns {
-            idle.push((stream, generation, Instant::now()));
+            idle.push((stream, generation, now));
         }
     }
 

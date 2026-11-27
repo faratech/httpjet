@@ -2257,18 +2257,20 @@ fn pump_local_uni_prefix<I: LocalUniIo>(
     let Some(id) = *stream else {
         return Ok(false);
     };
-    match io.write_uni(id, &prefix[*offset..]) {
-        Ok(0) | Err(WriteError::Blocked) => Ok(false),
-        Ok(written) => {
-            assert!(
-                written <= prefix.len() - *offset,
-                "QUIC stream write exceeded the supplied prefix"
-            );
-            *offset += written;
-            Ok(*offset == prefix.len())
+    while *offset < prefix.len() {
+        match io.write_uni(id, &prefix[*offset..]) {
+            Ok(0) | Err(WriteError::Blocked) => return Ok(false),
+            Ok(written) => {
+                assert!(
+                    written <= prefix.len() - *offset,
+                    "QUIC stream write exceeded the supplied prefix"
+                );
+                *offset += written;
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) => Err(error),
     }
+    Ok(true)
 }
 
 fn pump_local_h3_setup<I: LocalUniIo>(io: &mut I, st: &mut H3State) -> Result<(), WriteError> {
@@ -2615,18 +2617,23 @@ fn send_h3_goaway(conn: &mut quinn_proto::Connection, st: &mut H3State) {
         write_varint(&mut st.goaway_buf, payload.len() as u64);
         st.goaway_buf.extend_from_slice(&payload);
     }
-    match conn
-        .send_stream(control)
-        .write(&st.goaway_buf[st.goaway_off..])
-    {
-        Ok(n) => {
-            st.goaway_off += n;
-            if st.goaway_off == st.goaway_buf.len() {
+    while st.goaway_off < st.goaway_buf.len() {
+        match conn
+            .send_stream(control)
+            .write(&st.goaway_buf[st.goaway_off..])
+        {
+            Ok(0) | Err(WriteError::Blocked) => break,
+            Ok(n) => {
+                st.goaway_off += n;
+                if st.goaway_off == st.goaway_buf.len() {
+                    st.goaway_sent = true;
+                }
+            }
+            Err(_) => {
                 st.goaway_sent = true;
+                break;
             }
         }
-        Err(WriteError::Blocked) => {}
-        Err(_) => st.goaway_sent = true,
     }
 }
 
@@ -3885,10 +3892,12 @@ async fn endpoint_loop_concurrent(
     // quinn-udp socket state for GSO send (probes UDP_SEGMENT support once per core;
     // flush_conn re-reads the cap it may lower later).
     let udp = IoUringDatagram::new(udp)?;
-    // Retain one poll operation across losing select branches. Recreating it
-    // when completions are continuously ready can cancel every registration
-    // before its CQE arrives. Scalar mode allocates no extra readiness future.
+    // Retain poll/cancellation futures across losing select branches so busy
+    // completions or timers never cancel and re-register UDP readiness or
+    // re-subscribe to `CancellationToken` on every loop iteration.
     let mut writable_wait = udp.batch_enabled().then(|| Box::pin(udp.writable()));
+    let mut readable_wait = std::pin::pin!(udp.readable());
+    let mut shutdown_wait = std::pin::pin!(shutdown.cancelled());
     // GRO recv: drain many datagrams per readiness wake into reused buffers (one recvmmsg
     // returns up to GRO_BATCH messages, each GRO-coalescing up to ~64 segments). Batching ACK
     // processing into ONE flush per wake stops the send-bunching (one flush per ACK) that
@@ -3956,18 +3965,11 @@ async fn endpoint_loop_concurrent(
         }
         let next_timeout = deadlines.next().into_iter().chain(drain_deadline).min();
         let has_pending_work = !pending_work.is_empty() && !udp.send_blocked();
-        let shutdown_wait = async {
-            if draining {
-                std::future::pending::<()>().await;
-            } else {
-                shutdown.cancelled().await;
-            }
-        };
         monoio::select! {
             biased;
             // (0) Stop new admissions, send GOAWAY, and keep driving established streams
             // until every response drains or the same bounded grace used by TCP expires.
-            _ = shutdown_wait => {
+            _ = &mut shutdown_wait, if !draining => {
                 draining = true;
                 let now = Instant::now();
                 drain_deadline = Some(now + super::URING_DRAIN_GRACE);
@@ -4013,8 +4015,9 @@ async fn endpoint_loop_concurrent(
                 pump::<MAX_PUMP_ROUNDS>(&udp, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &comp_rx, &runtime, &policy, !draining, &mut pending_work).await;
             }
             // (2) Socket readable: GRO-drain queued datagrams, then pump (drive affected conns
-            // + interleave further ACK processing). `readable()` is a poll op (cancel-safe).
-            _ = udp.readable() => {
+            // + interleave further ACK processing). `readable()` is pinned across losing branches.
+            _ = &mut readable_wait => {
+                readable_wait.set(udp.readable());
                 let now = Instant::now();
                 recv_drain(&udp, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut endpoint, &mut conns, &mut h3, &mut deadlines, &mut epoch_ctr, &handshakes, &runtime, &policy, !draining, now, &mut pending_work).await;
                 pump::<MAX_PUMP_ROUNDS>(&udp, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &comp_rx, &runtime, &policy, !draining, &mut pending_work).await;
@@ -4136,6 +4139,104 @@ fn encode_h3_headers_frame(status: http::StatusCode, headers: &http::HeaderMap) 
 }
 
 /// Encode an HTTP/3 HEADERS frame directly into its final wire buffer (plus `extra_cap`
+const QPACK_SHARED_SLOTS: usize = 64;
+
+struct CachedQpackHeaders {
+    ptr: usize,
+    guard: std::sync::Weak<http::HeaderMap>,
+    field_section_size: u64,
+    wire: Vec<u8>,
+}
+
+thread_local! {
+    static QPACK_SHARED_HEADERS_CACHE: std::cell::RefCell<[Option<CachedQpackHeaders>; QPACK_SHARED_SLOTS]> =
+        const { std::cell::RefCell::new([const { None }; QPACK_SHARED_SLOTS]) };
+}
+
+fn populate_cached_h3_shared_headers(
+    shared: &Arc<http::HeaderMap>,
+    ptr: usize,
+    slot: usize,
+    extra_cap: usize,
+) -> (u64, Option<Vec<u8>>) {
+    let field_section_size = h3_field_section_size(http::StatusCode::OK, shared.as_ref());
+    let wire = encode_h3_headers_frame_with_extra(http::StatusCode::OK, shared.as_ref(), 0);
+    let out = if extra_cap != usize::MAX {
+        let mut buf = Vec::with_capacity(wire.len() + extra_cap);
+        buf.extend_from_slice(&wire);
+        Some(buf)
+    } else {
+        None
+    };
+    QPACK_SHARED_HEADERS_CACHE.with(|cell| {
+        let mut table = cell.borrow_mut();
+        if let Some(dst) = table.get_mut(slot) {
+            *dst = Some(CachedQpackHeaders {
+                ptr,
+                guard: Arc::downgrade(shared),
+                field_section_size,
+                wire,
+            });
+        }
+    });
+    (field_section_size, out)
+}
+
+/// Return the cached RFC 9114 §4.2.2 field-section size for a shared status-200
+/// `HeaderMap`, populating `QPACK_SHARED_HEADERS_CACHE` on miss so the subsequent
+/// QPACK wire encode hits the same slot without re-traversing the `HeaderMap`.
+fn cached_h3_shared_field_section_size(shared: &Arc<http::HeaderMap>) -> u64 {
+    let ptr = Arc::as_ptr(shared) as usize;
+    let slot = (ptr >> 6) & (QPACK_SHARED_SLOTS - 1);
+    let cached = QPACK_SHARED_HEADERS_CACHE.with(|cell| {
+        let table = cell.borrow();
+        let entry = table.get(slot)?.as_ref()?;
+        if entry.ptr == ptr && entry.guard.strong_count() > 0 {
+            Some(entry.field_section_size)
+        } else {
+            None
+        }
+    });
+    if let Some(size) = cached {
+        return size;
+    }
+    populate_cached_h3_shared_headers(shared, ptr, slot, usize::MAX).0
+}
+
+/// Cache encoded status-200 QPACK HEADERS frame bytes per `Arc<HeaderMap>`
+/// identity on the current H3 core (keyed by pointer + `Weak` liveness guard,
+/// just like H2's `replay_shared_response`). When `fast_memo` refreshes `Date`
+/// or `Age`, `Arc::make_mut` allocates a new `Arc` when shared, or if refcount
+/// was 1 the old `Weak` is invalidated when dropped — wait: if `Arc::make_mut`
+/// mutates in place while a `Weak` exists, `Arc::strong_count` is 1 and
+/// `Arc::weak_count` is 1, so `Arc::make_mut` ALWAYS clones (`Arc::get_mut`
+/// requires strong==1 && weak==0)! Thus a live `Weak` guarantees immutability
+/// of the underlying `HeaderMap`!
+fn encode_cached_h3_shared_headers_with_extra(
+    shared: &Arc<http::HeaderMap>,
+    extra_cap: usize,
+) -> Vec<u8> {
+    let ptr = Arc::as_ptr(shared) as usize;
+    let slot = (ptr >> 6) & (QPACK_SHARED_SLOTS - 1);
+    let cached = QPACK_SHARED_HEADERS_CACHE.with(|cell| {
+        let table = cell.borrow();
+        let entry = table.get(slot)?.as_ref()?;
+        if entry.ptr == ptr && entry.guard.strong_count() > 0 {
+            let mut out = Vec::with_capacity(entry.wire.len() + extra_cap);
+            out.extend_from_slice(&entry.wire);
+            Some(out)
+        } else {
+            None
+        }
+    });
+    if let Some(out) = cached {
+        return out;
+    }
+    populate_cached_h3_shared_headers(shared, ptr, slot, extra_cap)
+        .1
+        .unwrap_or_default()
+}
+
 /// headroom for coalescing a small DATA frame) with zero intermediate scratch copy:
 /// reserves a 3-byte prefix `[0x01, len_hi, len_lo]` which covers the common
 /// `64..16384`-byte field-section length in place, shifts `< 64` bytes by 1 byte for
@@ -4360,8 +4461,16 @@ fn decode_h3_request_direct(
                     if method.is_some() || value == b"CONNECT" {
                         return false;
                     }
-                    let Ok(m) = http::Method::from_bytes(value) else {
-                        return false;
+                    let m = match value {
+                        b"GET" => http::Method::GET,
+                        b"HEAD" => http::Method::HEAD,
+                        b"POST" => http::Method::POST,
+                        _ => {
+                            let Ok(m) = http::Method::from_bytes(value) else {
+                                return false;
+                            };
+                            m
+                        }
                     };
                     method = Some(m);
                 }
@@ -4602,7 +4711,7 @@ async fn handle_h3_request(
         return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST));
     };
     if parsed.body.len() > request_limits.max_body_bytes {
-        return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST));
+        return H3Outcome::full(h3_error(http::StatusCode::PAYLOAD_TOO_LARGE));
     }
     let body_b = parsed.body;
     let body_len = body_b.len();
@@ -4705,35 +4814,43 @@ async fn handle_h3_request(
             };
             // Fast-memo hits carry pre-sanitized status-200 GET headers in `shared_headers`
             // so we encode straight from `&Arc<HeaderMap>` without cloning `HeaderMap`.
-            let (body_forbidden, headers_ref): (bool, &http::HeaderMap) = if let Some(ref shared) =
-                shared_headers
+            let shared_200 = if let Some(ref shared) = shared_headers
                 && !is_head
                 && status == http::StatusCode::OK
                 && !streaming_unknown_len
             {
-                (false, shared.as_ref())
+                Some(shared)
             } else {
-                if let Some(shared) = shared_headers
-                    && headers.is_empty()
-                {
-                    headers = (*shared).clone();
-                }
-                let forbidden = prepare_h3_response_headers(
-                    &mut headers,
-                    is_head,
-                    status,
-                    streaming_unknown_len,
-                );
-                (forbidden, &headers)
+                None
             };
+            let (body_forbidden, headers_ref): (bool, &http::HeaderMap) =
+                if let Some(shared) = shared_200 {
+                    (false, shared.as_ref())
+                } else {
+                    if let Some(shared) = shared_headers.as_ref()
+                        && headers.is_empty()
+                    {
+                        headers = (**shared).clone();
+                    }
+                    let forbidden = prepare_h3_response_headers(
+                        &mut headers,
+                        is_head,
+                        status,
+                        streaming_unknown_len,
+                    );
+                    (forbidden, &headers)
+                };
             // #626 (RFC 9114 §7.2.4.1): never emit a field section larger than
             // the peer's SETTINGS_MAX_FIELD_SECTION_SIZE — a conforming client
             // would abort the stream with H3_MESSAGE_ERROR. Fall back to a
             // minimal 500 head (status only, the smallest legal section).
-            if max_field_section_size
-                .get()
-                .is_some_and(|limit| h3_field_section_size(status, headers_ref) > limit)
-            {
+            if max_field_section_size.get().is_some_and(|limit| {
+                let size = match shared_200 {
+                    Some(shared) => cached_h3_shared_field_section_size(shared),
+                    None => h3_field_section_size(status, headers_ref),
+                };
+                size > limit
+            }) {
                 if let crate::uring::bridge::BridgeBody::Stream { rx, .. } = &mut r.body {
                     rx.close();
                 }
@@ -4752,8 +4869,11 @@ async fn handle_h3_request(
                         // Small-body coalescing: append DATA frame directly onto `head`
                         // and emit `H3Body::Full` — eliminates Arc<H3EgressLease>, a
                         // second `Bytes::from_owner`, and 2 extra quinn SendStream writes.
-                        let mut data =
-                            encode_h3_headers_frame_with_extra(status, headers_ref, body.len() + 4);
+                        let mut data = if let Some(shared) = shared_200 {
+                            encode_cached_h3_shared_headers_with_extra(shared, body.len() + 4)
+                        } else {
+                            encode_h3_headers_frame_with_extra(status, headers_ref, body.len() + 4)
+                        };
                         encode_h3_data_frame(&mut data, &body);
                         let lease = match reserve_h3_egress(egress_budget.as_ref(), data.len()) {
                             Ok(lease) => lease,
@@ -4771,7 +4891,11 @@ async fn handle_h3_request(
                             completion,
                         }
                     } else {
-                        let head = encode_h3_headers_frame(status, headers_ref);
+                        let head = if let Some(shared) = shared_200 {
+                            encode_cached_h3_shared_headers_with_extra(shared, 0)
+                        } else {
+                            encode_h3_headers_frame(status, headers_ref)
+                        };
                         let framed_body = if body.is_empty() {
                             0
                         } else {
@@ -10291,5 +10415,32 @@ mod admission_tests {
             qpack_static_lookup("x-unknown", b""),
             QpackStaticMatch::None
         );
+    }
+
+    #[test]
+    fn cached_shared_field_section_size_matches_uncached_and_populates_wire() {
+        let mut hdrs = http::HeaderMap::new();
+        hdrs.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        hdrs.insert(
+            http::header::DATE,
+            http::HeaderValue::from_static("Fri, 27 Nov 2026 05:50:00 GMT"),
+        );
+        hdrs.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("1024"),
+        );
+        let shared = Arc::new(hdrs);
+        let expected_size = h3_field_section_size(http::StatusCode::OK, shared.as_ref());
+        let expected_wire =
+            encode_h3_headers_frame_with_extra(http::StatusCode::OK, shared.as_ref(), 0);
+        // Miss populates both field_section_size and wire; second call hits cache.
+        assert_eq!(cached_h3_shared_field_section_size(&shared), expected_size);
+        assert_eq!(cached_h3_shared_field_section_size(&shared), expected_size);
+        let wire = encode_cached_h3_shared_headers_with_extra(&shared, 16);
+        assert_eq!(wire, expected_wire);
+        assert!(wire.capacity() >= expected_wire.len() + 16);
     }
 }

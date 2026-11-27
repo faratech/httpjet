@@ -84,7 +84,7 @@ impl CommonState {
             has_seen_eof: false,
             peer_certificates: None,
             message_fragmenter: MessageFragmenter::default(),
-            received_plaintext: ChunkVecBuffer::new(Some(DEFAULT_RECEIVED_PLAINTEXT_LIMIT)),
+            received_plaintext: ChunkVecBuffer::new_reusable(Some(DEFAULT_RECEIVED_PLAINTEXT_LIMIT)),
             sendable_tls: ChunkVecBuffer::new(Some(DEFAULT_BUFFER_LIMIT)),
             queued_key_update_message: None,
             protocol: Protocol::Tcp,
@@ -554,7 +554,7 @@ impl CommonState {
     pub(crate) fn take_received_plaintext(&mut self, bytes: Payload<'_>) {
         self.temper_counters.received_app_data();
         self.received_plaintext
-            .append(bytes.into_vec());
+            .append_slice(bytes.bytes());
     }
 
     #[cfg(feature = "tls12")]

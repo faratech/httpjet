@@ -228,10 +228,20 @@ pub(crate) fn decompress_plain_tls(
     let Some(bound) = zstd::bulk::Decompressor::upper_bound(input) else {
         return Ok(None);
     };
-    if bound > cap {
+    // Guard against untrusted frames declaring a huge Frame_Content_Size (up to `cap`)
+    // in a tiny payload: only use the one-shot pre-allocated fast path when the declared
+    // size is bounded proportionally to the compressed input and <= 1 MiB. Larger valid
+    // frames fall back to the incremental streaming decoder, which still enforces `cap`.
+    let one_shot_limit = input
+        .len()
+        .saturating_mul(16)
+        .max(64 * 1024)
+        .min(1024 * 1024)
+        .min(cap);
+    if bound > one_shot_limit {
         return Ok(None);
     }
-    let capacity = bound.max(expected).min(cap);
+    let capacity = bound.max(expected.min(one_shot_limit)).min(one_shot_limit);
     let mut out = Vec::with_capacity(capacity);
     let res = DECODE_CTX.try_with(|cell| {
         let Ok(mut slot) = cell.try_borrow_mut() else {
@@ -700,6 +710,20 @@ mod tests {
             "identical dict bytes collapse to one generation"
         );
         assert!(gens.contains(&shared.generation()));
+    }
+
+    #[test]
+    fn decompress_plain_tls_refuses_huge_untrusted_frame_content_size() {
+        // Minimal zstd frame header with FCS_Field_Size=4 (flags=0xA0: Single_Segment=1,
+        // FCS=4-byte, Content_Checksum=0) declaring 100 MiB in a 14-byte payload.
+        let mut crafted = vec![0x28, 0xB5, 0x2F, 0xFD, 0xA0];
+        crafted.extend_from_slice(&(100u32 * 1024 * 1024).to_le_bytes());
+        crafted.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            decompress_plain_tls(&crafted, 100 * 1024 * 1024, 0).unwrap(),
+            None,
+            "oversized declared Frame_Content_Size must fall back to streaming decode"
+        );
     }
 
     #[test]

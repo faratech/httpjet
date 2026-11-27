@@ -210,6 +210,58 @@ impl DeframerVecBuffer {
         Ok(new_bytes)
     }
 
+    /// Take ownership of the backing `Vec<u8>` so an async completion runtime
+    /// (such as monoio/io_uring) can read ciphertext directly into `buf[used..]`
+    /// without an intermediate read buffer or `memcpy`.
+    ///
+    /// Returns `(buf, max_len)` where `buf.len() == self.used` (the already-filled
+    /// unread prefix) and `max_len` is the upper bound (`allow_max`) that the caller
+    /// must not exceed. The caller MUST pass `buf` back via [`Self::restore_after_read`]
+    /// once I/O completes (or if cancelled).
+    pub(crate) fn take_for_read(
+        &mut self,
+        is_joining_hs: bool,
+    ) -> Result<(Vec<u8>, usize), &'static str> {
+        const MAX_HANDSHAKE_SIZE: u32 = 0xffff;
+        // Size each async read for a full maximum-size TLS record so a single
+        // io_uring read absorbs an entire 16 KiB record without splitting it.
+        const READ_SIZE: usize = MAX_WIRE_SIZE;
+
+        let allow_max = match is_joining_hs {
+            true => MAX_HANDSHAKE_SIZE as usize,
+            false => MAX_WIRE_SIZE,
+        };
+
+        if self.used >= allow_max {
+            return Err("message buffer full");
+        }
+
+        let need_capacity = Ord::min(allow_max, self.used + READ_SIZE);
+        if self.buf.capacity() > 32 * 1024 && self.used == 0 {
+            self.buf.truncate(0);
+            self.buf.shrink_to(need_capacity);
+        } else if self.buf.len() > allow_max {
+            self.buf.truncate(self.used);
+            self.buf.shrink_to(need_capacity);
+        }
+        self.buf.truncate(self.used);
+        let spare_needed = need_capacity.saturating_sub(self.buf.len());
+        if self.buf.capacity() - self.buf.len() < spare_needed {
+            self.buf.reserve(spare_needed);
+        }
+
+        let buf = mem::take(&mut self.buf);
+        self.used = 0;
+        Ok((buf, allow_max))
+    }
+
+    /// Restore the backing `Vec<u8>` previously lent out by [`Self::take_for_read`].
+    /// `buf.len()` is the new total number of filled bytes (`old_used + bytes_read`).
+    pub(crate) fn restore_after_read(&mut self, buf: Vec<u8>) {
+        self.used = buf.len();
+        self.buf = buf;
+    }
+
     /// Resize the internal `buf` if necessary for reading more bytes.
     fn prepare_read(&mut self, is_joining_hs: bool) -> Result<(), &'static str> {
         /// TLS allows for handshake messages of up to 16MB.  We
@@ -243,7 +295,7 @@ impl DeframerVecBuffer {
         let need_capacity = Ord::min(allow_max, self.used + READ_SIZE);
         if need_capacity > self.buf.len() {
             self.buf.resize(need_capacity, 0);
-        } else if self.used == 0 || self.buf.len() > allow_max {
+        } else if self.buf.len() > allow_max || (self.used == 0 && self.buf.capacity() > 32 * 1024) {
             self.buf.resize(need_capacity, 0);
             self.buf.shrink_to(need_capacity);
         }

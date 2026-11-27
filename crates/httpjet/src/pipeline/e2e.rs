@@ -4395,6 +4395,7 @@ RewriteRule ^.*$ index.php [NC,L]
         request: &Request,
         tls: bool,
     ) -> Option<(Arc<http::HeaderMap>, bytes::Bytes)> {
+        let mut out = None;
         super::super::probe_borrowed_h2_memo(
             state,
             LISTENER,
@@ -4408,7 +4409,13 @@ RewriteRule ^.*$ index.php [NC,L]
             request.method(),
             request.uri(),
             request.headers(),
-        )
+            None,
+            &mut |headers, body, _| {
+                out = Some((Arc::clone(headers), body.clone()));
+                false
+            },
+        );
+        out
     }
 
     #[tokio::test]
@@ -4716,10 +4723,12 @@ RewriteRule ^.*$ index.php [NC,L]
                 request.method(),
                 request.uri(),
                 request.headers(),
+                None,
+                &mut |_, _, _| false,
             )
         };
         assert!(
-            probe(&state).is_some(),
+            probe(&state),
             "plaintext external peer initially matches the admitted memo"
         );
         Arc::get_mut(&mut state)
@@ -4728,7 +4737,7 @@ RewriteRule ^.*$ index.php [NC,L]
             .insert(VHOST.to_owned());
         let before = hits(&state);
         assert!(
-            probe(&state).is_none(),
+            !probe(&state),
             "mTLS redirect policy must precede cached bytes on plaintext"
         );
         assert_eq!(hits(&state), before);
@@ -4737,7 +4746,7 @@ RewriteRule ^.*$ index.php [NC,L]
             .mtls_required_vhosts
             .remove(VHOST);
         assert!(
-            probe(&state).is_some(),
+            probe(&state),
             "removing only the live gate restores the same hit"
         );
         std::fs::remove_dir_all(root).unwrap();

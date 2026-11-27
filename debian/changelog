@@ -1,3 +1,22 @@
+httpjet (0.2.8-1) stable; urgency=medium
+
+  * Add synchronous borrowed HTTP/3 memo fast path, cached QPACK
+    field_section_size in QPACK_SHARED_HEADERS_CACHE, and fast :method
+    matching (+1.2% to +47.4% across all 7 HTTP/3 workloads).
+  * Add H2 Frame-1 single-shot batching, cookied guest response-memo
+    fast path with strict logged-in member isolation (+658.5% cookied
+    cache H2), and big-h2 bulk pump improvements.
+  * Optimize LSAPI wire-header lookup (O(1) known-header index), framed
+    BEGIN_REQUEST encoding, and empty-.htaccess fast-path bypass (+11.2%
+    PHP H1, +10.2% PHP H2).
+  * Add batched reqid::next_batch minting, unrolled hex reqid formatting,
+    and 64 KiB access-log chunk/BufWriter batching.
+  * Resolve 29 audited security, RFC, and reliability bugs (#1310-#1340)
+    across H1/H2/H3, LSAPI, pagecache, proxy, static, compress, ACL/geo,
+    and admin/metrics surfaces (3,302 workspace tests passing).
+
+ -- Mike Fara <35661811+faratech@users.noreply.github.com>  Fri, 27 Nov 2026 07:38:00 +0000
+
 httpjet (0.2.7-1) stable; urgency=medium
 
   * Reserve framing space in x86-64 userspace TLS writes for HTTP/1 and HTTP/2.

@@ -259,7 +259,10 @@ fn parse_coding(part: &str) -> (&str, f32) {
             .strip_prefix("q=")
             .or_else(|| param.strip_prefix("Q="))
         {
-            q = rest.trim().parse::<f32>().unwrap_or(1.0).clamp(0.0, 1.0);
+            q = match rest.trim().parse::<f32>() {
+                Ok(v) if v.is_finite() => v.clamp(0.0, 1.0),
+                _ => 1.0,
+            };
         }
     }
     (coding, q)
@@ -1148,6 +1151,22 @@ mod tests {
         // Refusing identity does not refuse a coding offered beside it.
         assert_eq!(
             negotiate_with("identity;q=0, gzip", DEFAULT_PRIORITY),
+            Some(Encoding::Gzip)
+        );
+    }
+
+    #[test]
+    fn non_finite_qvalues_never_leak_nan() {
+        assert_eq!(
+            negotiate_with("gzip;q=NaN", DEFAULT_PRIORITY),
+            Some(Encoding::Gzip)
+        );
+        assert_eq!(
+            negotiate_with("gzip;q=inf", DEFAULT_PRIORITY),
+            Some(Encoding::Gzip)
+        );
+        assert_eq!(
+            negotiate_with("gzip;q=-inf", DEFAULT_PRIORITY),
             Some(Encoding::Gzip)
         );
     }

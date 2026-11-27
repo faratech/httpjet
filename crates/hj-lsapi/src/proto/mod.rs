@@ -129,10 +129,14 @@ pub(crate) use begin_scan::{
 };
 
 pub use builder::{
-    SpecialEnvType, WireHeader, build_begin_request, build_begin_request_body,
+    FieldTooLong, SpecialEnvType, WireHeader, build_begin_request, build_begin_request_body,
     build_begin_request_framed, build_begin_request_framed_into,
+    try_build_begin_request_framed_into,
 };
-pub use frame::{LsapiCodec, LsapiFrame, RespHeader, parse_resp_header};
+pub use frame::{
+    LsapiCodec, LsapiFrame, RespHeader, parse_resp_header, parse_resp_header_into,
+    parse_resp_header_raw_into,
+};
 
 /// Packet magic byte 0 (`'L'`).
 pub const VERSION_B0: u8 = b'L';
@@ -225,7 +229,40 @@ pub const HEADER_OFFSET_LEN: usize = 16;
 
 /// Return the `H_*` index slot for a request header name (ASCII case-insensitive),
 /// or `None` if it is not one of the well-known headers.
+#[inline]
 pub fn known_header_index(name: &str) -> Option<usize> {
+    // Fast path: `http::HeaderName::as_str()` is always lowercase ASCII.
+    let idx = match name {
+        "accept" => Some(0),
+        "accept-charset" => Some(1),
+        "accept-encoding" => Some(2),
+        "accept-language" => Some(3),
+        "authorization" => Some(4),
+        "connection" => Some(5),
+        "content-type" => Some(6),
+        "content-length" => Some(7),
+        "cookie" => Some(8),
+        "cookie2" => Some(9),
+        "host" => Some(10),
+        "pragma" => Some(11),
+        "referer" => Some(12),
+        "user-agent" => Some(13),
+        "cache-control" => Some(14),
+        "if-modified-since" => Some(15),
+        "if-match" => Some(16),
+        "if-none-match" => Some(17),
+        "if-range" => Some(18),
+        "if-unmodified-since" => Some(19),
+        "keep-alive" => Some(20),
+        "range" => Some(21),
+        "x-forwarded-for" => Some(22),
+        "via" => Some(23),
+        "transfer-encoding" => Some(24),
+        _ => None,
+    };
+    if idx.is_some() || !name.bytes().any(|b| b.is_ascii_uppercase()) {
+        return idx;
+    }
     KNOWN_HEADER_NAMES
         .iter()
         .position(|known| known.eq_ignore_ascii_case(name))
@@ -263,5 +300,21 @@ impl PacketType {
             9 => PacketType::InternalError,
             _ => return None,
         })
+    }
+}
+
+#[cfg(test)]
+mod known_header_tests {
+    use super::*;
+
+    #[test]
+    fn known_header_index_matches_table_lowercase_and_mixed_case() {
+        for (i, &name) in KNOWN_HEADER_NAMES.iter().enumerate() {
+            assert_eq!(known_header_index(name), Some(i), "lowercase {name}");
+            let upper = name.to_ascii_uppercase();
+            assert_eq!(known_header_index(&upper), Some(i), "uppercase {upper}");
+        }
+        assert_eq!(known_header_index("x-custom-header"), None);
+        assert_eq!(known_header_index("X-Custom-Header"), None);
     }
 }

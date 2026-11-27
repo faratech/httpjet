@@ -596,14 +596,14 @@ pub struct Metrics {
     /// (a `MemoClass` blocker) — "why is this vhost not memoizing" in one number.
     pub fast_memo_ineligible: Arc<AtomicU64>,
     /// (#343 Step 1) Fast-path GET/HEAD requests carrying NO Cookie header.
-    pub fast_cookie_none: Arc<PaddedAtomic>,
+    pub fast_cookie_none: Arc<ShardedAtomic>,
     /// (#343 Step 1) Cookied GET/HEAD requests whose cookie names include the
     /// configured member/session markers — presumed logged-in, not a fast-path
     /// extension candidate.
-    pub fast_cookie_member_session: Arc<PaddedAtomic>,
+    pub fast_cookie_member_session: Arc<ShardedAtomic>,
     /// (#343 Step 1) Cookied GET/HEAD requests with NO member/session marker — the
     /// benign-cookie population an on-core fast-path extension could serve.
-    pub fast_cookie_benign_only: Arc<PaddedAtomic>,
+    pub fast_cookie_benign_only: Arc<ShardedAtomic>,
     /// Why on-core `fast_serve` requests bridged to the tokio pipeline, per reason.
     pub fast_bridge: Arc<crate::pipeline::fast_bridge::FastBridgeCounters>,
     /// Page-cache lookups split by caller (on-core probe vs dispatch) and outcome.

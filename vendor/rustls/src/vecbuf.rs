@@ -22,6 +22,14 @@ pub(crate) struct ChunkVecBuffer {
 
     chunks: VecDeque<Vec<u8>>,
 
+    /// One retained drained chunk (`<= 64 KiB`) reused by `append_slice` so
+    /// per-record plaintext decryption avoids heap alloc/free churn.
+    reusable: Option<Vec<u8>>,
+
+    /// Retain a drained chunk in `reusable` (enabled only for `received_plaintext`,
+    /// never for `sendable_tls` which never calls `append_slice`, #1293).
+    retain_reusable: bool,
+
     /// The total upper limit (in bytes) of this object.
     limit: Option<usize>,
 }
@@ -31,6 +39,18 @@ impl ChunkVecBuffer {
         Self {
             prefix_used: 0,
             chunks: VecDeque::new(),
+            reusable: None,
+            retain_reusable: false,
+            limit,
+        }
+    }
+
+    pub(crate) fn new_reusable(limit: Option<usize>) -> Self {
+        Self {
+            prefix_used: 0,
+            chunks: VecDeque::new(),
+            reusable: None,
+            retain_reusable: true,
             limit,
         }
     }
@@ -69,6 +89,31 @@ impl ChunkVecBuffer {
         } else {
             len
         }
+    }
+
+    /// Append a borrowed plaintext slice without allocating a fresh `Vec` when
+    /// a retained chunk or spare tail capacity is available.
+    pub(crate) fn append_slice(&mut self, bytes: &[u8]) -> usize {
+        let len = bytes.len();
+        if len == 0 {
+            return 0;
+        }
+        if let Some(back) = self.chunks.back_mut() {
+            if back.len() + len <= back.capacity() {
+                back.extend_from_slice(bytes);
+                return len;
+            }
+        }
+        let mut buf = self.reusable.take().unwrap_or_else(|| {
+            Vec::with_capacity(len.max(2048))
+        });
+        buf.clear();
+        buf.extend_from_slice(bytes);
+        if self.chunks.is_empty() {
+            debug_assert_eq!(self.prefix_used, 0);
+        }
+        self.chunks.push_back(buf);
+        len
     }
 
     /// Take and append the given `bytes`.
@@ -204,7 +249,16 @@ impl ChunkVecBuffer {
                 return;
             } else {
                 self.prefix_used -= buf.len();
-                self.chunks.pop_front();
+                if let Some(mut old) = self.chunks.pop_front() {
+                    if self.retain_reusable
+                        && self.reusable.is_none()
+                        && old.capacity() >= 2048
+                        && old.capacity() <= 64 * 1024
+                    {
+                        old.clear();
+                        self.reusable = Some(old);
+                    }
+                }
             }
         }
 

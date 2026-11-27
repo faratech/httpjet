@@ -140,6 +140,33 @@ impl<'a> OutboundChunks<'a> {
             Self::Multiple { start, end, .. } => end - start,
         }
     }
+
+    /// Returns a single contiguous slice if the entire active range resides in one chunk.
+    #[inline]
+    pub fn as_single_slice(&self) -> Option<&'a [u8]> {
+        match *self {
+            Self::Single(chunk) => Some(chunk),
+            Self::Multiple { chunks, start, end } => {
+                if start == end {
+                    return Some(&[]);
+                }
+                let mut size = 0;
+                for chunk in chunks.iter() {
+                    let psize = size;
+                    let len = chunk.len();
+                    size += len;
+                    if size <= start {
+                        continue;
+                    }
+                    if end <= size {
+                        return Some(&chunk[start - psize..end - psize]);
+                    }
+                    return None;
+                }
+                None
+            }
+        }
+    }
 }
 
 impl<'a> From<&'a [u8]> for OutboundChunks<'a> {
@@ -211,14 +238,145 @@ impl OutboundOpaqueMessage {
     }
 }
 
+#[cfg(feature = "std")]
+mod record_pool {
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+
+    const SMALL_SLAB_CAP: usize = 4096;
+    const LARGE_SLAB_CAP: usize = 16448;
+    const LARGE_MAX_CAP: usize = 20 * 1024;
+    const BUCKET_LIMIT: usize = 32;
+
+    struct Pool {
+        small: Vec<Vec<u8>>,
+        large: Vec<Vec<u8>>,
+    }
+
+    std::thread_local! {
+        static POOL: RefCell<Pool> = const {
+            RefCell::new(Pool {
+                small: Vec::new(),
+                large: Vec::new(),
+            })
+        };
+    }
+
+    #[inline]
+    pub(super) fn take(min_cap: usize) -> Vec<u8> {
+        let alloc_cap = if min_cap <= SMALL_SLAB_CAP {
+            SMALL_SLAB_CAP
+        } else if min_cap <= LARGE_SLAB_CAP {
+            LARGE_SLAB_CAP
+        } else {
+            return Vec::with_capacity(min_cap);
+        };
+        let pooled = POOL.with(|cell| {
+            let mut p = cell.borrow_mut();
+            let bucket = if alloc_cap == SMALL_SLAB_CAP {
+                &mut p.small
+            } else {
+                &mut p.large
+            };
+            bucket.pop()
+        });
+        match pooled {
+            Some(mut v) => {
+                v.clear();
+                v
+            }
+            None => Vec::with_capacity(alloc_cap),
+        }
+    }
+
+    /// Take a small (`<= 4 KiB`) pre-initialized slab buffer for out-of-place
+    /// TLS 1.3 scatter encryption. Large 16 KiB records stay on the L1D-friendly
+    /// in-place path (`take` + `seal_in_place_append_tag`).
+    #[inline]
+    pub(super) fn try_take_small_initialized(total_len: usize) -> Option<Vec<u8>> {
+        if total_len > SMALL_SLAB_CAP {
+            return None;
+        }
+        let pooled = POOL.with(|cell| cell.borrow_mut().small.pop());
+        match pooled {
+            Some(mut v) => {
+                if v.len() >= total_len {
+                    v.truncate(total_len);
+                    Some(v)
+                } else if total_len - v.len() <= 256 {
+                    v.resize(total_len, 0);
+                    Some(v)
+                } else {
+                    recycle(v);
+                    None
+                }
+            }
+            None => {
+                let mut v = Vec::with_capacity(SMALL_SLAB_CAP);
+                v.resize(total_len, 0);
+                Some(v)
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn recycle(mut buf: Vec<u8>) {
+        let cap = buf.capacity();
+        if cap == SMALL_SLAB_CAP {
+            let _ = POOL.try_with(|cell| {
+                let mut p = cell.borrow_mut();
+                if p.small.len() < BUCKET_LIMIT {
+                    p.small.push(buf);
+                }
+            });
+        } else if (LARGE_SLAB_CAP..=LARGE_MAX_CAP).contains(&cap) {
+            buf.clear();
+            let _ = POOL.try_with(|cell| {
+                let mut p = cell.borrow_mut();
+                if p.large.len() < BUCKET_LIMIT {
+                    p.large.push(buf);
+                }
+            });
+        }
+    }
+}
+
+/// Return a completed TLS record buffer to the current thread's pool for reuse
+/// by subsequent `PrefixedPayload::with_capacity` allocations.
+#[cfg(feature = "std")]
+#[inline]
+pub fn recycle_tls_record_vec(buf: Vec<u8>) {
+    record_pool::recycle(buf);
+}
+
 #[derive(Clone, Debug)]
 pub struct PrefixedPayload(Vec<u8>);
 
 impl PrefixedPayload {
     pub fn with_capacity(capacity: usize) -> Self {
+        #[cfg(feature = "std")]
+        let mut prefixed_payload = record_pool::take(HEADER_SIZE + capacity);
+        #[cfg(not(feature = "std"))]
         let mut prefixed_payload = Vec::with_capacity(HEADER_SIZE + capacity);
         prefixed_payload.resize(HEADER_SIZE, 0);
         Self(prefixed_payload)
+    }
+
+    #[inline]
+    pub fn try_with_small_initialized_len(payload_len: usize) -> Option<Self> {
+        let total = HEADER_SIZE + payload_len;
+        #[cfg(feature = "std")]
+        {
+            record_pool::try_take_small_initialized(total).map(Self)
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            if total <= 4096 {
+                Some(Self(alloc::vec![0u8; total]))
+            } else {
+                None
+            }
+        }
     }
 
     pub fn extend_from_slice(&mut self, slice: &[u8]) {

@@ -162,9 +162,14 @@ pub struct RespHeader {
 ///
 /// `little_endian` selects how the int32/u16 fields are read; callers normally
 /// pass `true` because the local server and lsphp run with the same endianness
-/// and we always emit little-endian. (Use [`RespHeader::parse_flagged`] when you
-/// still have the raw header flag byte.)
-pub fn parse_resp_header(mut body: &[u8], little_endian: bool) -> std::io::Result<RespHeader> {
+/// Single-pass streaming parser for an LSAPI `RESP_HEADER` payload. Invokes
+/// `on_header` for each valid header without allocating an intermediate `Vec`,
+/// returning `(status_code, header_count_hint)`.
+pub fn parse_resp_header_raw_into(
+    mut body: &[u8],
+    little_endian: bool,
+    mut on_header: impl FnMut(&[u8], &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<(u16, usize)> {
     fn bad(msg: &str) -> std::io::Error {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -198,7 +203,6 @@ pub fn parse_resp_header(mut body: &[u8], little_endian: bool) -> std::io::Resul
     };
     let (lens, _) = lens.as_chunks::<2>();
 
-    let mut headers = Vec::with_capacity(cnt);
     for &len in lens {
         let len = usize::from(if little_endian {
             u16::from_le_bytes(len)
@@ -233,18 +237,40 @@ pub fn parse_resp_header(mut body: &[u8], little_endian: bool) -> std::io::Resul
                 (line.trim_ascii(), &b""[..])
             }
         };
+        on_header(name, value)?;
+    }
+
+    Ok((status as u16, cnt))
+}
+
+pub fn parse_resp_header_into(
+    body: &[u8],
+    little_endian: bool,
+    mut on_header: impl FnMut(
+        http::header::HeaderName,
+        http::header::HeaderValue,
+    ) -> std::io::Result<()>,
+) -> std::io::Result<(u16, usize)> {
+    parse_resp_header_raw_into(body, little_endian, |name, value| {
         if let (Ok(hn), Ok(hv)) = (
             http::header::HeaderName::from_bytes(name),
             http::header::HeaderValue::from_bytes(value),
         ) {
-            headers.push((hn, hv));
+            on_header(hn, hv)?;
         }
-    }
-
-    Ok(RespHeader {
-        status: status as u16,
-        headers,
+        Ok(())
     })
+}
+
+/// and we always emit little-endian. (Use [`RespHeader::parse_flagged`] when you
+/// still have the raw header flag byte.)
+pub fn parse_resp_header(body: &[u8], little_endian: bool) -> std::io::Result<RespHeader> {
+    let mut headers = Vec::new();
+    let (status, _) = parse_resp_header_into(body, little_endian, |hn, hv| {
+        headers.push((hn, hv));
+        Ok(())
+    })?;
+    Ok(RespHeader { status, headers })
 }
 
 impl RespHeader {

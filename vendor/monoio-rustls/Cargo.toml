@@ -38,6 +38,9 @@ name = "monoio_rustls"
 path = "src/lib.rs"
 
 
+[dependencies.libc]
+version = "0.2"
+
 [dependencies.monoio]
 version = "0.2.0"
 

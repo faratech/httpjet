@@ -30,11 +30,13 @@ pub fn strip_hop_by_hop_response(headers: &mut HeaderMap) {
     // Resolve the field names called out by any `Connection` token first, then
     // drop them — once `Connection` is removed those names are no longer derivable.
     let mut named: Vec<HeaderName> = Vec::new();
+    let mut saw_connection = false;
     for value in headers.get_all(CONNECTION).iter() {
+        saw_connection = true;
         if let Ok(s) = value.to_str() {
             for tok in s.split(',') {
                 let tok = tok.trim();
-                if tok.is_empty() {
+                if tok.is_empty() || tok.eq_ignore_ascii_case("content-length") {
                     continue;
                 }
                 if let Ok(name) = HeaderName::from_bytes(tok.as_bytes()) {
@@ -46,7 +48,9 @@ pub fn strip_hop_by_hop_response(headers: &mut HeaderMap) {
     for name in named {
         headers.remove(name);
     }
-    headers.remove(CONNECTION);
+    if saw_connection {
+        headers.remove(CONNECTION);
+    }
     headers.remove(TRANSFER_ENCODING);
     headers.remove(UPGRADE);
     headers.remove(TE);
@@ -198,12 +202,11 @@ fn hex_val(b: u8) -> Option<u8> {
 /// per-worker response memos can skip re-inserting `Date` into a cached `HeaderMap`
 /// when the second has not ticked.
 #[inline]
-pub fn http_date_now_with_sec() -> (u64, HeaderValue) {
+pub fn http_date_at_with_sec(now: SystemTime) -> (u64, HeaderValue) {
     thread_local! {
         static DATE_MEMO: RefCell<(u64, HeaderValue)> =
             const { RefCell::new((0, HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT"))) };
     }
-    let now = SystemTime::now();
     let secs = now
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -219,6 +222,11 @@ pub fn http_date_now_with_sec() -> (u64, HeaderValue) {
         }
         (m.0, m.1.clone())
     })
+}
+
+#[inline]
+pub fn http_date_now_with_sec() -> (u64, HeaderValue) {
+    http_date_at_with_sec(SystemTime::now())
 }
 
 /// Coarse wall-clock epoch second for `fast_memo` hits, refreshed at most once every
@@ -283,6 +291,18 @@ pub fn stamp_date<B>(mut resp: http::Response<B>) -> http::Response<B> {
     if !resp.headers().contains_key(http::header::DATE) {
         resp.headers_mut()
             .insert(http::header::DATE, http_date_now());
+    }
+    resp
+}
+
+#[inline]
+pub fn stamp_date_at<B>(mut resp: http::Response<B>, now: SystemTime) -> http::Response<B> {
+    if !resp.extensions().is_empty() && resp.extensions().get::<SharedHeaders>().is_some() {
+        return resp;
+    }
+    if !resp.headers().contains_key(http::header::DATE) {
+        resp.headers_mut()
+            .insert(http::header::DATE, http_date_at_with_sec(now).1);
     }
     resp
 }
@@ -617,5 +637,20 @@ mod tests {
             "W/\"pcdeadbeef\""
         ));
         assert!(!if_none_match_matches("\"v1;fr\"", "\"v1;en\""));
+    }
+
+    #[test]
+    fn strip_hop_by_hop_response_preserves_content_length() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            CONNECTION,
+            HeaderValue::from_static("content-length, x-hop"),
+        );
+        h.insert(CONTENT_LENGTH, HeaderValue::from_static("123"));
+        h.insert("x-hop", HeaderValue::from_static("drop-me"));
+        strip_hop_by_hop_response(&mut h);
+        assert_eq!(h.get(CONTENT_LENGTH).unwrap(), "123");
+        assert!(!h.contains_key("x-hop"));
+        assert!(!h.contains_key(CONNECTION));
     }
 }

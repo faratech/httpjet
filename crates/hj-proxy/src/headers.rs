@@ -49,11 +49,9 @@ pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap, keep_upgrade: bool) {
                 if keep_upgrade && tok.eq_ignore_ascii_case("upgrade") {
                     continue;
                 }
-                // RFC 9110 7.6.1 forbids listing `Host` in `Connection`, so honoring the token
-                // only lets a client delete the Host we just ensured: `ensure_host` runs BEFORE
-                // this strip, hyper's low-level h1 client never synthesizes one, and the backend
-                // answers 400. Never a legitimate hop-by-hop nomination.
-                if tok.eq_ignore_ascii_case("host") {
+                // RFC 9110 §7.6.1 forbids listing framing/routing headers such as
+                // `Host` or `Content-Length` in `Connection`.
+                if tok.eq_ignore_ascii_case("host") || tok.eq_ignore_ascii_case("content-length") {
                     continue;
                 }
                 if let Ok(name) = HeaderName::from_bytes(tok.as_bytes()) {
@@ -470,5 +468,22 @@ mod tests {
         assert_eq!(conn_vals, vec!["upgrade"]);
         assert!(h.contains_key("x-forwarded-for"));
         assert!(h.contains_key("x-real-ip"));
+    }
+
+    #[test]
+    fn connection_cannot_strip_content_length_or_host() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            CONNECTION,
+            HeaderValue::from_static("Host, Content-Length, X-Hop"),
+        );
+        h.insert(HOST, HeaderValue::from_static("example.com"));
+        h.insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("42"));
+        h.insert("x-hop", HeaderValue::from_static("remove-me"));
+        strip_hop_by_hop(&mut h, false);
+        assert_eq!(h.get(HOST).unwrap(), "example.com");
+        assert_eq!(h.get(http::header::CONTENT_LENGTH).unwrap(), "42");
+        assert!(!h.contains_key("x-hop"));
+        assert!(!h.contains_key(CONNECTION));
     }
 }

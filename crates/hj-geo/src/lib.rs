@@ -58,8 +58,21 @@ impl IntervalSet {
                     v4.push((first, first | !u32::from(m)));
                 }
                 (IpAddr::V6(n), IpAddr::V6(m)) => {
-                    let first = u128::from(n);
-                    v6.push((first, first | !u128::from(m)));
+                    if p.prefix_len() >= 96
+                        && let Some(v4_net) = n.to_ipv4_mapped()
+                    {
+                        let v4_prefix = p.prefix_len() - 96;
+                        let v4_mask = if v4_prefix == 0 {
+                            0u32
+                        } else {
+                            u32::MAX << (32 - v4_prefix)
+                        };
+                        let first = u32::from(v4_net) & v4_mask;
+                        v4.push((first, first | !v4_mask));
+                    } else {
+                        let first = u128::from(n);
+                        v6.push((first, first | !u128::from(m)));
+                    }
                 }
                 _ => {}
             }
@@ -346,5 +359,14 @@ mod tests {
                 "malformed ASN label {label:?} was accepted"
             );
         }
+    }
+
+    #[test]
+    fn interval_set_matches_ipv4_mapped_ipv6_prefixes() {
+        let prefix: IpNet = "::ffff:203.0.113.0/120".parse().unwrap();
+        let set = IntervalSet::from_prefixes([&prefix]);
+        assert!(set.contains("203.0.113.5".parse().unwrap()));
+        assert!(set.contains("::ffff:203.0.113.5".parse().unwrap()));
+        assert!(!set.contains("203.0.114.5".parse().unwrap()));
     }
 }

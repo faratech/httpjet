@@ -541,8 +541,14 @@ impl Proxy {
                 .await
             {
                 Ok(Ok(r)) => r,
-                Ok(Err(e)) => return Err(HandlerError::BadGateway(format!("ws request: {e}"))),
-                Err(_) => return Err(HandlerError::GatewayTimeout),
+                Ok(Err(e)) => {
+                    driver.abort();
+                    return Err(HandlerError::BadGateway(format!("ws request: {e}")));
+                }
+                Err(_) => {
+                    driver.abort();
+                    return Err(HandlerError::GatewayTimeout);
+                }
             };
 
         let status = upstream_resp.status();
@@ -567,9 +573,22 @@ impl Proxy {
             headers::sanitize_response_headers(&mut client_headers, true);
 
             // Reclaim the upgraded upstream IO from the response.
-            let upstream_io = hyper::upgrade::on(upstream_resp)
-                .await
-                .map_err(|e| HandlerError::BadGateway(format!("ws upgrade: {e}")))?;
+            let upstream_io = match tokio::time::timeout(
+                selected.response_timeout(),
+                hyper::upgrade::on(upstream_resp),
+            )
+            .await
+            {
+                Ok(Ok(io)) => io,
+                Ok(Err(e)) => {
+                    driver.abort();
+                    return Err(HandlerError::BadGateway(format!("ws upgrade: {e}")));
+                }
+                Err(_) => {
+                    driver.abort();
+                    return Err(HandlerError::GatewayTimeout);
+                }
+            };
             // We no longer need the driver task to do more work; it will resolve
             // once the connection is torn down.
             drop(driver);
@@ -638,8 +657,8 @@ impl Proxy {
         parts.version = Version::HTTP_11;
         let uri = upstream_uri(&parts.uri, target)?;
         parts.uri = uri;
-        ensure_host(&mut parts.headers, target, &target.authority);
         headers::rewrite_request_headers(&mut parts.headers, ctx, true);
+        ensure_host(&mut parts.headers, target, &target.authority);
         apply_host_override(&mut parts.headers, target);
         // The handshake leg carries NO request body, so strip any framing headers — otherwise a
         // client that sent `Upgrade: websocket` together with a Content-Length (+ body) would

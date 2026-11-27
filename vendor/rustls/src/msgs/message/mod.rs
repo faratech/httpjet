@@ -14,6 +14,8 @@ mod outbound;
 use alloc::vec::Vec;
 
 pub(crate) use outbound::read_opaque_message_header;
+#[cfg(feature = "std")]
+pub use outbound::recycle_tls_record_vec;
 pub use outbound::{OutboundChunks, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload};
 
 #[derive(Debug)]

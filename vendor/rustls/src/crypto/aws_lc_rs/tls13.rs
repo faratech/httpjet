@@ -231,17 +231,37 @@ impl MessageEncrypter for AeadMessageEncrypter {
         msg: OutboundPlainMessage<'_>,
         seq: u64,
     ) -> Result<OutboundOpaqueMessage, Error> {
-        let total_len = self.encrypted_payload_len(msg.payload.len());
-        let mut payload = PrefixedPayload::with_capacity(total_len);
-
+        let plain_len = msg.payload.len();
+        let total_len = self.encrypted_payload_len(plain_len);
         let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
         let aad = aead::Aad::from(make_tls13_aad(total_len));
-        payload.extend_from_chunks(&msg.payload);
-        payload.extend_from_slice(&msg.typ.to_array());
 
-        self.enc_key
-            .seal_in_place_append_tag(nonce, aad, &mut payload)
-            .map_err(|_| Error::EncryptError)?;
+        let payload = if let Some((plain, mut payload)) =
+            msg.payload.as_single_slice().and_then(|plain| {
+                PrefixedPayload::try_with_small_initialized_len(total_len).map(|p| (plain, p))
+            }) {
+            let (out_cipher, extra_out_and_tag) = payload.as_mut().split_at_mut(plain_len);
+            self.enc_key
+                .seal_out_of_place_scatter(
+                    nonce,
+                    aad,
+                    plain,
+                    out_cipher,
+                    &msg.typ.to_array(),
+                    extra_out_and_tag,
+                )
+                .map_err(|_| Error::EncryptError)?;
+            payload
+        } else {
+            let mut payload = PrefixedPayload::with_capacity(total_len);
+            payload.extend_from_chunks(&msg.payload);
+            payload.extend_from_slice(&msg.typ.to_array());
+
+            self.enc_key
+                .seal_in_place_append_tag(nonce, aad, &mut payload)
+                .map_err(|_| Error::EncryptError)?;
+            payload
+        };
 
         Ok(OutboundOpaqueMessage::new(
             ContentType::ApplicationData,
@@ -292,17 +312,37 @@ impl MessageEncrypter for GcmMessageEncrypter {
         msg: OutboundPlainMessage<'_>,
         seq: u64,
     ) -> Result<OutboundOpaqueMessage, Error> {
-        let total_len = self.encrypted_payload_len(msg.payload.len());
-        let mut payload = PrefixedPayload::with_capacity(total_len);
-
+        let plain_len = msg.payload.len();
+        let total_len = self.encrypted_payload_len(plain_len);
         let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
         let aad = aead::Aad::from(make_tls13_aad(total_len));
-        payload.extend_from_chunks(&msg.payload);
-        payload.extend_from_slice(&msg.typ.to_array());
 
-        self.enc_key
-            .seal_in_place_append_tag(nonce, aad, &mut payload)
-            .map_err(|_| Error::EncryptError)?;
+        let payload = if let Some((plain, mut payload)) =
+            msg.payload.as_single_slice().and_then(|plain| {
+                PrefixedPayload::try_with_small_initialized_len(total_len).map(|p| (plain, p))
+            }) {
+            let (out_cipher, extra_out_and_tag) = payload.as_mut().split_at_mut(plain_len);
+            self.enc_key
+                .seal_out_of_place_scatter(
+                    nonce,
+                    aad,
+                    plain,
+                    out_cipher,
+                    &msg.typ.to_array(),
+                    extra_out_and_tag,
+                )
+                .map_err(|_| Error::EncryptError)?;
+            payload
+        } else {
+            let mut payload = PrefixedPayload::with_capacity(total_len);
+            payload.extend_from_chunks(&msg.payload);
+            payload.extend_from_slice(&msg.typ.to_array());
+
+            self.enc_key
+                .seal_in_place_append_tag(nonce, aad, &mut payload)
+                .map_err(|_| Error::EncryptError)?;
+            payload
+        };
 
         Ok(OutboundOpaqueMessage::new(
             ContentType::ApplicationData,

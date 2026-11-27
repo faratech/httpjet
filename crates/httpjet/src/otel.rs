@@ -48,7 +48,7 @@ fn parse_trusted_parents(value: &str) -> anyhow::Result<Vec<std::net::IpAddr>> {
             !peer.is_unspecified() && !peer.is_multicast(),
             "invalid OTel trusted-parent address"
         );
-        peers.push(peer);
+        peers.push(peer.to_canonical());
     }
     Ok(peers)
 }
@@ -99,7 +99,7 @@ pub fn inbound_parent(
     let trusted = direct_tcp
         && TRUSTED_PARENTS
             .get()
-            .is_some_and(|peers| peers.contains(&peer));
+            .is_some_and(|peers| peers.contains(&peer.to_canonical()));
     extract_parent(headers, trusted)
 }
 static EXPORT_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1021,5 +1021,14 @@ mod tests {
         provider.force_flush().unwrap();
         provider.shutdown().unwrap();
         collector.join().unwrap();
+    }
+
+    #[test]
+    fn parse_trusted_parents_canonicalizes_v4_mapped_v6() {
+        let parsed = parse_trusted_parents("::ffff:127.0.0.1, 10.0.0.1").unwrap();
+        let v4_loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let v4_mapped: std::net::IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert_eq!(parsed[0], v4_loopback);
+        assert!(parsed.contains(&v4_mapped.to_canonical()));
     }
 }

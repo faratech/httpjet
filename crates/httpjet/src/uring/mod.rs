@@ -139,9 +139,12 @@ impl CoreHandler {
         ctx: &BridgeCtx,
         req: hj_core::Request,
         upgrade: bool,
+        skip_memo_probe: bool,
         reusable_head: Option<&mut H1RequestHeadCache>,
     ) -> Option<bridge::BridgeResp> {
-        if !upgrade && let Some(response) = self.fast_local(&state, ctx, &req).await {
+        if !upgrade
+            && let Some(response) = self.fast_local(&state, ctx, &req, skip_memo_probe).await
+        {
             if let Some(cache) = reusable_head {
                 cache.store(req);
             }
@@ -163,7 +166,7 @@ impl CoreHandler {
         #[cfg(feature = "otel")]
         let trace = self.trace_request(&state, ctx, &mut req);
         let future = async {
-            if let Some(response) = self.fast(&state, ctx, &req).await {
+            if let Some(response) = self.fast_local(&state, ctx, &req, false).await {
                 return response;
             }
             let mut ctx = ctx.clone();
@@ -182,23 +185,14 @@ impl CoreHandler {
         future.await
     }
 
-    /// Try the on-core cache-hit fast path; `Some(resp)` if served without the bridge.
-    fn fast<'a>(
-        &'a self,
-        st: &'a Arc<ServerState>,
-        ctx: &'a BridgeCtx,
-        req: &'a hj_core::Request,
-    ) -> impl std::future::Future<Output = Option<hj_core::Response>> + 'a {
-        Self::fast_for_listener(&self.listener_name, st, ctx, req)
-    }
-
-    /// Thread-local (`!Send`) on-core fast path for H1: includes direct
+    /// Thread-local (`!Send`) on-core fast path for H1/H2: includes direct
     /// `monoio::net::UnixStream` LSAPI dispatch when page cache is off.
     async fn fast_local(
         &self,
         st: &Arc<ServerState>,
         ctx: &BridgeCtx,
         req: &hj_core::Request,
+        skip_memo_probe: bool,
     ) -> Option<hj_core::Response> {
         crate::pipeline::fast_serve_uring_local(
             st,
@@ -212,6 +206,7 @@ impl CoreHandler {
             ctx.proto,
             ctx.tls.as_ref(),
             req,
+            skip_memo_probe,
         )
         .await
         .map(|response| {
@@ -229,6 +224,7 @@ impl CoreHandler {
         st: &Arc<ServerState>,
         ctx: &BridgeCtx,
         req: &hj_core::Request,
+        skip_memo_probe: bool,
     ) -> Option<hj_core::Response> {
         // Stamp Date here (insert-if-absent): the page cache strips the stored Date
         // expecting the serve boundary to re-add one, and the uring writers never do — the
@@ -245,6 +241,7 @@ impl CoreHandler {
             ctx.proto,
             ctx.tls.as_ref(),
             req,
+            skip_memo_probe,
         )
         .await
         .map(|response| {
@@ -1680,9 +1677,15 @@ async fn handle_tls_bridged(
     let mut stream =
         tls.map_io(|io| directio::DirectWriteSocket::new_for(io, proto != Proto::Http2));
     stream.enable_owned_ciphertext_writes();
-    // 68 KiB gives a full 64 KiB H1 or H2 payload plus framing and 5 TLS record
-    // headers in one flush without splitting 64 KiB responses into 63K + 1K.
-    stream.session_mut().set_buffer_limit(Some(68 * 1024));
+    // 256 KiB on H2 matches `take_tls_write_batch`'s 16-record cap and sends
+    // multiple full 64 KiB responses per `sendmsg` without 63K+1K splits;
+    // 68 KiB on H1 covers a full 64 KiB response + framing in one flush.
+    let buf_limit = if proto == Proto::Http2 {
+        256 * 1024
+    } else {
+        68 * 1024
+    };
+    stream.session_mut().set_buffer_limit(Some(buf_limit));
     match proto {
         Proto::Http2 => serve_h2_bridged(stream, prefix, ctx, core, shutdown, None).await,
         _ => handle_h1_bridged(stream, prefix, ctx, core, shutdown, None).await,
@@ -1914,15 +1917,23 @@ pub(crate) fn trusted_proxy_idle_secs() -> u64 {
 /// The idle window for this connection: the configured keep-alive padded to [`IDLE_FLOOR`],
 /// raised to the trusted-proxy window for a certified peer while the connection count allows.
 fn conn_idle_timeout(state: &ServerState, ctx: &BridgeCtx) -> Option<std::time::Duration> {
-    use std::sync::atomic::Ordering;
     let certified = ctx
         .tls
         .as_ref()
         .and_then(|t| t.client_cert.as_ref())
         .is_some_and(|c| c.verified);
+    if !certified {
+        return Some(
+            state
+                .serve_config
+                .keep_alive_timeout
+                .map_or(IDLE_FLOOR, |t| t.max(IDLE_FLOOR)),
+        );
+    }
+    use std::sync::atomic::Ordering;
     idle_window(
         state.serve_config.keep_alive_timeout,
-        certified,
+        true,
         state.metrics.active_conns.load(Ordering::Relaxed),
         TRUSTED_PROXY_IDLE_SECS.load(Ordering::Relaxed),
         TRUSTED_PROXY_IDLE_MAX_CONNS.load(Ordering::Relaxed),
@@ -2002,8 +2013,8 @@ async fn serve_h2_bridged<S>(
     let dispatch = Arc::new((core, ctx));
     if crate::pipeline::fast_memo::ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
         let probe_dispatch = Arc::clone(&dispatch);
-        h2_cfg.borrowed_memo_probe =
-            Some(hj_h2::server::BorrowedMemoProbe(Arc::new(move |head| {
+        h2_cfg.borrowed_memo_probe = Some(hj_h2::server::BorrowedMemoProbe(Arc::new(
+            move |head, visit| {
                 let (core, ctx) = probe_dispatch.as_ref();
                 // A declined read-only probe grants nothing. Use a lock-free
                 // Guard (`load()`) to avoid an atomic Arc clone+drop per stream.
@@ -2021,9 +2032,30 @@ async fn serve_h2_bridged<S>(
                     head.method,
                     head.uri,
                     head.headers,
+                    head.now,
+                    visit,
                 )
-                .map(|(headers, body)| hj_h2::server::SharedFullResponse { headers, body })
-            })));
+            },
+        )));
+        let commit_dispatch = Arc::clone(&dispatch);
+        h2_cfg.borrowed_memo_batch_commit = Some(hj_h2::server::BorrowedMemoBatchCommit(Arc::new(
+            move |template_id, now, extra_count| {
+                let (core, ctx) = commit_dispatch.as_ref();
+                let state = core.holder.load();
+                if extra_count == 0 {
+                    crate::pipeline::h2_memo_batch_eligible(&state, template_id)
+                } else {
+                    crate::pipeline::commit_borrowed_h2_memo_batch(
+                        &state,
+                        ctx.peer.ip(),
+                        template_id,
+                        now,
+                        extra_count,
+                    );
+                    true
+                }
+            },
+        )));
     }
     let service = move |req: hj_core::Request| {
         let dispatch = Arc::clone(&dispatch);
@@ -2039,7 +2071,7 @@ async fn serve_h2_bridged<S>(
             async move {
                 let (core, ctx) = dispatch.as_ref();
                 let state = core.holder.load_full();
-                if let Some(response) = core.fast_local(&state, ctx, &req).await {
+                if let Some(response) = core.fast_local(&state, ctx, &req, false).await {
                     return response;
                 }
                 let mut ctx = ctx.clone();
@@ -2150,14 +2182,33 @@ async fn handle_h1_bridged<S>(
         any(target_arch = "x86_64", target_arch = "aarch64"),
         not(feature = "otel")
     ));
+    struct H1MemoHintGuard<'a> {
+        holder: &'a crate::serving_generation::ServingView,
+        hint: Option<crate::pipeline::H1MemoHint>,
+    }
+    impl Drop for H1MemoHintGuard<'_> {
+        fn drop(&mut self) {
+            if self.hint.is_some() {
+                crate::pipeline::flush_h1_memo_hint(&self.holder.load(), &mut self.hint);
+            }
+        }
+    }
     let mut head_cache = H1RequestHeadCache::default();
-    let mut memo_hint: Option<crate::pipeline::H1MemoHint> = None;
+    let mut memo_hint = H1MemoHintGuard {
+        holder: &core.holder,
+        hint: None,
+    };
     let mut read_slot = write_watch::Slot::default();
     // (Tier 2) One bucket per CONNECTION — pacing must not reset per response. Rebuilt
     // inside the loop only when a response carries a different rate (context override or
     // a post-reload tuning change).
-    let mut throttle =
-        hj_http::BandwidthThrottle::new(core.holder.load().serve_config.bandwidth_limit);
+    let (mut keep_alive_timeout, mut throttle) = {
+        let init_state = core.holder.load();
+        (
+            conn_idle_timeout(&init_state, &ctx),
+            hj_http::BandwidthThrottle::new(init_state.serve_config.bandwidth_limit),
+        )
+    };
     // Pin `shutdown.cancelled()` ONCE per connection so idle keep-alive turns
     // do not acquire/release `tokio::sync::Notify`'s global cross-core mutex twice
     // per HTTP/1.1 request (~700–800k/s lock ops across cores).
@@ -2179,7 +2230,6 @@ async fn handle_h1_bridged<S>(
             // keeps idle origin connections well past a 5s keepAliveTimeout, and an
             // unpadded H1 idle wait closes them almost immediately (constant
             // reconnect + TLS-handshake churn). H2 has padded to >=90s for a while.
-            let keep_alive_timeout = conn_idle_timeout(&core.holder.load(), &ctx);
             monoio::select! {
                 biased;
                 res = read_timeout_slot(&mut stream, keep_alive_timeout, &mut read_scratch, &mut read_slot) => {
@@ -2219,6 +2269,7 @@ async fn handle_h1_bridged<S>(
         // bytes. Use a lock-free Guard (`load()`) for intake limits and the
         // synchronous borrowed H1 memo fast path; only clone the Arc on a miss.
         let state_guard = core.holder.load();
+        keep_alive_timeout = conn_idle_timeout(&state_guard, &ctx);
         // Request-size caps from the LiteSpeed config (maxReqHeaderSize/maxReqBodySize),
         // matching the tokio path — mirror hyper's `max_buf_size` 8 KiB floor for the head.
         let max_head = state_guard.serve_config.max_req_header_size.max(8192);
@@ -2390,13 +2441,25 @@ async fn handle_h1_bridged<S>(
         // Synchronous borrowed H1 memo fast path: probe `fast_memo` directly
         // from the parsed head before `finish_body`, `http::Request`, `Response`,
         // `Extensions`, `BridgeResp`, and `Arc<ServerState>` cloning.
+        let mut skip_memo_probe = false;
         if !http10
             && !has_upgrade
             && !expect_continue
             && matches!(framing, BodyFraming::Length(0))
             && method == http::Method::GET
             && crate::pipeline::fast_memo::ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-            && let Some((shared_headers, body)) = crate::pipeline::probe_borrowed_h1_memo_with_hint(
+        {
+            enum H1BorrowedHit {
+                Wire(Vec<u8>),
+                Full(h1_write_buffers::FullResponse),
+                Fallback(Arc<http::HeaderMap>, bytes::Bytes),
+            }
+            let mut h1_hit: Option<H1BorrowedHit> = None;
+            let try_shared_wire = keep_alive
+                && default_bw_rate == 0
+                && throttle.is_none()
+                && !shutdown.is_cancelled();
+            let outcome = crate::pipeline::probe_borrowed_h1_memo_with_hint(
                 &state_guard,
                 &core.listener_name,
                 ctx.peer.ip(),
@@ -2408,59 +2471,128 @@ async fn handle_h1_bridged<S>(
                 &uri,
                 &headers,
                 reused_head,
-                &mut memo_hint,
-            )
-        {
-            acc.drain(..head_len);
-            if retain_head && keep_alive {
-                head_cache.store_parts(method, uri, headers);
-            }
-            if throttle
-                .as_ref()
-                .is_none_or(|t| t.rate_bps() != default_bw_rate)
-            {
-                throttle = hj_http::BandwidthThrottle::new(default_bw_rate);
-            }
-            if keep_alive && shutdown.is_cancelled() {
-                keep_alive = false;
-            }
-            let resp = bridge::BridgeResp {
-                status: http::StatusCode::OK,
-                headers: http::HeaderMap::new(),
-                shared_headers: Some(shared_headers),
-                body: bridge::BridgeBody::Full(body),
-                bw_rate: None,
-                completion: None,
-            };
-            drop(state_guard);
-            let outcome = write_h1_response_reusing(
-                &mut stream,
-                resp,
-                false,
-                keep_alive,
-                false,
-                &mut throttle,
-                sendfile_fd,
-                header_read_timeout,
-                &shutdown,
-                &mut response_buffers,
-            )
-            .await;
-            if outcome.close {
-                end.set(if outcome.failed {
-                    H1ConnEnd::IoError
-                } else if client_close {
-                    H1ConnEnd::ClientClose
-                } else if keepalive_cap {
-                    H1ConnEnd::KeepaliveCap
-                } else if shutdown.is_cancelled() {
-                    H1ConnEnd::Shutdown
+                write_watch::coarse_now(),
+                &mut memo_hint.hint,
+                &mut |headers_arc, body| {
+                    if try_shared_wire && !body.is_empty() {
+                        if body.len() <= 4096 {
+                            if let Some(wire) = response_buffers.take_shared_wire(headers_arc, body)
+                            {
+                                h1_hit = Some(H1BorrowedHit::Wire(wire));
+                                return;
+                            }
+                        } else if let Some(head) =
+                            response_buffers.take_shared_head(headers_arc, body.len())
+                        {
+                            if let Ok(full) = response_buffers.full(head, body.clone()) {
+                                h1_hit = Some(H1BorrowedHit::Full(full));
+                                return;
+                            }
+                        }
+                    }
+                    h1_hit = Some(H1BorrowedHit::Fallback(
+                        Arc::clone(headers_arc),
+                        body.clone(),
+                    ));
+                },
+            );
+            skip_memo_probe = outcome == crate::pipeline::BorrowedMemoOutcome::Missed;
+            if let Some(h1_hit) = h1_hit {
+                if head_len == acc.len() {
+                    acc.clear();
                 } else {
-                    H1ConnEnd::ResponseClose
-                });
-                return;
+                    acc.drain(..head_len);
+                }
+                if retain_head && keep_alive {
+                    head_cache.store_parts(method, uri, headers);
+                }
+                drop(state_guard);
+                match h1_hit {
+                    H1BorrowedHit::Wire(wire) => {
+                        let mut send_slot = std::mem::take(&mut response_buffers.send_slot);
+                        let mut progress =
+                            SendProgress::with_slot(header_read_timeout, &mut send_slot);
+                        let write_res = progress.write_all(&mut stream, wire).await;
+                        response_buffers.send_slot = send_slot;
+                        match write_res {
+                            Ok(wire) => {
+                                response_buffers.recycle_shared_wire_fast(wire);
+                                continue;
+                            }
+                            Err(_) => {
+                                response_buffers.invalidate_after_wire_error();
+                                end.set(H1ConnEnd::IoError);
+                                return;
+                            }
+                        }
+                    }
+                    H1BorrowedHit::Full(full) => {
+                        let mut send_slot = std::mem::take(&mut response_buffers.send_slot);
+                        let mut progress =
+                            SendProgress::with_slot(header_read_timeout, &mut send_slot);
+                        let write_res = progress.write_full(&mut stream, full).await;
+                        response_buffers.send_slot = send_slot;
+                        match write_res {
+                            Ok(returned) => {
+                                response_buffers.recycle_full_shared_head_fast(returned);
+                                continue;
+                            }
+                            Err(_) => {
+                                response_buffers.invalidate_after_wire_error();
+                                end.set(H1ConnEnd::IoError);
+                                return;
+                            }
+                        }
+                    }
+                    H1BorrowedHit::Fallback(shared_headers, body) => {
+                        if throttle
+                            .as_ref()
+                            .is_none_or(|t| t.rate_bps() != default_bw_rate)
+                        {
+                            throttle = hj_http::BandwidthThrottle::new(default_bw_rate);
+                        }
+                        if keep_alive && shutdown.is_cancelled() {
+                            keep_alive = false;
+                        }
+                        let resp = bridge::BridgeResp {
+                            status: http::StatusCode::OK,
+                            headers: http::HeaderMap::new(),
+                            shared_headers: Some(shared_headers),
+                            body: bridge::BridgeBody::Full(body),
+                            bw_rate: None,
+                            completion: None,
+                        };
+                        let outcome = write_h1_response_reusing(
+                            &mut stream,
+                            resp,
+                            false,
+                            keep_alive,
+                            false,
+                            &mut throttle,
+                            sendfile_fd,
+                            header_read_timeout,
+                            &shutdown,
+                            &mut response_buffers,
+                        )
+                        .await;
+                        if outcome.close {
+                            end.set(if outcome.failed {
+                                H1ConnEnd::IoError
+                            } else if client_close {
+                                H1ConnEnd::ClientClose
+                            } else if keepalive_cap {
+                                H1ConnEnd::KeepaliveCap
+                            } else if shutdown.is_cancelled() {
+                                H1ConnEnd::Shutdown
+                            } else {
+                                H1ConnEnd::ResponseClose
+                            });
+                            return;
+                        }
+                        continue;
+                    }
+                }
             }
-            continue;
         }
         let state = Arc::clone(&state_guard);
         drop(state_guard);
@@ -2746,29 +2878,39 @@ async fn handle_h1_bridged<S>(
             }
         };
 
-        let decode_tried =
-            request_body::finish_body_decodes(&headers, &body_bytes, state.request_decompression);
-        let body_bytes = match request_body::finish_body(
-            &mut headers,
-            body_bytes,
-            body_lease,
-            &state.body_budget,
-            max_body,
-            state.request_decompression,
-        )
-        .await
+        let (decode_tried, body_bytes) = if body_bytes.is_empty()
+            && body_lease.is_none()
+            && !headers.contains_key(http::header::CONTENT_ENCODING)
         {
-            Ok(bytes) => bytes,
-            Err(status) => {
-                end.set(H1ConnEnd::Refused);
-                write_status_close(
-                    &mut stream,
-                    status.as_u16(),
-                    status.canonical_reason().unwrap_or("Bad Request"),
-                    &shutdown,
-                )
-                .await;
-                return;
+            (false, bytes::Bytes::new())
+        } else {
+            let decode_tried = request_body::finish_body_decodes(
+                &headers,
+                &body_bytes,
+                state.request_decompression,
+            );
+            match request_body::finish_body(
+                &mut headers,
+                body_bytes,
+                body_lease,
+                &state.body_budget,
+                max_body,
+                state.request_decompression,
+            )
+            .await
+            {
+                Ok(bytes) => (decode_tried, bytes),
+                Err(status) => {
+                    end.set(H1ConnEnd::Refused);
+                    write_status_close(
+                        &mut stream,
+                        status.as_u16(),
+                        status.canonical_reason().unwrap_or("Bad Request"),
+                        &shutdown,
+                    )
+                    .await;
+                    return;
+                }
             }
         };
         let body: hj_core::IncomingBody = if body_bytes.is_empty() {
@@ -2812,6 +2954,7 @@ async fn handle_h1_bridged<S>(
             &ctx,
             req,
             upgrade_ready.is_some(),
+            skip_memo_probe,
             (retain_head && keep_alive).then_some(&mut head_cache),
         );
         #[cfg(feature = "otel")]
@@ -2919,7 +3062,7 @@ struct H1RequestHeadCache {
 
 struct H1RequestHeadEntry {
     wire: Box<[u8]>,
-    parsed: Option<http::request::Parts>,
+    parsed: Option<(http::Method, http::Uri, http::HeaderMap)>,
 }
 
 impl H1RequestHeadCache {
@@ -2929,11 +3072,11 @@ impl H1RequestHeadCache {
         if wire.len() > max_head || !input.starts_with(wire) {
             return None;
         }
-        let parts = entry.parsed.take()?;
+        let (method, uri, headers) = entry.parsed.take()?;
         Some(ParsedReq::Done {
-            method: parts.method,
-            uri: parts.uri,
-            headers: parts.headers,
+            method,
+            uri,
+            headers,
             head_len: wire.len(),
             framing: BodyFraming::Length(0),
             keep_alive: true,
@@ -2965,18 +3108,14 @@ impl H1RequestHeadCache {
 
     fn store(&mut self, request: hj_core::Request) {
         if let Some(entry) = self.entry.as_deref_mut() {
-            entry.parsed = Some(request.into_parts().0);
+            let parts = request.into_parts().0;
+            entry.parsed = Some((parts.method, parts.uri, parts.headers));
         }
     }
 
     fn store_parts(&mut self, method: http::Method, uri: http::Uri, headers: http::HeaderMap) {
         if let Some(entry) = self.entry.as_deref_mut() {
-            let mut req = http::Request::new(());
-            *req.method_mut() = method;
-            *req.uri_mut() = uri;
-            *req.version_mut() = http::Version::HTTP_11;
-            *req.headers_mut() = headers;
-            entry.parsed = Some(req.into_parts().0);
+            entry.parsed = Some((method, uri, headers));
         }
     }
 }
@@ -4020,16 +4159,18 @@ impl<'a> SendProgress<'a> {
         };
         let mut write = std::pin::pin!(write);
         if let Some(slot) = self.slot.as_deref_mut() {
-            struct DisarmOnDrop<'s>(&'s mut write_watch::Slot);
+            struct DisarmOnDrop<'s>(&'s mut write_watch::Slot, bool);
             impl Drop for DisarmOnDrop<'_> {
                 fn drop(&mut self) {
-                    self.0.disarm();
+                    if self.1 {
+                        self.0.disarm();
+                    }
                 }
             }
-            let guard = DisarmOnDrop(slot);
+            let mut guard = DisarmOnDrop(slot, false);
             let mut started: Option<std::time::Instant> = None;
             return std::future::poll_fn(|cx| {
-                if started.is_some() && guard.0.expired() {
+                if guard.1 && guard.0.expired() {
                     return std::task::Poll::Ready(Err(send_progress_timeout()));
                 }
                 match write.as_mut().poll(cx) {
@@ -4052,6 +4193,7 @@ impl<'a> SendProgress<'a> {
                             }
                         });
                         guard.0.arm(s + budget, cx.waker());
+                        guard.1 = true;
                         std::task::Poll::Pending
                     }
                 }
@@ -4258,14 +4400,11 @@ where
                 let hdrs = resp.shared_headers.as_deref().unwrap_or(&resp.headers);
                 const SMALL_RESPONSE_LIMIT: usize = 4096;
                 let share = resp.shared_headers.as_ref().filter(|_| {
-                    !is_head
-                        && keep_alive
-                        && !http10
-                        && resp.status == http::StatusCode::OK
-                        && body.len() <= SMALL_RESPONSE_LIMIT
+                    !is_head && keep_alive && !http10 && resp.status == http::StatusCode::OK
                 });
                 if !body_forbidden
                     && !body.is_empty()
+                    && body.len() <= SMALL_RESPONSE_LIMIT
                     && let Some(headers_arc) = share
                     && let Some(wire) = buffers.take_shared_wire(headers_arc, &body)
                 {
@@ -4336,10 +4475,19 @@ where
                             Err(error) => Err(error),
                         }
                     } else {
+                        let body_len = body.len();
                         match buffers.full(head, body) {
                             Ok(buffer) => match progress.write_full(stream, buffer).await {
                                 Ok(buffer) => {
-                                    buffers.recycle_full(buffer);
+                                    if let Some(headers_arc) = share {
+                                        buffers.recycle_full_shared_head(
+                                            buffer,
+                                            headers_arc,
+                                            body_len,
+                                        );
+                                    } else {
+                                        buffers.recycle_full(buffer);
+                                    }
                                     Ok(())
                                 }
                                 Err(error) => Err(error),
@@ -6503,8 +6651,11 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         assert_eq!(parse_chunk_size(b"zz"), None);
         // (#232 class) 1*HEXDIG only: from_str_radix would accept a leading '+'.
         assert_eq!(parse_chunk_size(b"+2"), None);
-        // ASCII-OWS padding is fine; Unicode whitespace is not.
-        assert_eq!(parse_chunk_size(b" 2 "), Some(2));
+        // (#1316) RFC 9112 §7.1: leading OWS and trailing OWS without `;` are rejected;
+        // BWS immediately before `;` chunk-ext is allowed; Unicode whitespace is rejected.
+        assert_eq!(parse_chunk_size(b" 2 "), None);
+        assert_eq!(parse_chunk_size(b"2 "), None);
+        assert_eq!(parse_chunk_size(b"2 ;ext=1"), Some(2));
         assert_eq!(parse_chunk_size(b"\xc2\xa02"), None);
     }
 
